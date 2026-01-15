@@ -1,0 +1,65 @@
+[package]
+name = "ngboost-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Felix Agene agene001@umn.edu>"]
+description = "Natural Gradient Boosting for Probabilistic Prediction - A Rust implementation of NGBoost"
+license = "MIT"
+repository = "https://github.com/agene0001/ngboost-rs"
+documentation = "https://docs.rs/ngboost-rs"
+readme = "README.md"
+keywords = ["machine-learning", "gradient-boosting", "probabilistic", "uncertainty", "ngboost"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+ndarray = "0.17.2"
+ndarray-linalg = "0.18.1"
+statrs = "0.18.0"
+rand = "0.10.0-rc.6"
+
+# Optional BLAS backends - user must enable one
+accelerate-src = { version = "0.3.2", optional = true }
+intel-mkl-src = { version = "0.8.1", optional = true }
+openblas-src = { version = "0.10.13", optional = true, features = ["system"] }
+
+[dev-dependencies]
+ndarray-rand = "0.16.0"
+
+[features]
+default = []
+# BLAS backend features - user must choose one
+accelerate = ["accelerate-src"]
+intel-mkl = ["intel-mkl-src"]
+openblas = ["openblas-src"]
+
+[[example]]
+name = "regression"
+path = "examples/regression.rs"
+
+[[example]]
+name = "classification"
+path = "examples/classification.rs"
+
+[[example]]
+name = "distributions"
+path = "examples/distributions.rs"
+
+[[example]]
+name = "uncertainty"
+path = "examples/uncertainty.rs"
+
+[package.metadata.docs.rs]
+features = ["openblas"]
+
+# Optimization settings for release builds
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# For even faster builds during development
+[profile.dev]
+opt-level = 1
+
+# Fast debug builds with some optimization
+[profile.dev.package."*"]
+opt-level = 2

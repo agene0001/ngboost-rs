@@ -1,0 +1,345 @@
+use crate::dist::{Distribution, RegressionDistn};
+use crate::scores::{LogScore, Scorable};
+use ndarray::{s, Array1, Array2, Array3};
+use ndarray_linalg::Inverse;
+
+/// Get the lower triangular indices for a p x p matrix.
+/// Returns (row_indices, col_indices, diagonal_mask).
+fn tril_indices(p: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    for i in 0..p {
+        for j in 0..=i {
+            rows.push(i);
+            cols.push(j);
+        }
+    }
+    (rows, cols)
+}
+
+/// Get the number of lower triangular elements for a p x p matrix.
+fn tril_size(p: usize) -> usize {
+    p * (p + 1) / 2
+}
+
+/// Build the Cholesky factor L from flattened lower triangular values.
+/// The diagonal elements are exponentiated to ensure positive definiteness.
+fn build_cholesky_factor(tril_vals: &Array2<f64>, p: usize) -> Array3<f64> {
+    // tril_vals is (lower_size, N)
+    let n = tril_vals.ncols();
+    let mut l = Array3::zeros((n, p, p));
+
+    let (rows, cols) = tril_indices(p);
+
+    for (par_idx, (&row, &col)) in rows.iter().zip(cols.iter()).enumerate() {
+        for i in 0..n {
+            let val = tril_vals[[par_idx, i]];
+            if row == col {
+                // Diagonal: exponentiate to ensure positive
+                l[[i, row, col]] = val.exp() + 1e-6;
+            } else {
+                l[[i, row, col]] = val;
+            }
+        }
+    }
+
+    l
+}
+
+/// A P-dimensional Multivariate Normal distribution.
+///
+/// Uses the parameterization Σ^(-1) = L * L^T where L is lower triangular.
+/// The diagonal of L is modeled on the log scale.
+///
+/// Number of parameters: P + P*(P+1)/2 = P*(P+3)/2
+/// - First P parameters are the mean
+/// - Remaining P*(P+1)/2 are the lower triangle of L
+#[derive(Debug, Clone)]
+pub struct MultivariateNormal<const P: usize> {
+    /// The mean vector (N x P).
+    pub loc: Array2<f64>,
+    /// The Cholesky factor L (N x P x P).
+    pub l: Array3<f64>,
+    /// The precision matrix (inverse covariance): Σ^(-1) = L * L^T (N x P x P).
+    pub cov_inv: Array3<f64>,
+    /// Cached covariance matrix (computed lazily).
+    cov: Option<Array3<f64>>,
+    /// Number of observations.
+    n_obs: usize,
+    /// The parameters.
+    _params: Array2<f64>,
+}
+
+impl<const P: usize> MultivariateNormal<P> {
+    /// Number of parameters for this distribution.
+    pub const N_PARAMS: usize = P * (P + 3) / 2;
+
+    /// PDF normalization constant: -P/2 * log(2*pi)
+    fn pdf_constant() -> f64 {
+        -(P as f64) / 2.0 * (2.0 * std::f64::consts::PI).ln()
+    }
+
+    /// Compute the log determinant of L (sum of log of diagonal elements).
+    fn log_det_l(&self, obs_idx: usize) -> f64 {
+        let mut log_det = 0.0;
+        for i in 0..P {
+            log_det += self.l[[obs_idx, i, i]].ln();
+        }
+        log_det
+    }
+
+    /// Get the covariance matrix (computed lazily).
+    pub fn cov(&mut self) -> &Array3<f64> {
+        if self.cov.is_none() {
+            let mut cov = Array3::zeros((self.n_obs, P, P));
+            for i in 0..self.n_obs {
+                let cov_inv_i = self.cov_inv.slice(s![i, .., ..]).to_owned();
+                if let Ok(cov_i) = cov_inv_i.inv() {
+                    for r in 0..P {
+                        for c in 0..P {
+                            cov[[i, r, c]] = cov_i[[r, c]];
+                        }
+                    }
+                } else {
+                    // Fallback to identity if singular
+                    for r in 0..P {
+                        cov[[i, r, r]] = 1.0;
+                    }
+                }
+            }
+            self.cov = Some(cov);
+        }
+        self.cov.as_ref().unwrap()
+    }
+
+    /// Compute residual and eta = L^T * (loc - y) for each observation.
+    fn summaries(&self, y: &Array2<f64>) -> (Array3<f64>, Array2<f64>) {
+        // y is (N, P)
+        // diff: (N, P, 1)
+        // eta: (N, P) = L^T @ diff
+        let n = self.n_obs;
+        let mut diff = Array3::zeros((n, P, 1));
+        let mut eta = Array2::zeros((n, P));
+
+        for i in 0..n {
+            for j in 0..P {
+                diff[[i, j, 0]] = self.loc[[i, j]] - y[[i, j]];
+            }
+
+            // eta = L^T @ diff
+            for j in 0..P {
+                let mut sum = 0.0;
+                for k in 0..P {
+                    sum += self.l[[i, k, j]] * diff[[i, k, 0]];
+                }
+                eta[[i, j]] = sum;
+            }
+        }
+
+        (diff, eta)
+    }
+
+    /// Compute log PDF for multivariate normal.
+    pub fn logpdf(&self, y: &Array2<f64>) -> Array1<f64> {
+        let (_, eta) = self.summaries(y);
+        let mut logpdf = Array1::zeros(self.n_obs);
+
+        for i in 0..self.n_obs {
+            // Quadratic form: -0.5 * ||eta||^2
+            let mut quad = 0.0;
+            for j in 0..P {
+                quad += eta[[i, j]] * eta[[i, j]];
+            }
+            let p1 = -0.5 * quad;
+
+            // Log determinant term
+            let p2 = self.log_det_l(i);
+
+            logpdf[i] = p1 + p2 + Self::pdf_constant();
+        }
+
+        logpdf
+    }
+}
+
+impl<const P: usize> Distribution for MultivariateNormal<P> {
+    fn from_params(params: &Array2<f64>) -> Self {
+        // params is (N, n_params) where n_params = P + P*(P+1)/2
+        let n_obs = params.nrows();
+
+        // Extract mean (first P columns)
+        let loc = params.slice(s![.., 0..P]).to_owned();
+
+        // Extract lower triangular values (remaining columns)
+        // Need to transpose to (tril_len, N) for build_cholesky_factor
+        let tril_params = params.slice(s![.., P..]).t().to_owned();
+        let l = build_cholesky_factor(&tril_params, P);
+
+        // Compute precision matrix: cov_inv = L @ L^T
+        let mut cov_inv = Array3::zeros((n_obs, P, P));
+        for i in 0..n_obs {
+            for r in 0..P {
+                for c in 0..P {
+                    let mut sum = 0.0;
+                    for k in 0..P {
+                        sum += l[[i, r, k]] * l[[i, c, k]];
+                    }
+                    cov_inv[[i, r, c]] = sum;
+                }
+            }
+        }
+
+        MultivariateNormal {
+            loc,
+            l,
+            cov_inv,
+            cov: None,
+            n_obs,
+            _params: params.clone(),
+        }
+    }
+
+    fn fit(_y: &Array1<f64>) -> Array1<f64> {
+        // This is tricky because y is 1D but we need 2D data
+        // For MVN, fit expects (N, P) shaped data
+        // We'll assume y contains flattened data or handle single observation
+        // For now, return default initialization
+
+        // Default: mean = 0, L = identity
+        // Mean parameters (first P) = 0
+        // Lower triangular of identity: diagonal = log(1) = 0, off-diagonal = 0
+        // All zeros is the default
+        Array1::zeros(Self::N_PARAMS)
+    }
+
+    fn n_params(&self) -> usize {
+        Self::N_PARAMS
+    }
+
+    fn predict(&self) -> Array1<f64> {
+        // Return the first dimension of the mean for each observation
+        // (For multi-output, this is a simplification)
+        self.loc.column(0).to_owned()
+    }
+
+    fn params(&self) -> &Array2<f64> {
+        &self._params
+    }
+}
+
+impl<const P: usize> RegressionDistn for MultivariateNormal<P> {}
+
+impl<const P: usize> Scorable<LogScore> for MultivariateNormal<P> {
+    fn score(&self, y: &Array1<f64>) -> Array1<f64> {
+        // Reshape y from (N*P,) to (N, P) if needed
+        // For now, assume y is already (N,) where N is n_obs
+        // and we need 2D y for MVN
+
+        // This is a simplification - in practice, y should be 2D
+        // We'll reshape assuming y contains all P dimensions for each observation
+        let n = self.n_obs;
+        let mut y_2d = Array2::zeros((n, P));
+
+        if y.len() == n * P {
+            for i in 0..n {
+                for j in 0..P {
+                    y_2d[[i, j]] = y[i * P + j];
+                }
+            }
+        } else if y.len() == n {
+            // Single dimension - replicate
+            for i in 0..n {
+                y_2d[[i, 0]] = y[i];
+            }
+        }
+
+        -self.logpdf(&y_2d)
+    }
+
+    fn d_score(&self, y: &Array1<f64>) -> Array2<f64> {
+        // Reshape y
+        let n = self.n_obs;
+        let mut y_2d = Array2::zeros((n, P));
+
+        if y.len() == n * P {
+            for i in 0..n {
+                for j in 0..P {
+                    y_2d[[i, j]] = y[i * P + j];
+                }
+            }
+        } else if y.len() == n {
+            for i in 0..n {
+                y_2d[[i, 0]] = y[i];
+            }
+        }
+
+        let (diff, eta) = self.summaries(&y_2d);
+        let tril_len = tril_size(P);
+        let n_params = P + tril_len;
+        let mut gradient = Array2::zeros((n, n_params));
+
+        let (rows, cols) = tril_indices(P);
+
+        for i in 0..n {
+            // Gradient of the mean: L^T @ eta (transposed back)
+            for j in 0..P {
+                let mut sum = 0.0;
+                for k in 0..P {
+                    sum += self.l[[i, k, j]] * eta[[i, k]];
+                }
+                gradient[[i, j]] = sum;
+            }
+
+            // Gradient of the lower triangular elements
+            for (par_idx, (&row, &col)) in rows.iter().zip(cols.iter()).enumerate() {
+                if row == col {
+                    // Diagonal: d/d(log(L_ii)) = L_ii * diff_i * eta_i - 1
+                    let l_ii = self.l[[i, row, row]];
+                    gradient[[i, P + par_idx]] = diff[[i, row, 0]] * eta[[i, row]] * l_ii - 1.0;
+                } else {
+                    // Off-diagonal: d/d(L_ij) = eta_j * diff_i
+                    gradient[[i, P + par_idx]] = eta[[i, col]] * diff[[i, row, 0]];
+                }
+            }
+        }
+
+        gradient
+    }
+
+    fn metric(&self) -> Array3<f64> {
+        // Fisher Information Matrix for MVN
+        let tril_len = tril_size(P);
+        let n_params = P + tril_len;
+        let mut fi = Array3::zeros((self.n_obs, n_params, n_params));
+
+        // Initialize with identity for stability
+        for i in 0..self.n_obs {
+            for j in 0..n_params {
+                fi[[i, j, j]] = 1.0;
+            }
+        }
+
+        // FI of the location: L @ L^T = cov_inv
+        for i in 0..self.n_obs {
+            for r in 0..P {
+                for c in 0..P {
+                    fi[[i, r, c]] = self.cov_inv[[i, r, c]];
+                }
+            }
+        }
+
+        // The variance component FI is more complex and requires the covariance matrix
+        // For now, we use an approximation with identity for the variance parameters
+
+        fi
+    }
+}
+
+/// Type alias for 2-dimensional MVN.
+pub type MultivariateNormal2 = MultivariateNormal<2>;
+
+/// Type alias for 3-dimensional MVN.
+pub type MultivariateNormal3 = MultivariateNormal<3>;
+
+/// Type alias for 4-dimensional MVN.
+pub type MultivariateNormal4 = MultivariateNormal<4>;
