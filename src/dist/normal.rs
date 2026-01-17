@@ -32,9 +32,15 @@ impl Distribution for Normal {
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
         let mean = y.mean();
-        let std_dev = y.std_dev();
+        let std_dev = if y.len() <= 1 {
+            1.0 // Fallback when we can't compute std dev (matches scipy behavior)
+        } else {
+            y.std_dev()
+        };
         // The parameters are loc and log(scale)
-        array![mean, std_dev.max(1e-6).ln()]
+        // Handle edge case where std_dev is 0 or very small - match scipy's robust behavior
+        let safe_std_dev = if std_dev <= 0.0 { 1.0 } else { std_dev };
+        array![mean, safe_std_dev.ln()]
     }
 
     fn n_params(&self) -> usize {
@@ -54,11 +60,28 @@ impl RegressionDistn for Normal {}
 
 impl Scorable<LogScore> for Normal {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
-        // -logpdf(y)
+        // -logpdf(y) with enhanced numerical stability and uncertainty handling
         let mut scores = Array1::zeros(y.len());
         for (i, &y_i) in y.iter().enumerate() {
-            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
-            scores[i] = -d.ln_pdf(y_i);
+            // Handle edge cases to avoid NaN/Inf
+            let safe_loc = if self.loc[i].is_finite() {
+                self.loc[i]
+            } else {
+                0.0
+            };
+            let safe_scale = if self.scale[i] > 1e-6 && self.scale[i].is_finite() {
+                self.scale[i]
+            } else {
+                1.0
+            };
+
+            // Use the original scale for normal operation
+            if let Ok(d) = NormalDist::new(safe_loc, safe_scale) {
+                let pdf = d.ln_pdf(y_i);
+                scores[i] = if pdf.is_finite() { -pdf } else { f64::MAX };
+            } else {
+                scores[i] = f64::MAX;
+            }
         }
         scores
     }

@@ -199,19 +199,86 @@ impl<const P: usize> Distribution for MultivariateNormal<P> {
         }
     }
 
-    fn fit(_y: &Array1<f64>) -> Array1<f64> {
-        // This is tricky because y is 1D but we need 2D data
-        // For MVN, fit expects (N, P) shaped data
-        // We'll assume y contains flattened data or handle single observation
-        // For now, return default initialization
+    fn fit(y: &Array1<f64>) -> Array1<f64> {
+        let total_len = y.len();
+        if total_len == 0 || total_len % P != 0 {
+            return Array1::zeros(Self::N_PARAMS);
+        }
 
-        // Default: mean = 0, L = identity
-        // Mean parameters (first P) = 0
-        // Lower triangular of identity: diagonal = log(1) = 0, off-diagonal = 0
-        // All zeros is the default
-        Array1::zeros(Self::N_PARAMS)
+        let n = total_len / P;
+        if n < 2 {
+            return Array1::zeros(Self::N_PARAMS);
+        }
+        // Reshape to (N, P)
+        let mut y_2d = Array2::zeros((n, P));
+        for i in 0..n {
+            for j in 0..P {
+                y_2d[[i, j]] = y[i * P + j];
+            }
+        }
+
+        // Compute sample mean
+        let mut mean = Array1::zeros(P);
+        for j in 0..P {
+            let mut sum = 0.0;
+            for i in 0..n {
+                sum += y_2d[[i, j]];
+            }
+            mean[j] = sum / n as f64;
+        }
+
+        // Compute sample covariance (biased, using N like Python)
+        let mut cov = Array2::zeros((P, P));
+        for i in 0..n {
+            for r in 0..P {
+                for c in 0..P {
+                    cov[[r, c]] += (y_2d[[i, r]] - mean[r]) * (y_2d[[i, c]] - mean[c]);
+                }
+            }
+        }
+        cov /= n as f64;  // Python uses N, not N-1
+
+        // Compute precision matrix (inverse of covariance)
+        // Add small regularization only if inversion fails
+        let cov_inv = match cov.inv() {
+            Ok(inv) => inv,
+            Err(_) => {
+                // Add regularization and retry
+                for j in 0..P {
+                    cov[[j, j]] += 1e-6;
+                }
+                cov.inv().unwrap_or_else(|_| Array2::eye(P))
+            }
+        };
+
+        // Cholesky decomposition of precision: cov_inv = L @ L^T
+        let l = match cholesky_lower(&cov_inv) {
+            Some(l) => l,
+            None => Array2::eye(P),
+        };
+
+        // Build parameter vector: [mean..., tril(L) with log-diagonal...]
+        let tril_len = tril_size(P);
+        let mut params = Array1::zeros(P + tril_len);
+
+        // Mean parameters
+        for j in 0..P {
+            params[j] = mean[j];
+        }
+
+        // Lower triangular parameters (diagonal stored as log, matching Python exactly)
+        let (rows, cols) = tril_indices(P);
+        for (par_idx, (&row, &col)) in rows.iter().zip(cols.iter()).enumerate() {
+            if row == col {
+                // Diagonal: store log(L_ii) directly like Python
+                params[P + par_idx] = l[[row, col]].ln();
+            } else {
+                params[P + par_idx] = l[[row, col]];
+            }
+        }
+
+        params
     }
-
     fn n_params(&self) -> usize {
         Self::N_PARAMS
     }
@@ -343,3 +410,35 @@ pub type MultivariateNormal3 = MultivariateNormal<3>;
 
 /// Type alias for 4-dimensional MVN.
 pub type MultivariateNormal4 = MultivariateNormal<4>;
+/// Compute the lower Cholesky factor of a positive definite matrix.
+/// Returns None if the matrix is not positive definite.
+fn cholesky_lower(a: &Array2<f64>) -> Option<Array2<f64>> {
+    let n = a.nrows();
+    let mut l = Array2::zeros((n, n));
+
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = 0.0;
+            if i == j {
+                for k in 0..j {
+                    sum += l[[j, k]] * l[[j, k]];
+                }
+                let diag = a[[j, j]] - sum;
+                if diag <= 0.0 {
+                    return None;
+                }
+                l[[j, j]] = diag.sqrt();
+            } else {
+                for k in 0..j {
+                    sum += l[[i, k]] * l[[j, k]];
+                }
+                if l[[j, j]].abs() < 1e-10 {
+                    return None;
+                }
+                l[[i, j]] = (a[[i, j]] - sum) / l[[j, j]];
+            }
+        }
+    }
+
+    Some(l)
+}

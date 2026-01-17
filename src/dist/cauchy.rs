@@ -49,7 +49,7 @@ impl Distribution for Cauchy {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         // Median
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2){
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]
@@ -170,7 +170,7 @@ impl Distribution for CauchyFixedVar {
         let mut sorted: Vec<f64> = y.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]

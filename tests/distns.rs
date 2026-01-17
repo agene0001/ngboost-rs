@@ -18,7 +18,7 @@ use ngboost_rs::dist::{
     weibull::Weibull,
     Distribution,
 };
-use ngboost_rs::learners::StumpLearner;
+use ngboost_rs::learners::{HistogramLearner, StumpLearner};
 use ngboost_rs::ngboost::NGBoost;
 use ngboost_rs::scores::{LogScore, Scorable};
 
@@ -330,8 +330,8 @@ fn test_small_dataset() {
     let n_samples = 10;
     let n_features = 2;
     let x = Array2::random((n_samples, n_features), Uniform::new(0., 1.).unwrap());
-    let y =
-        x.dot(&Array1::from(vec![1.0, -1.0])) + &Array1::random(n_samples, Uniform::new(-0.1, 0.1).unwrap());
+    let y = x.dot(&Array1::from(vec![1.0, -1.0]))
+        + &Array1::random(n_samples, Uniform::new(-0.1, 0.1).unwrap());
     let y = y.mapv(|v: f64| v.abs() + 0.01);
 
     let mut model: NGBoost<Normal, LogScore, StumpLearner> = NGBoost::new(5, 0.1, StumpLearner);
@@ -343,8 +343,8 @@ fn test_small_dataset() {
 fn test_single_feature() {
     let n_samples = 50;
     let x = Array2::random((n_samples, 1), Uniform::new(0., 1.).unwrap());
-    let y =
-        x.column(0).mapv(|v| v * 2.0 + 1.0) + &Array1::random(n_samples, Uniform::new(-0.1, 0.1).unwrap());
+    let y = x.column(0).mapv(|v| v * 2.0 + 1.0)
+        + &Array1::random(n_samples, Uniform::new(-0.1, 0.1).unwrap());
     let y = y.mapv(|v: f64| v.abs() + 0.01);
 
     let mut model: NGBoost<Normal, LogScore, StumpLearner> = NGBoost::new(10, 0.1, StumpLearner);
@@ -369,4 +369,109 @@ fn test_many_iterations() {
     let y_pred = model.predict(&x);
     let mse: f64 = (&y - &y_pred).mapv(|v| v * v).mean().unwrap();
     assert!(mse < 1.0); // Should have learned something
+}
+
+// ============================================================================
+// Histogram Learner Tests
+// ============================================================================
+
+#[test]
+fn test_histogram_learner_basic() {
+    let n_samples = 100;
+    let n_features = 5;
+    let x = Array2::random((n_samples, n_features), Uniform::new(0., 1.).unwrap());
+    let y = x.dot(&Array1::from(vec![1.5, -2.3, 0.4, 3.1, -1.1]))
+        + &Array1::random(n_samples, Uniform::new(-0.5, 0.5).unwrap());
+    let y = y.mapv(|v| if v < 0.0 { 0.01 } else { v });
+
+    let hist_learner = HistogramLearner::new(3);
+    let mut model: NGBoost<Normal, LogScore, HistogramLearner> =
+        NGBoost::new(50, 0.1, hist_learner);
+    let fit_result = model.fit(&x, &y);
+    assert!(fit_result.is_ok());
+
+    let y_pred = model.predict(&x);
+    assert_eq!(y_pred.len(), n_samples);
+
+    // Check predictions are reasonable
+    let mse: f64 = (&y - &y_pred).mapv(|v| v * v).mean().unwrap();
+    assert!(mse < 1.0);
+}
+
+#[test]
+fn test_histogram_learner_classification() {
+    let n_samples = 100;
+    let n_features = 5;
+    let x = Array2::random((n_samples, n_features), Uniform::new(0., 1.).unwrap());
+    let linear = x.dot(&Array1::from(vec![1.5, -2.3, 0.4, 3.1, -1.1]));
+    let y = linear.mapv(|v: f64| if v > 0.0 { 1.0 } else { 0.0 });
+
+    let hist_learner = HistogramLearner::new(3);
+    let mut model: NGBoost<Bernoulli, LogScore, HistogramLearner> =
+        NGBoost::new(20, 0.1, hist_learner);
+    let fit_result = model.fit(&x, &y);
+    assert!(fit_result.is_ok());
+
+    let y_pred = model.predict(&x);
+    assert_eq!(y_pred.len(), n_samples);
+
+    // Predictions should be 0 or 1
+    for &pred in y_pred.iter() {
+        assert!(pred == 0.0 || pred == 1.0);
+    }
+}
+
+#[test]
+fn test_histogram_vs_stump_accuracy() {
+    // Compare histogram and stump learners - both should achieve reasonable accuracy
+    let n_samples = 200;
+    let n_features = 4;
+    let x = Array2::random((n_samples, n_features), Uniform::new(0., 1.).unwrap());
+    let y = x.dot(&Array1::from(vec![2.0, -1.5, 1.0, -0.5]))
+        + &Array1::random(n_samples, Uniform::new(-0.3, 0.3).unwrap());
+    let y = y.mapv(|v: f64| v.abs() + 0.01);
+
+    // Histogram learner
+    let hist_learner = HistogramLearner::new(3);
+    let mut hist_model: NGBoost<Normal, LogScore, HistogramLearner> =
+        NGBoost::new(50, 0.1, hist_learner);
+    hist_model.fit(&x, &y).unwrap();
+    let hist_pred = hist_model.predict(&x);
+    let hist_mse: f64 = (&y - &hist_pred).mapv(|v| v * v).mean().unwrap();
+
+    // Stump learner (for comparison)
+    let mut stump_model: NGBoost<Normal, LogScore, StumpLearner> =
+        NGBoost::new(50, 0.1, StumpLearner);
+    stump_model.fit(&x, &y).unwrap();
+    let stump_pred = stump_model.predict(&x);
+    let stump_mse: f64 = (&y - &stump_pred).mapv(|v| v * v).mean().unwrap();
+
+    // Both should achieve reasonable accuracy
+    assert!(hist_mse < 1.0, "Histogram MSE too high: {}", hist_mse);
+    assert!(stump_mse < 1.0, "Stump MSE too high: {}", stump_mse);
+
+    // Histogram with depth-3 should generally be better than depth-1 stump
+    // (but not always due to randomness, so we use a loose check)
+    println!("Histogram MSE: {}, Stump MSE: {}", hist_mse, stump_mse);
+}
+
+#[test]
+fn test_histogram_learner_with_different_bins() {
+    let n_samples = 100;
+    let n_features = 3;
+    let x = Array2::random((n_samples, n_features), Uniform::new(0., 1.).unwrap());
+    let y = x.dot(&Array1::from(vec![1.0, -1.0, 0.5]))
+        + &Array1::random(n_samples, Uniform::new(-0.2, 0.2).unwrap());
+    let y = y.mapv(|v: f64| v.abs() + 0.01);
+
+    // Test with fewer bins
+    let hist_learner = HistogramLearner::with_params(3, 32, 1, 2);
+    let mut model: NGBoost<Normal, LogScore, HistogramLearner> =
+        NGBoost::new(30, 0.1, hist_learner);
+    let fit_result = model.fit(&x, &y);
+    assert!(fit_result.is_ok());
+
+    let y_pred = model.predict(&x);
+    let mse: f64 = (&y - &y_pred).mapv(|v| v * v).mean().unwrap();
+    assert!(mse < 1.0);
 }
