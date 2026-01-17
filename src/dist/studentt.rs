@@ -1,7 +1,8 @@
 use crate::dist::{Distribution, RegressionDistn};
 use crate::scores::{LogScore, Scorable};
 use ndarray::{array, Array1, Array2, Array3};
-use statrs::distribution::{Continuous, StudentsT as StudentsTDist};
+use rand::prelude::*;
+use statrs::distribution::{Continuous, ContinuousCDF, StudentsT as StudentsTDist};
 use statrs::function::gamma::digamma;
 
 /// The Student's T distribution with learnable degrees of freedom.
@@ -61,6 +62,26 @@ impl Distribution for StudentT {
 
 impl RegressionDistn for StudentT {}
 
+impl StudentT {
+    /// Sample from the distribution using inverse CDF method.
+    /// Returns an array of shape (n_samples, n_obs) where each column is samples for one observation.
+    pub fn sample(&self, n_samples: usize) -> Array2<f64> {
+        let n_obs = self.loc.len();
+        let mut samples = Array2::zeros((n_samples, n_obs));
+        let mut rng = rand::rng();
+
+        for i in 0..n_obs {
+            let d = StudentsTDist::new(self.loc[i], self.scale[i], self.df[i]).unwrap();
+            for s in 0..n_samples {
+                // Use inverse CDF sampling
+                let u: f64 = rng.random();
+                samples[[s, i]] = d.inverse_cdf(u);
+            }
+        }
+        samples
+    }
+}
+
 impl Scorable<LogScore> for StudentT {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         let mut scores = Array1::zeros(y.len());
@@ -108,17 +129,18 @@ impl Scorable<LogScore> for StudentT {
     }
 
     fn metric(&self) -> Array3<f64> {
-        // For full T distribution with learnable df, the FIM is complex
-        // Using an identity approximation for stability
+        // Python's TLogScore does NOT implement metric(), so it falls back to
+        // the default LogScore.metric() which returns identity matrix.
+        // We match that behavior here.
         let n_obs = self.loc.len();
-        let mut fi = Array3::zeros((n_obs, 3, 3));
+        let n_params = 3;
 
+        let mut fi = Array3::zeros((n_obs, n_params, n_params));
         for i in 0..n_obs {
-            fi[[i, 0, 0]] = 1.0;
-            fi[[i, 1, 1]] = 1.0;
-            fi[[i, 2, 2]] = 1.0;
+            for j in 0..n_params {
+                fi[[i, j, j]] = 1.0;
+            }
         }
-
         fi
     }
 }

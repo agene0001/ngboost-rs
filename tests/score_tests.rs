@@ -1,8 +1,8 @@
-//! Tests for scoring rules including numerical gradient verification.
-//! This mirrors Python's test_score.py to ensure gradient implementations are correct.
-
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
+
+// Tests for scoring rules including numerical gradient verification.
+// This mirrors Python's test_score.py to ensure gradient implementations are correct.
 
 use ndarray::Array1;
 use ngboost_rs::dist::{

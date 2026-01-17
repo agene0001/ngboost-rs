@@ -398,6 +398,309 @@ fn test_histogram_learner_basic() {
     assert!(mse < 1.0);
 }
 
+// ============================================================================
+// MultivariateNormal Distribution Tests
+// ============================================================================
+
+use ngboost_rs::dist::multivariate_normal::{MultivariateNormal2, MultivariateNormal3};
+
+/// Test basic construction of MultivariateNormal from parameters.
+#[test]
+fn test_multivariate_normal_2d_from_params() {
+    // For P=2, we have P + P*(P+1)/2 = 2 + 3 = 5 parameters
+    // [mean_0, mean_1, L_00 (log scale), L_10, L_11 (log scale)]
+    let n_obs = 10;
+    let n_params = 5;
+    let mut params = Array2::zeros((n_obs, n_params));
+
+    for i in 0..n_obs {
+        // Mean: [1.0, 2.0]
+        params[[i, 0]] = 1.0;
+        params[[i, 1]] = 2.0;
+        // L matrix (lower triangular):
+        // L = [[exp(0.0), 0], [0.5, exp(0.0)]] = [[1.0, 0], [0.5, 1.0]]
+        params[[i, 2]] = 0.0; // log(L_00)
+        params[[i, 3]] = 0.5; // L_10
+        params[[i, 4]] = 0.0; // log(L_11)
+    }
+
+    let dist = MultivariateNormal2::from_params(&params);
+
+    // Check means
+    for i in 0..n_obs {
+        assert!((dist.loc[[i, 0]] - 1.0).abs() < 1e-6);
+        assert!((dist.loc[[i, 1]] - 2.0).abs() < 1e-6);
+    }
+
+    // Check that L matrix is correct
+    for i in 0..n_obs {
+        assert!((dist.l[[i, 0, 0]] - 1.0).abs() < 0.01); // exp(0) + 1e-6 ≈ 1.0
+        assert!((dist.l[[i, 1, 0]] - 0.5).abs() < 1e-6);
+        assert!((dist.l[[i, 1, 1]] - 1.0).abs() < 0.01);
+    }
+}
+
+/// Test fitting MultivariateNormal parameters from data.
+#[test]
+fn test_multivariate_normal_2d_fit() {
+    // Create synthetic 2D data with known mean and covariance
+    let n_samples = 100;
+    let p = 2;
+
+    // Generate data with mean [3.0, 5.0] and some correlation
+    let mut y = Array1::zeros(n_samples * p);
+    for i in 0..n_samples {
+        let x1 = 3.0 + (i as f64 * 0.01 - 0.5);
+        let x2 = 5.0 + (i as f64 * 0.02 - 1.0) + 0.5 * x1; // Correlated with x1
+        y[i * p] = x1;
+        y[i * p + 1] = x2;
+    }
+
+    let params = MultivariateNormal2::fit(&y);
+
+    // Should have 5 parameters for 2D MVN
+    assert_eq!(params.len(), 5);
+
+    // Mean should be approximately [3.0, 6.5] (due to correlation term)
+    assert!(
+        (params[0] - 3.0).abs() < 0.5,
+        "Mean[0] = {} not close to 3.0",
+        params[0]
+    );
+    // Note: exact mean[1] depends on exact correlation structure
+}
+
+/// Test log probability computation.
+#[test]
+fn test_multivariate_normal_2d_logpdf() {
+    let n_obs = 5;
+    let n_params = 5;
+    let mut params = Array2::zeros((n_obs, n_params));
+
+    for i in 0..n_obs {
+        params[[i, 0]] = 0.0; // mean_0
+        params[[i, 1]] = 0.0; // mean_1
+        params[[i, 2]] = 0.0; // log(L_00) -> L_00 ≈ 1
+        params[[i, 3]] = 0.0; // L_10
+        params[[i, 4]] = 0.0; // log(L_11) -> L_11 ≈ 1
+    }
+
+    let dist = MultivariateNormal2::from_params(&params);
+
+    // y at the mean should have highest log probability
+    let y_at_mean = Array2::zeros((n_obs, 2));
+    let logpdf_at_mean = dist.logpdf(&y_at_mean);
+
+    // y away from mean should have lower log probability
+    let mut y_away = Array2::zeros((n_obs, 2));
+    for i in 0..n_obs {
+        y_away[[i, 0]] = 2.0;
+        y_away[[i, 1]] = 2.0;
+    }
+    let logpdf_away = dist.logpdf(&y_away);
+
+    for i in 0..n_obs {
+        assert!(
+            logpdf_at_mean[i] > logpdf_away[i],
+            "Log PDF at mean ({}) should be greater than away ({})",
+            logpdf_at_mean[i],
+            logpdf_away[i]
+        );
+    }
+}
+
+/// Test score (negative log likelihood) computation.
+#[test]
+fn test_multivariate_normal_2d_score() {
+    let n_obs = 10;
+    let n_params = 5;
+    let mut params = Array2::zeros((n_obs, n_params));
+
+    for i in 0..n_obs {
+        params[[i, 0]] = 1.0;
+        params[[i, 1]] = 2.0;
+        params[[i, 2]] = 0.0;
+        params[[i, 3]] = 0.0;
+        params[[i, 4]] = 0.0;
+    }
+
+    let dist = MultivariateNormal2::from_params(&params);
+
+    // Create y values (flattened: [y1_0, y1_1, y2_0, y2_1, ...])
+    let mut y = Array1::zeros(n_obs * 2);
+    for i in 0..n_obs {
+        y[i * 2] = 1.0; // Close to mean
+        y[i * 2 + 1] = 2.0;
+    }
+
+    let scores = Scorable::score(&dist, &y);
+    assert_eq!(scores.len(), n_obs);
+
+    // Score should be positive (negative log prob)
+    for i in 0..n_obs {
+        assert!(
+            scores[i].is_finite(),
+            "Score[{}] is not finite: {}",
+            i,
+            scores[i]
+        );
+    }
+}
+
+/// Test gradient computation.
+#[test]
+fn test_multivariate_normal_2d_gradient() {
+    let n_obs = 5;
+    let n_params = 5;
+    let mut params = Array2::zeros((n_obs, n_params));
+
+    for i in 0..n_obs {
+        params[[i, 0]] = 0.0;
+        params[[i, 1]] = 0.0;
+        params[[i, 2]] = 0.0;
+        params[[i, 3]] = 0.0;
+        params[[i, 4]] = 0.0;
+    }
+
+    let dist = MultivariateNormal2::from_params(&params);
+
+    let mut y = Array1::zeros(n_obs * 2);
+    for i in 0..n_obs {
+        y[i * 2] = 0.5;
+        y[i * 2 + 1] = -0.5;
+    }
+
+    let grads = Scorable::d_score(&dist, &y);
+    assert_eq!(grads.nrows(), n_obs);
+    assert_eq!(grads.ncols(), n_params);
+
+    // Gradients should be finite
+    for i in 0..n_obs {
+        for j in 0..n_params {
+            assert!(
+                grads[[i, j]].is_finite(),
+                "Gradient[{}, {}] is not finite: {}",
+                i,
+                j,
+                grads[[i, j]]
+            );
+        }
+    }
+}
+
+/// Test Fisher Information Matrix computation.
+#[test]
+fn test_multivariate_normal_2d_metric() {
+    let n_obs = 3;
+    let n_params = 5;
+    let mut params = Array2::zeros((n_obs, n_params));
+
+    for i in 0..n_obs {
+        params[[i, 0]] = 0.0;
+        params[[i, 1]] = 0.0;
+        params[[i, 2]] = 0.0;
+        params[[i, 3]] = 0.0;
+        params[[i, 4]] = 0.0;
+    }
+
+    let dist = MultivariateNormal2::from_params(&params);
+    let metric = Scorable::<LogScore>::metric(&dist);
+
+    assert_eq!(metric.shape(), &[n_obs, n_params, n_params]);
+
+    // Metric should be positive definite (at least have positive diagonal)
+    for i in 0..n_obs {
+        for j in 0..n_params {
+            assert!(
+                metric[[i, j, j]] > 0.0,
+                "Metric[{}, {}, {}] should be positive: {}",
+                i,
+                j,
+                j,
+                metric[[i, j, j]]
+            );
+        }
+    }
+}
+
+/// Test 3-dimensional MultivariateNormal.
+#[test]
+fn test_multivariate_normal_3d_basic() {
+    // For P=3, we have P + P*(P+1)/2 = 3 + 6 = 9 parameters
+    let n_obs = 5;
+    let n_params = 9;
+    let mut params = Array2::zeros((n_obs, n_params));
+
+    for i in 0..n_obs {
+        // Mean: [1.0, 2.0, 3.0]
+        params[[i, 0]] = 1.0;
+        params[[i, 1]] = 2.0;
+        params[[i, 2]] = 3.0;
+        // L matrix (lower triangular, 6 elements):
+        // L = [[exp(0), 0, 0], [0, exp(0), 0], [0, 0, exp(0)]] = identity
+        params[[i, 3]] = 0.0; // log(L_00)
+        params[[i, 4]] = 0.0; // L_10
+        params[[i, 5]] = 0.0; // log(L_11)
+        params[[i, 6]] = 0.0; // L_20
+        params[[i, 7]] = 0.0; // L_21
+        params[[i, 8]] = 0.0; // log(L_22)
+    }
+
+    let dist = MultivariateNormal3::from_params(&params);
+
+    // Check means
+    for i in 0..n_obs {
+        assert!((dist.loc[[i, 0]] - 1.0).abs() < 1e-6);
+        assert!((dist.loc[[i, 1]] - 2.0).abs() < 1e-6);
+        assert!((dist.loc[[i, 2]] - 3.0).abs() < 1e-6);
+    }
+
+    // Test score computation
+    let mut y = Array1::zeros(n_obs * 3);
+    for i in 0..n_obs {
+        y[i * 3] = 1.0;
+        y[i * 3 + 1] = 2.0;
+        y[i * 3 + 2] = 3.0;
+    }
+
+    let scores = Scorable::score(&dist, &y);
+    assert_eq!(scores.len(), n_obs);
+
+    for i in 0..n_obs {
+        assert!(scores[i].is_finite());
+    }
+}
+
+/// Test that predict returns first dimension of mean.
+#[test]
+fn test_multivariate_normal_predict() {
+    let n_obs = 10;
+    let n_params = 5; // 2D MVN
+    let mut params = Array2::zeros((n_obs, n_params));
+
+    for i in 0..n_obs {
+        params[[i, 0]] = (i as f64) * 0.5; // Varying mean_0
+        params[[i, 1]] = 2.0;
+        params[[i, 2]] = 0.0;
+        params[[i, 3]] = 0.0;
+        params[[i, 4]] = 0.0;
+    }
+
+    let dist = MultivariateNormal2::from_params(&params);
+    let predictions = dist.predict();
+
+    assert_eq!(predictions.len(), n_obs);
+    for i in 0..n_obs {
+        assert!(
+            (predictions[i] - (i as f64) * 0.5).abs() < 1e-6,
+            "Prediction[{}] = {} not close to {}",
+            i,
+            predictions[i],
+            (i as f64) * 0.5
+        );
+    }
+}
+
 #[test]
 fn test_histogram_learner_classification() {
     let n_samples = 100;

@@ -236,7 +236,7 @@ impl<const P: usize> Distribution for MultivariateNormal<P> {
                 }
             }
         }
-        cov /= n as f64;  // Python uses N, not N-1
+        cov /= n as f64; // Python uses N, not N-1
 
         // Compute precision matrix (inverse of covariance)
         // Add small regularization only if inversion fails
@@ -375,28 +375,97 @@ impl<const P: usize> Scorable<LogScore> for MultivariateNormal<P> {
 
     fn metric(&self) -> Array3<f64> {
         // Fisher Information Matrix for MVN
+        // Formulas obtained by taking the expectation of the Hessian
+        // (as noted in the Python implementation)
         let tril_len = tril_size(P);
         let n_params = P + tril_len;
         let mut fi = Array3::zeros((self.n_obs, n_params, n_params));
 
-        // Initialize with identity for stability
-        for i in 0..self.n_obs {
-            for j in 0..n_params {
-                fi[[i, j, j]] = 1.0;
+        let (rows, cols) = tril_indices(P);
+
+        // Identify diagonal and off-diagonal indices
+        let mut diags = Vec::new();
+        let mut off_diags = Vec::new();
+        for (par_idx, (&row, &col)) in rows.iter().zip(cols.iter()).enumerate() {
+            if row == col {
+                diags.push(par_idx);
+            } else {
+                off_diags.push(par_idx);
             }
         }
 
-        // FI of the location: L @ L^T = cov_inv
-        for i in 0..self.n_obs {
+        for obs in 0..self.n_obs {
+            // Initialize diagonal to 1 for stability
+            for j in 0..n_params {
+                fi[[obs, j, j]] = 1.0;
+            }
+
+            // FI of the location: L @ L^T = cov_inv
             for r in 0..P {
                 for c in 0..P {
-                    fi[[i, r, c]] = self.cov_inv[[i, r, c]];
+                    fi[[obs, r, c]] = self.cov_inv[[obs, r, c]];
+                }
+            }
+
+            // Compute covariance matrix for this observation (inverse of cov_inv)
+            let cov_inv_obs = self.cov_inv.slice(s![obs, .., ..]).to_owned();
+            let cov_obs = match cov_inv_obs.inv() {
+                Ok(inv) => inv,
+                Err(_) => {
+                    // Fallback to identity if singular
+                    Array2::eye(P)
+                }
+            };
+
+            // Compute L^T @ cov for the variance component FI
+            // cov_sum[i,j] = sum_k L[k,i] * cov[k,j]
+            let mut cov_sum = Array2::zeros((P, P));
+            for i in 0..P {
+                for j in 0..P {
+                    let mut sum = 0.0;
+                    for k in 0..P {
+                        sum += self.l[[obs, k, i]] * cov_obs[[k, j]];
+                    }
+                    cov_sum[[i, j]] = sum;
+                }
+            }
+
+            // Variance component of FI (VarComp in Python)
+            // E[d^2l / dlog(a_ii) dlog(a_kk)] and E[d^2l / dlog(a_ii) da_kq]
+            for &diag_idx in &diags {
+                let i = rows[diag_idx];
+                let l_ii = self.l[[obs, i, i]];
+                // Diagonal-diagonal: L_ii^2 * cov_ii + cov_sum_ii * L_ii
+                let value = l_ii * l_ii * cov_obs[[i, i]] + cov_sum[[i, i]] * l_ii;
+                fi[[obs, P + diag_idx, P + diag_idx]] = value;
+
+                // Diagonal-offdiagonal interactions
+                for &par_idx in &off_diags {
+                    let q = rows[par_idx];
+                    let k = cols[par_idx];
+                    if i == k {
+                        let value = cov_obs[[q, i]] * l_ii;
+                        fi[[obs, P + diag_idx, P + par_idx]] = value;
+                        fi[[obs, P + par_idx, P + diag_idx]] = value;
+                    }
+                }
+            }
+
+            // Off-diagonal w.r.t. off-diagonal
+            for &par_idx in &off_diags {
+                let j = rows[par_idx];
+                let i = cols[par_idx];
+                for &par_idx2 in &off_diags {
+                    let k = rows[par_idx2];
+                    let q = cols[par_idx2];
+                    if i == q {
+                        let value = cov_obs[[k, j]];
+                        fi[[obs, P + par_idx, P + par_idx2]] = value;
+                        fi[[obs, P + par_idx2, P + par_idx]] = value;
+                    }
                 }
             }
         }
-
-        // The variance component FI is more complex and requires the covariance matrix
-        // For now, we use an approximation with identity for the variance parameters
 
         fi
     }

@@ -1,10 +1,10 @@
-//! Basic tests matching Python's test_basic.py
-//!
-//! These tests verify basic regression and classification functionality
-//! using synthetic data that mimics real-world datasets.
-
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
+
+// Basic tests matching Python's test_basic.py
+//
+// These tests verify basic regression and classification functionality
+// using synthetic data that mimics real-world datasets.
 
 use ndarray::{Array1, Array2, Axis};
 use ndarray_rand::rand_distr::Uniform;

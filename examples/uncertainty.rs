@@ -1,13 +1,14 @@
-//! Example demonstrating uncertainty quantification with NGBoost.
-//!
-//! NGBoost provides full probability distributions, not just point predictions.
-//! This example shows how to use the predicted distributions to:
-//! - Estimate prediction uncertainty
-//! - Compute confidence intervals
-//! - Identify uncertain predictions
-
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
+
+// Example demonstrating uncertainty quantification with NGBoost.
+//
+// NGBoost provides full probability distributions, not just point predictions.
+// This example shows how to use the predicted distributions to:
+// - Estimate prediction uncertainty
+// - Compute confidence intervals
+// - Identify uncertain predictions
+
 
 use ndarray::{Array1, Array2};
 use ndarray_rand::rand_distr::Uniform;
@@ -31,7 +32,8 @@ fn main() {
         .column(0)
         .iter()
         .enumerate()
-        .map(|(_, &x)| {
+        .map(|(_, x)| { // Removed '&' from pattern match to handle references manually below
+            let x = *x as f64;
             // True function: y = sin(x) + noise
             // Noise increases with x (heteroscedastic)
             let noise_scale = 0.1 + 0.1 * x;

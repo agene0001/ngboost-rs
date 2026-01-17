@@ -4,6 +4,11 @@ use ndarray::{array, Array1, Array2, Array3};
 use statrs::distribution::{Continuous, ContinuousCDF, Normal as NormalDist};
 use statrs::statistics::Statistics;
 
+/// Minimum scale (standard deviation) to avoid numerical issues.
+const MIN_SCALE: f64 = 1e-6;
+/// Maximum scale to prevent overflow in variance calculations.
+const MAX_SCALE: f64 = 1e6;
+
 /// The Normal (Gaussian) distribution.
 #[derive(Debug, Clone)]
 pub struct Normal {
@@ -20,7 +25,10 @@ pub struct Normal {
 impl Distribution for Normal {
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
-        let scale = params.column(1).mapv(f64::exp);
+        // Clamp scale to [MIN_SCALE, MAX_SCALE] for numerical stability
+        let scale = params
+            .column(1)
+            .mapv(|p| f64::exp(p).clamp(MIN_SCALE, MAX_SCALE));
         let var = &scale * &scale;
         Normal {
             loc,
@@ -69,7 +77,7 @@ impl Scorable<LogScore> for Normal {
             } else {
                 0.0
             };
-            let safe_scale = if self.scale[i] > 1e-6 && self.scale[i].is_finite() {
+            let safe_scale = if self.scale[i] >= MIN_SCALE && self.scale[i].is_finite() {
                 self.scale[i]
             } else {
                 1.0

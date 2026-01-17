@@ -2,13 +2,21 @@ use crate::dist::{ClassificationDistn, Distribution};
 use crate::scores::{LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, Axis};
 
-/// Softmax function applied along axis 0.
+/// Minimum probability value to avoid log(0) and division issues.
+const PROB_EPS: f64 = 1e-10;
+/// Maximum probability value (1 - PROB_EPS) to maintain numerical stability.
+const PROB_MAX: f64 = 1.0 - PROB_EPS;
+
+/// Softmax function applied along axis 0 with numerical stability improvements.
+/// Returns probabilities clamped to [PROB_EPS, PROB_MAX] to avoid log(0).
 fn softmax_axis0(logits: &Array2<f64>) -> Array2<f64> {
     let max_vals = logits.fold_axis(Axis(0), f64::NEG_INFINITY, |&a, &b| a.max(b));
     let shifted = logits - &max_vals;
     let exp_vals = shifted.mapv(f64::exp);
     let sum_exp = exp_vals.sum_axis(Axis(0));
-    exp_vals / &sum_exp
+    let probs = exp_vals / &sum_exp;
+    // Clamp probabilities to avoid numerical issues in log computations
+    probs.mapv(|p| p.clamp(PROB_EPS, PROB_MAX))
 }
 
 /// A K-class Categorical distribution for classification.
@@ -61,14 +69,17 @@ impl<const K: usize> Distribution for Categorical<K> {
             }
         }
 
-        // Convert to probabilities
-        let probs: Vec<f64> = counts.iter().map(|&c| c as f64 / n as f64).collect();
+        // Convert to probabilities with smoothing to avoid log(0)
+        let probs: Vec<f64> = counts
+            .iter()
+            .map(|&c| (c as f64 / n as f64).max(PROB_EPS))
+            .collect();
 
         // Return logits relative to class 0: log(p_k) - log(p_0)
-        let log_p0 = (probs[0].max(1e-10)).ln();
+        let log_p0 = probs[0].ln();
         let mut init_params = Array1::zeros(K - 1);
         for k in 1..K {
-            init_params[k - 1] = (probs[k].max(1e-10)).ln() - log_p0;
+            init_params[k - 1] = probs[k].ln() - log_p0;
         }
 
         init_params
@@ -113,7 +124,7 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
         let mut scores = Array1::zeros(y.len());
         for (i, &y_i) in y.iter().enumerate() {
             let class = y_i as usize;
-            scores[i] = -self.probs[[class, i]].max(1e-10).ln();
+            scores[i] = -self.probs[[class, i]].max(PROB_EPS).ln();
         }
         scores
     }

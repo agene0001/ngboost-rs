@@ -1,13 +1,14 @@
-//! Example demonstrating different probability distributions available in NGBoost.
-//!
-//! This example shows how to use various distributions for different types of data:
-//! - Normal: General continuous data
-//! - Poisson: Count data
-//! - Gamma: Positive continuous data (e.g., wait times)
-//! - Laplace: Data with heavy tails
-
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
+
+// Example demonstrating different probability distributions available in NGBoost.
+//
+// This example shows how to use various distributions for different types of data:
+// - Normal: General continuous data
+// - Poisson: Count data
+// - Gamma: Positive continuous data (e.g., wait times)
+// - Laplace: Data with heavy tails
+
 
 use ndarray::{Array1, Array2};
 use ndarray_rand::rand_distr::Uniform;

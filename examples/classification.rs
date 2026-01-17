@@ -1,12 +1,13 @@
-//! Binary classification example using NGBoost with Bernoulli distribution.
-//!
-//! This example demonstrates:
-//! - Creating synthetic classification data
-//! - Training an NGBoost classifier
-//! - Making predictions and getting class probabilities
-
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
+
+// Binary classification example using NGBoost with Bernoulli distribution.
+//
+// This example demonstrates:
+// - Creating synthetic classification data
+// - Training an NGBoost classifier
+// - Making predictions and getting class probabilities
+
 
 use ndarray::{Array1, Array2};
 use ndarray_rand::rand_distr::Uniform;

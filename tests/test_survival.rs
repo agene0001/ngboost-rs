@@ -1,9 +1,9 @@
-//! Survival analysis tests matching Python's survival-related tests.
-//!
-//! Tests the NGBSurvival implementation with censored data.
-
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
+
+// Survival analysis tests matching Python's survival-related tests.
+//
+// Tests the NGBSurvival implementation with censored data.
 
 use ndarray::{Array1, Array2};
 use ndarray_rand::rand_distr::Uniform;

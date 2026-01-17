@@ -1,7 +1,7 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
-pub trait BaseLearner {
+pub trait BaseLearner: Send + Sync {
     fn fit(
         &self,
         x: &Array2<f64>,
@@ -53,6 +53,7 @@ pub enum SerializableTrainedLearner {
     Stump(TrainedStumpLearner),
     DecisionTree(TrainedDecisionTree),
     HistogramTree(TrainedHistogramTree),
+    Ridge(TrainedRidgeLearner),
 }
 
 impl SerializableTrainedLearner {
@@ -70,6 +71,7 @@ impl SerializableTrainedLearner {
             SerializableTrainedLearner::Stump(s) => Box::new(s),
             SerializableTrainedLearner::DecisionTree(t) => Box::new(t),
             SerializableTrainedLearner::HistogramTree(h) => Box::new(h),
+            SerializableTrainedLearner::Ridge(r) => Box::new(r),
         }
     }
 }
@@ -80,6 +82,7 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::Stump(s) => s.predict(x),
             SerializableTrainedLearner::DecisionTree(t) => t.predict(x),
             SerializableTrainedLearner::HistogramTree(h) => h.predict(x),
+            SerializableTrainedLearner::Ridge(r) => r.predict(x),
         }
     }
 
@@ -88,6 +91,7 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::Stump(s) => s.feature_importances(),
             SerializableTrainedLearner::DecisionTree(t) => t.feature_importances(),
             SerializableTrainedLearner::HistogramTree(h) => h.feature_importances(),
+            SerializableTrainedLearner::Ridge(r) => r.feature_importances(),
         }
     }
 
@@ -96,6 +100,7 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::Stump(s) => s.split_feature(),
             SerializableTrainedLearner::DecisionTree(t) => t.split_feature(),
             SerializableTrainedLearner::HistogramTree(h) => h.split_feature(),
+            SerializableTrainedLearner::Ridge(_) => None, // Linear models don't split
         }
     }
 
@@ -104,6 +109,7 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::Stump(s) => s.split_features(),
             SerializableTrainedLearner::DecisionTree(t) => t.split_features(),
             SerializableTrainedLearner::HistogramTree(h) => h.split_features(),
+            SerializableTrainedLearner::Ridge(_) => None, // Linear models don't split
         }
     }
 }
@@ -290,6 +296,197 @@ fn find_best_split(x: &Array2<f64>, y: &Array1<f64>) -> (usize, f64, f64) {
 }
 
 // ============================================================================
+// Ridge (L2-regularized Linear) Learner
+// ============================================================================
+
+/// A Ridge regression learner (L2-regularized least squares).
+/// Matches sklearn's Ridge with alpha parameter.
+///
+/// Solves: min_w ||y - Xw||^2 + alpha * ||w||^2
+#[derive(Clone)]
+pub struct RidgeLearner {
+    /// Regularization strength. Larger values specify stronger regularization.
+    pub alpha: f64,
+    /// Whether to fit an intercept term.
+    pub fit_intercept: bool,
+}
+
+impl RidgeLearner {
+    /// Create a new Ridge learner with the given regularization strength.
+    pub fn new(alpha: f64) -> Self {
+        RidgeLearner {
+            alpha,
+            fit_intercept: true,
+        }
+    }
+
+    /// Create a Ridge learner with alpha=0 (equivalent to OLS).
+    /// This matches Python's default_linear_learner = Ridge(alpha=0.0)
+    pub fn default_linear() -> Self {
+        RidgeLearner {
+            alpha: 0.0,
+            fit_intercept: true,
+        }
+    }
+
+    /// Create a Ridge learner with custom options.
+    pub fn with_options(alpha: f64, fit_intercept: bool) -> Self {
+        RidgeLearner {
+            alpha,
+            fit_intercept,
+        }
+    }
+}
+
+impl BaseLearner for RidgeLearner {
+    fn fit_with_weights(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+    ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
+        if x.nrows() == 0 {
+            return Err("Cannot fit to empty dataset");
+        }
+        if x.nrows() != y.len() {
+            return Err("X and y must have the same number of samples");
+        }
+
+        let n_samples = x.nrows();
+        let n_features = x.ncols();
+
+        // Apply sample weights by scaling X and y
+        let (x_weighted, y_weighted) = if let Some(weights) = sample_weight {
+            // Scale by sqrt(weight) so that (X'WX) becomes (X_w'X_w)
+            let sqrt_weights = weights.mapv(|w| w.sqrt());
+            let mut x_w = x.clone();
+            let mut y_w = y.clone();
+            for i in 0..n_samples {
+                let sw = sqrt_weights[i];
+                for j in 0..n_features {
+                    x_w[[i, j]] *= sw;
+                }
+                y_w[i] *= sw;
+            }
+            (x_w, y_w)
+        } else {
+            (x.clone(), y.clone())
+        };
+
+        // Handle intercept by centering
+        let (x_centered, y_centered, x_mean, y_mean) = if self.fit_intercept {
+            let x_mean = x_weighted.mean_axis(ndarray::Axis(0)).unwrap();
+            let y_mean = y_weighted.mean().unwrap_or(0.0);
+
+            let x_centered = &x_weighted - &x_mean;
+            let y_centered = &y_weighted - y_mean;
+
+            (x_centered, y_centered, Some(x_mean), y_mean)
+        } else {
+            (x_weighted, y_weighted, None, 0.0)
+        };
+
+        // Solve Ridge regression: (X'X + alpha*I)^{-1} X'y
+        // Using the normal equations approach
+        let xtx = x_centered.t().dot(&x_centered);
+        let xty = x_centered.t().dot(&y_centered);
+
+        // Add regularization: X'X + alpha * I
+        let mut xtx_reg = xtx;
+        for i in 0..n_features {
+            xtx_reg[[i, i]] += self.alpha;
+        }
+
+        // Solve the linear system
+        use ndarray_linalg::Solve;
+        let coefficients = match xtx_reg.solve_into(xty) {
+            Ok(coef) => coef,
+            Err(_) => {
+                // If solve fails, try with more regularization
+                for i in 0..n_features {
+                    xtx_reg[[i, i]] += 1e-6;
+                }
+                match xtx_reg.solve_into(x_centered.t().dot(&y_centered)) {
+                    Ok(coef) => coef,
+                    Err(_) => {
+                        // Fall back to zero coefficients
+                        Array1::zeros(n_features)
+                    }
+                }
+            }
+        };
+
+        // Compute intercept
+        let intercept = if self.fit_intercept {
+            let x_mean = x_mean.unwrap();
+            y_mean - x_mean.dot(&coefficients)
+        } else {
+            0.0
+        };
+
+        Ok(Box::new(TrainedRidgeLearner {
+            coefficients: coefficients.to_vec(),
+            intercept,
+            n_features,
+        }))
+    }
+}
+
+/// A trained Ridge regression model.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TrainedRidgeLearner {
+    /// Coefficient weights for each feature (stored as Vec for serialization).
+    pub coefficients: Vec<f64>,
+    /// Intercept term.
+    pub intercept: f64,
+    /// Number of features the model was trained on.
+    pub n_features: usize,
+}
+
+impl TrainedRidgeLearner {
+    /// Get coefficients as an Array1.
+    pub fn coefficients_array(&self) -> Array1<f64> {
+        Array1::from(self.coefficients.clone())
+    }
+}
+
+impl TrainedBaseLearner for TrainedRidgeLearner {
+    fn predict(&self, x: &Array2<f64>) -> Array1<f64> {
+        // y = X @ w + b
+        let coef = Array1::from(self.coefficients.clone());
+        x.dot(&coef) + self.intercept
+    }
+
+    fn feature_importances(&self) -> Option<Array1<f64>> {
+        // For linear models, use absolute coefficient values as importance
+        let abs_coef: Vec<f64> = self.coefficients.iter().map(|c| c.abs()).collect();
+        let sum: f64 = abs_coef.iter().sum();
+        if sum > 0.0 {
+            Some(Array1::from(
+                abs_coef.iter().map(|c| c / sum).collect::<Vec<_>>(),
+            ))
+        } else {
+            Some(Array1::zeros(self.n_features))
+        }
+    }
+
+    fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
+        Some(SerializableTrainedLearner::Ridge(self.clone()))
+    }
+}
+
+/// Returns the default linear learner matching Python's sklearn default:
+/// Ridge(alpha=0.0) which is equivalent to OLS
+pub fn default_linear_learner() -> RidgeLearner {
+    RidgeLearner::default_linear()
+}
+
+/// Returns a Ridge learner with specified regularization
+pub fn ridge_learner(alpha: f64) -> RidgeLearner {
+    RidgeLearner::new(alpha)
+}
+
+// ============================================================================
 // Histogram-based Gradient Boosting Learner
 // ============================================================================
 
@@ -360,7 +557,10 @@ impl BaseLearner for HistogramLearner {
 
         // Build bin edges for each feature
         let bin_edges: Vec<Vec<f64>> = (0..n_features)
-            .map(|f| compute_bin_edges(x.column(f).as_slice().unwrap(), self.max_bins))
+            .map(|f| {
+                let col_vec: Vec<f64> = x.column(f).to_vec();
+                compute_bin_edges(&col_vec, self.max_bins)
+            })
             .collect();
 
         // Bin the data (convert continuous to discrete bin indices)

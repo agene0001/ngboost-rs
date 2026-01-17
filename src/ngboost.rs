@@ -6,11 +6,54 @@ use crate::dist::normal::Normal;
 use crate::dist::{ClassificationDistn, Distribution};
 use crate::learners::{default_tree_learner, BaseLearner, DecisionTreeLearner, TrainedBaseLearner};
 use crate::scores::{LogScore, Scorable, Score};
-use ndarray::s;
 use ndarray::{Array1, Array2};
 use rand::prelude::*;
 use rand::rng;
 use std::marker::PhantomData;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+/// Learning rate schedule for controlling step size during training.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum LearningRateSchedule {
+    /// Constant learning rate throughout training.
+    #[default]
+    Constant,
+    /// Linear decay: lr * (1 - decay_rate * progress), clamped to min_lr.
+    /// Default: decay_rate=0.7, min_lr=0.1
+    Linear {
+        decay_rate: f64,
+        min_lr_fraction: f64,
+    },
+    /// Exponential decay: lr * exp(-decay_rate * progress).
+    Exponential { decay_rate: f64 },
+    /// Cosine annealing: lr * 0.5 * (1 + cos(pi * progress)).
+    /// Proven effective for probabilistic models.
+    Cosine,
+    /// Cosine annealing with warm restarts.
+    /// Restarts the schedule every `restart_period` iterations.
+    CosineWarmRestarts { restart_period: u32 },
+}
+
+/// Line search method for finding optimal step size.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum LineSearchMethod {
+    /// Binary search (original NGBoost method): scale up then scale down by 2x.
+    /// Fast but may miss optimal step size.
+    #[default]
+    Binary,
+    /// Golden section search: more accurate but slightly slower.
+    /// Uses the golden ratio to efficiently narrow down the optimal step size.
+    /// Generally finds better step sizes with fewer function evaluations.
+    GoldenSection {
+        /// Maximum number of iterations (default: 20)
+        max_iters: usize,
+    },
+}
+
+/// Golden ratio constant for golden section search.
+const GOLDEN_RATIO: f64 = 1.618033988749895;
 
 pub struct NGBoost<D, S, B>
 where
@@ -29,7 +72,15 @@ where
     pub tol: f64,
     pub early_stopping_rounds: Option<u32>,
     pub validation_fraction: f64,
-    pub adaptive_learning_rate: bool, // Enable adaptive learning rate for better convergence
+    pub adaptive_learning_rate: bool, // Enable adaptive learning rate for better convergence (deprecated, use lr_schedule)
+    /// Learning rate schedule for controlling step size during training.
+    pub lr_schedule: LearningRateSchedule,
+    /// Tikhonov regularization parameter for stabilizing Fisher matrix inversion.
+    /// Added to diagonal of Fisher Information Matrix: F + tikhonov_reg * I.
+    /// Set to 0.0 to disable (default). Typical values: 1e-6 to 1e-3.
+    pub tikhonov_reg: f64,
+    /// Line search method for finding optimal step size.
+    pub line_search_method: LineSearchMethod,
 
     // Base learner
     base_learner: B,
@@ -70,7 +121,10 @@ where
             tol: 1e-4,
             early_stopping_rounds: None,
             validation_fraction: 0.1,
-            adaptive_learning_rate: false, // Default to false for backward compatibility
+            adaptive_learning_rate: false,
+            lr_schedule: LearningRateSchedule::Constant,
+            tikhonov_reg: 0.0,
+            line_search_method: LineSearchMethod::Binary,
             base_learner,
             base_models: Vec::new(),
             scalings: Vec::new(),
@@ -112,6 +166,57 @@ where
             early_stopping_rounds,
             validation_fraction,
             adaptive_learning_rate,
+            lr_schedule: LearningRateSchedule::Constant,
+            tikhonov_reg: 0.0,
+            line_search_method: LineSearchMethod::Binary,
+            base_learner,
+            base_models: Vec::new(),
+            scalings: Vec::new(),
+            init_params: None,
+            col_idxs: Vec::new(),
+            train_loss_monitor: None,
+            val_loss_monitor: None,
+            best_val_loss_itr: None,
+            n_features: None,
+            rng: rng(),
+            _dist: PhantomData,
+            _score: PhantomData,
+        }
+    }
+
+    /// Create NGBoost with advanced options including learning rate schedule and regularization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_advanced_options(
+        n_estimators: u32,
+        learning_rate: f64,
+        base_learner: B,
+        natural_gradient: bool,
+        minibatch_frac: f64,
+        col_sample: f64,
+        verbose: bool,
+        verbose_eval: u32,
+        tol: f64,
+        early_stopping_rounds: Option<u32>,
+        validation_fraction: f64,
+        lr_schedule: LearningRateSchedule,
+        tikhonov_reg: f64,
+        line_search_method: LineSearchMethod,
+    ) -> Self {
+        NGBoost {
+            n_estimators,
+            learning_rate,
+            natural_gradient,
+            minibatch_frac,
+            col_sample,
+            verbose,
+            verbose_eval,
+            tol,
+            early_stopping_rounds,
+            validation_fraction,
+            adaptive_learning_rate: false,
+            lr_schedule,
+            tikhonov_reg,
+            line_search_method,
             base_learner,
             base_models: Vec::new(),
             scalings: Vec::new(),
@@ -177,6 +282,70 @@ where
         self.fit_internal(x, y, x_val, y_val, sample_weight, val_sample_weight, true)
     }
 
+    /// Validates hyperparameters before fitting.
+    /// Returns an error message if any hyperparameter is invalid.
+    fn validate_hyperparameters(&self) -> Result<(), &'static str> {
+        if self.n_estimators == 0 {
+            return Err("n_estimators must be greater than 0");
+        }
+        if self.learning_rate <= 0.0 {
+            return Err("learning_rate must be positive");
+        }
+        if self.learning_rate > 10.0 {
+            return Err("learning_rate > 10.0 is likely a mistake");
+        }
+        if self.minibatch_frac <= 0.0 || self.minibatch_frac > 1.0 {
+            return Err("minibatch_frac must be in (0, 1]");
+        }
+        if self.col_sample <= 0.0 || self.col_sample > 1.0 {
+            return Err("col_sample must be in (0, 1]");
+        }
+        if self.tol < 0.0 {
+            return Err("tol must be non-negative");
+        }
+        if self.validation_fraction < 0.0 || self.validation_fraction >= 1.0 {
+            return Err("validation_fraction must be in [0, 1)");
+        }
+        if self.tikhonov_reg < 0.0 {
+            return Err("tikhonov_reg must be non-negative");
+        }
+
+        // Validate learning rate schedule parameters
+        match self.lr_schedule {
+            LearningRateSchedule::Linear {
+                decay_rate,
+                min_lr_fraction,
+            } => {
+                if decay_rate < 0.0 || decay_rate > 1.0 {
+                    return Err("Linear schedule decay_rate must be in [0, 1]");
+                }
+                if min_lr_fraction < 0.0 || min_lr_fraction > 1.0 {
+                    return Err("Linear schedule min_lr_fraction must be in [0, 1]");
+                }
+            }
+            LearningRateSchedule::Exponential { decay_rate } => {
+                if decay_rate < 0.0 {
+                    return Err("Exponential schedule decay_rate must be non-negative");
+                }
+            }
+            LearningRateSchedule::CosineWarmRestarts { restart_period } => {
+                if restart_period == 0 {
+                    return Err("CosineWarmRestarts restart_period must be > 0");
+                }
+            }
+            _ => {}
+        }
+
+        // Validate line search parameters
+        if let LineSearchMethod::GoldenSection { max_iters } = self.line_search_method {
+            if max_iters == 0 {
+                return Err("GoldenSection max_iters must be > 0");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Internal fit implementation that can optionally reset state.
     fn fit_internal(
         &mut self,
@@ -188,6 +357,9 @@ where
         _val_sample_weight: Option<&Array1<f64>>,
         reset_state: bool,
     ) -> Result<(), &'static str> {
+        // Validate hyperparameters first
+        self.validate_hyperparameters()?;
+
         // Validate input dimensions with more detailed error messages
         if x.nrows() != y.len() {
             return Err("Number of samples in X and y must match");
@@ -224,15 +396,25 @@ where
             && self.validation_fraction < 1.0
         {
             // Split training data into training and validation sets
+            // Shuffle indices first to match sklearn's train_test_split behavior
             let n_samples = x.nrows();
             let n_val = ((n_samples as f64) * self.validation_fraction) as usize;
             let n_train = n_samples - n_val;
 
-            // Simple split (could be enhanced with proper shuffling)
-            let x_train = x.slice(s![0..n_train, ..]).to_owned();
-            let y_train = y.slice(s![0..n_train]).to_owned();
-            let x_val_auto = Some(x.slice(s![n_train..n_samples, ..]).to_owned());
-            let y_val_auto = Some(y.slice(s![n_train..n_samples]).to_owned());
+            // Shuffle indices for random split (matches Python's train_test_split)
+            let mut indices: Vec<usize> = (0..n_samples).collect();
+            for i in (1..indices.len()).rev() {
+                let j = self.rng.random_range(0..=i);
+                indices.swap(i, j);
+            }
+
+            let train_indices: Vec<usize> = indices[0..n_train].to_vec();
+            let val_indices: Vec<usize> = indices[n_train..].to_vec();
+
+            let x_train = x.select(ndarray::Axis(0), &train_indices);
+            let y_train = y.select(ndarray::Axis(0), &train_indices);
+            let x_val_auto = Some(x.select(ndarray::Axis(0), &val_indices));
+            let y_val_auto = Some(y.select(ndarray::Axis(0), &val_indices));
 
             (x_train, y_train, x_val_auto, y_val_auto)
         } else {
@@ -282,7 +464,20 @@ where
 
         for itr in 0..self.n_estimators {
             let dist = D::from_params(&params);
-            let grads = Scorable::grad(&dist, &y_train, self.natural_gradient);
+
+            // Compute gradients with optional Tikhonov regularization
+            let grads = if self.natural_gradient && self.tikhonov_reg > 0.0 {
+                // Use regularized natural gradient for better numerical stability
+                let standard_grad = Scorable::d_score(&dist, &y_train);
+                let metric = Scorable::metric(&dist);
+                crate::scores::natural_gradient_regularized(
+                    &standard_grad,
+                    &metric,
+                    self.tikhonov_reg,
+                )
+            } else {
+                Scorable::grad(&dist, &y_train, self.natural_gradient)
+            };
 
             // Sample data for this iteration
             let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
@@ -291,16 +486,51 @@ where
 
             let grads_sampled = grads.select(ndarray::Axis(0), &row_idxs);
 
-            let mut fitted_learners: Vec<Box<dyn TrainedBaseLearner>> = Vec::new();
-            let mut predictions_cols: Vec<Array1<f64>> = Vec::new();
+            // Fit base learners for each parameter - parallelized when feature enabled
+            #[cfg(feature = "parallel")]
+            let fit_results: Vec<
+                Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>,
+            > = {
+                // Pre-clone learners to avoid borrow issues in parallel iterator
+                let learners: Vec<B> = (0..n_params).map(|_| self.base_learner.clone()).collect();
+                learners
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(j, learner)| {
+                        let grad_j = grads_sampled.column(j).to_owned();
+                        let fitted = learner.fit_with_weights(
+                            &x_sampled,
+                            &grad_j,
+                            weight_sampled.as_ref(),
+                        )?;
+                        let preds = fitted.predict(&x_sampled);
+                        Ok((fitted, preds))
+                    })
+                    .collect()
+            };
 
-            for j in 0..n_params {
-                let grad_j = grads_sampled.column(j).to_owned();
-                let learner = self.base_learner.clone();
-                let fitted =
-                    learner.fit_with_weights(&x_sampled, &grad_j, weight_sampled.as_ref())?;
-                predictions_cols.push(fitted.predict(&x_sampled));
+            #[cfg(not(feature = "parallel"))]
+            let fit_results: Vec<
+                Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>,
+            > = (0..n_params)
+                .map(|j| {
+                    let grad_j = grads_sampled.column(j).to_owned();
+                    let learner = self.base_learner.clone();
+                    let fitted =
+                        learner.fit_with_weights(&x_sampled, &grad_j, weight_sampled.as_ref())?;
+                    let preds = fitted.predict(&x_sampled);
+                    Ok((fitted, preds))
+                })
+                .collect();
+
+            // Unpack results, propagating any errors
+            let mut fitted_learners: Vec<Box<dyn TrainedBaseLearner>> =
+                Vec::with_capacity(n_params);
+            let mut predictions_cols: Vec<Array1<f64>> = Vec::with_capacity(n_params);
+            for result in fit_results {
+                let (fitted, preds) = result?;
                 fitted_learners.push(fitted);
+                predictions_cols.push(preds);
             }
 
             let predictions = to_2d_array(predictions_cols);
@@ -314,39 +544,50 @@ where
             self.scalings.push(scale);
             self.base_models.push(fitted_learners);
 
-            // Update full parameters using the sampled predictions
-            let mut full_predictions = Array2::zeros(params.raw_dim());
-            for j in 0..n_params {
-                let mut pred_col = Array1::zeros(x_train.nrows());
-                // Map the sampled predictions back to the full row set
-                for (i, &row_idx) in row_idxs.iter().enumerate() {
-                    pred_col[row_idx] = predictions[[i, j]];
-                }
-                // Assign to the specific parameter column (j)
-                full_predictions.column_mut(j).assign(&pred_col);
-            }
+            // Apply learning rate schedule
+            let progress = itr as f64 / self.n_estimators as f64;
+            let effective_learning_rate = self.compute_learning_rate(itr, progress);
 
-            // Apply adaptive learning rate if enabled
-            let effective_learning_rate = if self.adaptive_learning_rate {
-                // Reduce learning rate as we progress for better fine-tuning
-                let progress = itr as f64 / self.n_estimators as f64;
-                self.learning_rate * (1.0 - 0.7 * progress).max(0.1)
+            // Update parameters for ALL training samples by re-predicting on full X
+            // This matches Python's behavior: after fitting base learners on minibatch,
+            // we predict on the FULL training set to update all parameters
+            // This is critical for correct convergence with minibatch_frac < 1.0
+            let fitted_learners = self.base_models.last().unwrap();
+            let full_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == x_train.ncols() {
+                fitted_learners
+                    .iter()
+                    .map(|learner| learner.predict(&x_train))
+                    .collect()
             } else {
-                self.learning_rate
+                let x_subset = x_train.select(ndarray::Axis(1), &col_idxs);
+                fitted_learners
+                    .iter()
+                    .map(|learner| learner.predict(&x_subset))
+                    .collect()
             };
+            let full_predictions = to_2d_array(full_predictions_cols);
 
             params -= &(effective_learning_rate * scale * &full_predictions);
 
             // Update validation parameters if validation data is provided
             if let (Some(xv), Some(yv), Some(vp)) = (x_val, y_val, val_params.as_mut()) {
                 // Get predictions on validation data from the fitted base learners
+                // Apply column subsampling to match training
                 let fitted_learners = self.base_models.last().unwrap();
-                let val_predictions_cols: Vec<Array1<f64>> = fitted_learners
-                    .iter()
-                    .map(|learner| learner.predict(xv))
-                    .collect();
+                let val_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == xv.ncols() {
+                    fitted_learners
+                        .iter()
+                        .map(|learner| learner.predict(xv))
+                        .collect()
+                } else {
+                    let xv_subset = xv.select(ndarray::Axis(1), &col_idxs);
+                    fitted_learners
+                        .iter()
+                        .map(|learner| learner.predict(&xv_subset))
+                        .collect()
+                };
                 let val_predictions = to_2d_array(val_predictions_cols);
-                *vp -= &(self.learning_rate * scale * &val_predictions);
+                *vp -= &(effective_learning_rate * scale * &val_predictions);
 
                 // Calculate validation loss using monitor or default
                 let val_dist = D::from_params(vp);
@@ -474,10 +715,22 @@ where
             indices.into_iter().take(col_size).collect()
         };
 
-        // Create sampled data
-        let x_sampled = x
-            .select(ndarray::Axis(0), &row_idxs)
-            .select(ndarray::Axis(1), &col_idxs);
+        // Create sampled data with optimized single-pass selection
+        // Instead of two sequential selects (which create an intermediate array),
+        // we directly construct the result array
+        let x_sampled = if col_size == n_features {
+            // No column sampling - just select rows (single allocation)
+            x.select(ndarray::Axis(0), &row_idxs)
+        } else {
+            // Both row and column sampling - single allocation with direct indexing
+            let mut result = Array2::zeros((row_idxs.len(), col_idxs.len()));
+            for (new_row, &old_row) in row_idxs.iter().enumerate() {
+                for (new_col, &old_col) in col_idxs.iter().enumerate() {
+                    result[[new_row, new_col]] = x[[old_row, old_col]];
+                }
+            }
+            result
+        };
         let y_sampled = y.select(ndarray::Axis(0), &row_idxs);
         let params_sampled = params.select(ndarray::Axis(0), &row_idxs);
 
@@ -504,7 +757,10 @@ where
             return Array2::zeros((0, 0));
         }
 
-        let init_params = self.init_params.as_ref().unwrap();
+        let init_params = self
+            .init_params
+            .as_ref()
+            .expect("Model has not been fitted. Call fit() before predict().");
         let n_params = init_params.len();
         let mut params = Array2::from_elem((x.nrows(), n_params), 0.0);
         params
@@ -515,7 +771,7 @@ where
             .unwrap_or(self.base_models.len())
             .min(self.base_models.len());
 
-        for (i, (learners, _col_idx)) in self
+        for (i, (learners, col_idx)) in self
             .base_models
             .iter()
             .zip(self.col_idxs.iter())
@@ -524,8 +780,17 @@ where
         {
             let scale = self.scalings[i];
 
-            let predictions_cols: Vec<Array1<f64>> =
-                learners.iter().map(|learner| learner.predict(x)).collect();
+            // Apply column subsampling during prediction to match training
+            // This is critical when col_sample < 1.0
+            let predictions_cols: Vec<Array1<f64>> = if col_idx.len() == x.ncols() {
+                learners.iter().map(|learner| learner.predict(x)).collect()
+            } else {
+                let x_subset = x.select(ndarray::Axis(1), col_idx);
+                learners
+                    .iter()
+                    .map(|learner| learner.predict(&x_subset))
+                    .collect()
+            };
 
             let predictions = to_2d_array(predictions_cols);
 
@@ -586,6 +851,32 @@ where
     /// Get number of features the model was trained on
     pub fn n_features(&self) -> Option<usize> {
         self.n_features
+    }
+
+    /// Compute the effective learning rate for the given iteration using the configured schedule.
+    fn compute_learning_rate(&self, iteration: u32, progress: f64) -> f64 {
+        // Legacy adaptive_learning_rate takes precedence for backward compatibility
+        if self.adaptive_learning_rate {
+            return self.learning_rate * (1.0 - 0.7 * progress).max(0.1);
+        }
+
+        match self.lr_schedule {
+            LearningRateSchedule::Constant => self.learning_rate,
+            LearningRateSchedule::Linear {
+                decay_rate,
+                min_lr_fraction,
+            } => self.learning_rate * (1.0 - decay_rate * progress).max(min_lr_fraction),
+            LearningRateSchedule::Exponential { decay_rate } => {
+                self.learning_rate * (-decay_rate * progress).exp()
+            }
+            LearningRateSchedule::Cosine => {
+                self.learning_rate * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+            }
+            LearningRateSchedule::CosineWarmRestarts { restart_period } => {
+                let period_progress = (iteration % restart_period) as f64 / restart_period as f64;
+                self.learning_rate * 0.5 * (1.0 + (std::f64::consts::PI * period_progress).cos())
+            }
+        }
     }
 
     /// Compute feature importances based on how often each feature is used in splits.
@@ -682,6 +973,22 @@ where
         y: &Array1<f64>,
         sample_weight: Option<&Array1<f64>>,
     ) -> f64 {
+        match self.line_search_method {
+            LineSearchMethod::Binary => self.line_search_binary(resids, start, y, sample_weight),
+            LineSearchMethod::GoldenSection { max_iters } => {
+                self.line_search_golden_section(resids, start, y, sample_weight, max_iters)
+            }
+        }
+    }
+
+    /// Binary line search (original NGBoost method).
+    fn line_search_binary(
+        &self,
+        resids: &Array2<f64>,
+        start: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+    ) -> f64 {
         let mut scale = 1.0;
         let initial_score = Scorable::total_score(&D::from_params(start), y, sample_weight);
 
@@ -700,10 +1007,8 @@ where
         }
 
         // Scale down phase: find a step that actually reduces loss
-        // Check residual norm for convergence (like Python does)
         loop {
             let scaled_resids = resids * scale;
-            // Compute MEAN norm of scaled residuals (matching Python's np.linalg.norm(..., axis=1).mean())
             let norm: f64 = scaled_resids
                 .rows()
                 .into_iter()
@@ -721,13 +1026,88 @@ where
             }
             scale *= 0.5;
 
-            // Prevent infinite loop with minimum scale
             if scale < 1e-10 {
                 break;
             }
         }
 
         scale
+    }
+
+    /// Golden section line search for more accurate step size.
+    /// Uses the golden ratio to efficiently narrow down the optimal step size.
+    fn line_search_golden_section(
+        &self,
+        resids: &Array2<f64>,
+        start: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        max_iters: usize,
+    ) -> f64 {
+        // Helper to compute score at a given scale
+        let compute_score = |scale: f64| -> f64 {
+            let scaled_resids = resids * scale;
+            let next_params = start - &scaled_resids;
+            Scorable::total_score(&D::from_params(&next_params), y, sample_weight)
+        };
+
+        let initial_score = compute_score(0.0);
+
+        // First, find a reasonable upper bound by scaling up
+        let mut upper = 1.0;
+        while upper < 256.0 {
+            let score = compute_score(upper * 2.0);
+            if score >= initial_score || !score.is_finite() {
+                break;
+            }
+            upper *= 2.0;
+        }
+
+        // Golden section search between 0 and upper
+        let mut a = 0.0;
+        let mut b = upper;
+        let inv_phi = 1.0 / GOLDEN_RATIO;
+        let _inv_phi2 = 1.0 / (GOLDEN_RATIO * GOLDEN_RATIO); // Available for Brent's method extension
+
+        // Initial interior points
+        let mut c = b - (b - a) * inv_phi;
+        let mut d = a + (b - a) * inv_phi;
+        let mut fc = compute_score(c);
+        let mut fd = compute_score(d);
+
+        for _ in 0..max_iters {
+            if (b - a).abs() < self.tol {
+                break;
+            }
+
+            if fc < fd {
+                // Minimum is in [a, d]
+                b = d;
+                d = c;
+                fd = fc;
+                c = b - (b - a) * inv_phi;
+                fc = compute_score(c);
+            } else {
+                // Minimum is in [c, b]
+                a = c;
+                c = d;
+                fc = fd;
+                d = a + (b - a) * inv_phi;
+                fd = compute_score(d);
+            }
+        }
+
+        // Return the midpoint of the final interval
+        let scale = (a + b) / 2.0;
+
+        // Verify the scale actually reduces loss, otherwise fall back
+        let final_score = compute_score(scale);
+        if final_score < initial_score && final_score.is_finite() {
+            scale
+        } else {
+            // Fall back to a small step
+            1.0
+        }
     }
 
     /// Serialize the model to a platform-independent format
@@ -760,6 +1140,10 @@ where
             col_idxs: self.col_idxs.clone(),
             best_val_loss_itr: self.best_val_loss_itr,
             base_models: serialized_base_models,
+            lr_schedule: self.lr_schedule,
+            tikhonov_reg: self.tikhonov_reg,
+            line_search_method: self.line_search_method,
+            n_features: self.n_features,
         })
     }
 
@@ -796,6 +1180,12 @@ where
         model.col_idxs = serialized.col_idxs;
         model.best_val_loss_itr = serialized.best_val_loss_itr;
 
+        // Restore advanced options (added in v0.3)
+        model.lr_schedule = serialized.lr_schedule;
+        model.tikhonov_reg = serialized.tikhonov_reg;
+        model.line_search_method = serialized.line_search_method;
+        model.n_features = serialized.n_features;
+
         // Restore base models
         model.base_models = serialized
             .base_models
@@ -826,6 +1216,18 @@ pub struct SerializedNGBoost {
     pub best_val_loss_itr: Option<usize>,
     /// Serialized base models - each inner Vec contains learners for each parameter
     pub base_models: Vec<Vec<crate::learners::SerializableTrainedLearner>>,
+    /// Learning rate schedule (added in v0.3)
+    #[serde(default)]
+    pub lr_schedule: LearningRateSchedule,
+    /// Tikhonov regularization parameter (added in v0.3)
+    #[serde(default)]
+    pub tikhonov_reg: f64,
+    /// Line search method (added in v0.3)
+    #[serde(default)]
+    pub line_search_method: LineSearchMethod,
+    /// Number of features the model was trained on (added in v0.3)
+    #[serde(default)]
+    pub n_features: Option<usize>,
 }
 
 fn to_2d_array(cols: Vec<Array1<f64>>) -> Array2<f64> {

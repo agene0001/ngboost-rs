@@ -1,9 +1,9 @@
-//! Serialization tests matching Python's test_pickling.py
-//!
-//! Tests that models can be saved and loaded correctly with predictions matching.
-
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
+
+// Serialization tests matching Python's test_pickling.py
+//
+// Tests that models can be saved and loaded correctly with predictions matching.
 
 use ndarray::{Array1, Array2};
 use ndarray_rand::rand_distr::Uniform;

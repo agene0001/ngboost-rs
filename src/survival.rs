@@ -259,24 +259,41 @@ where
             self.scalings.push(scale);
             self.base_models.push(fitted_learners);
 
-            // Update parameters
-            let mut full_predictions = Array2::zeros(params.raw_dim());
-            for j in 0..n_params {
-                let mut pred_col = Array1::zeros(x.nrows());
-                for (i, &row_idx) in row_idxs.iter().enumerate() {
-                    pred_col[row_idx] = predictions[[i, j]];
-                }
-                full_predictions.column_mut(j).assign(&pred_col);
-            }
+            // Update parameters for ALL training samples by re-predicting on full X
+            // This matches Python's behavior: after fitting base learners on minibatch,
+            // we predict on the FULL training set to update all parameters
+            let fitted_learners = self.base_models.last().unwrap();
+            let full_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == x.ncols() {
+                fitted_learners
+                    .iter()
+                    .map(|learner| learner.predict(x))
+                    .collect()
+            } else {
+                let x_subset = x.select(ndarray::Axis(1), &col_idxs);
+                fitted_learners
+                    .iter()
+                    .map(|learner| learner.predict(&x_subset))
+                    .collect()
+            };
+            let full_predictions = to_2d_array(full_predictions_cols);
             params -= &(self.learning_rate * scale * &full_predictions);
 
             // Handle validation and early stopping
             if let Some((ref xv, ref yv, ref mut vp)) = val_data.clone() {
+                // Apply column subsampling to match training
                 let fitted_learners = self.base_models.last().unwrap();
-                let val_predictions_cols: Vec<Array1<f64>> = fitted_learners
-                    .iter()
-                    .map(|learner| learner.predict(xv))
-                    .collect();
+                let val_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == xv.ncols() {
+                    fitted_learners
+                        .iter()
+                        .map(|learner| learner.predict(xv))
+                        .collect()
+                } else {
+                    let xv_subset = xv.select(ndarray::Axis(1), &col_idxs);
+                    fitted_learners
+                        .iter()
+                        .map(|learner| learner.predict(&xv_subset))
+                        .collect()
+                };
                 let val_predictions = to_2d_array(val_predictions_cols);
                 *vp -= &(self.learning_rate * scale * &val_predictions);
 
@@ -436,10 +453,25 @@ where
             .outer_iter_mut()
             .for_each(|mut row| row.assign(init_params));
 
-        for (i, learners) in self.base_models.iter().enumerate() {
+        for (i, (learners, col_idx)) in self
+            .base_models
+            .iter()
+            .zip(self.col_idxs.iter())
+            .enumerate()
+        {
             let scale = self.scalings[i];
-            let predictions_cols: Vec<Array1<f64>> =
-                learners.iter().map(|learner| learner.predict(x)).collect();
+
+            // Apply column subsampling during prediction to match training
+            let predictions_cols: Vec<Array1<f64>> = if col_idx.len() == x.ncols() {
+                learners.iter().map(|learner| learner.predict(x)).collect()
+            } else {
+                let x_subset = x.select(ndarray::Axis(1), col_idx);
+                learners
+                    .iter()
+                    .map(|learner| learner.predict(&x_subset))
+                    .collect()
+            };
+
             let predictions = to_2d_array(predictions_cols);
             params -= &(self.learning_rate * scale * &predictions);
         }

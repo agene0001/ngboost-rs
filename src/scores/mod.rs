@@ -137,6 +137,69 @@ pub trait CensoredScorable<S: Score> {
     }
 }
 
+/// Compute the natural gradient with optional Tikhonov regularization.
+/// This function adds `reg * I` to the metric before solving, which stabilizes
+/// the solution for ill-conditioned Fisher Information Matrices.
+///
+/// # Arguments
+/// * `grad` - The standard gradient (n_obs x n_params)
+/// * `metric` - The Fisher Information Matrix (n_obs x n_params x n_params)
+/// * `reg` - Tikhonov regularization parameter (0.0 to disable)
+///
+/// # Returns
+/// The natural gradient (n_obs x n_params)
+pub fn natural_gradient_regularized(
+    grad: &Array2<f64>,
+    metric: &Array3<f64>,
+    reg: f64,
+) -> Array2<f64> {
+    let n_obs = grad.nrows();
+    let n_params = grad.ncols();
+    let mut natural_grad = Array2::zeros(grad.raw_dim());
+
+    for i in 0..n_obs {
+        let g_i = grad.row(i).to_owned();
+        let mut metric_i = metric.index_axis(ndarray::Axis(0), i).to_owned();
+
+        // Apply Tikhonov regularization: F_reg = F + reg * I
+        if reg > 0.0 {
+            for j in 0..n_params {
+                metric_i[[j, j]] += reg;
+            }
+        }
+
+        // Try direct solve first (fastest)
+        if let Ok(ng_i) = metric_i.solve_into(g_i.clone()) {
+            if ng_i.iter().all(|&v| v.is_finite()) {
+                natural_grad.row_mut(i).assign(&ng_i);
+                continue;
+            }
+        }
+
+        // Fall back to inverse
+        if let Ok(inv_metric_i) = metric_i.inv() {
+            let result = inv_metric_i.dot(&grad.row(i));
+            if result.iter().all(|&v| v.is_finite()) {
+                natural_grad.row_mut(i).assign(&result);
+                continue;
+            }
+        }
+
+        // Fall back to pseudo-inverse
+        if let Some(pinv_metric_i) = pinv(&metric_i) {
+            let result = pinv_metric_i.dot(&grad.row(i));
+            if result.iter().all(|&v| v.is_finite()) {
+                natural_grad.row_mut(i).assign(&result);
+                continue;
+            }
+        }
+
+        // Last resort: use regular gradient with small damping
+        natural_grad.row_mut(i).assign(&(&grad.row(i) * 0.99));
+    }
+    natural_grad
+}
+
 /// Compute the Moore-Penrose pseudo-inverse of a matrix using SVD.
 /// This matches numpy's np.linalg.pinv behavior with default rcond.
 fn pinv(matrix: &Array2<f64>) -> Option<Array2<f64>> {
