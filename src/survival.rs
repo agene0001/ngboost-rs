@@ -156,7 +156,24 @@ where
         time: &Array1<f64>,
         event: &Array1<f64>,
     ) -> Result<(), &'static str> {
-        self.fit_with_validation(x, time, event, None, None, None)
+        self.fit_with_validation(x, time, event, None, None, None, None, None)
+    }
+
+    /// Fit the survival model with sample weights.
+    ///
+    /// # Arguments
+    /// * `x` - Feature matrix (n_samples x n_features)
+    /// * `time` - Time to event or censoring for each sample
+    /// * `event` - Event indicator (1.0 = event occurred, 0.0 = censored)
+    /// * `sample_weight` - Optional weights for each sample
+    pub fn fit_with_weights(
+        &mut self,
+        x: &Array2<f64>,
+        time: &Array1<f64>,
+        event: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+    ) -> Result<(), &'static str> {
+        self.fit_with_validation(x, time, event, None, None, None, sample_weight, None)
     }
 
     /// Fit the survival model with validation data for early stopping.
@@ -168,6 +185,8 @@ where
         x_val: Option<&Array2<f64>>,
         time_val: Option<&Array1<f64>>,
         event_val: Option<&Array1<f64>>,
+        sample_weight: Option<&Array1<f64>>,
+        val_sample_weight: Option<&Array1<f64>>,
     ) -> Result<(), &'static str> {
         // Validate input dimensions
         if x.nrows() != time.len() || x.nrows() != event.len() {
@@ -186,6 +205,23 @@ where
         }
         if time.iter().any(|&v| !v.is_finite() || v <= 0.0) {
             return Err("Time values must be positive and finite");
+        }
+
+        // Validate sample weights if provided
+        if let Some(weights) = sample_weight {
+            if weights.len() != x.nrows() {
+                return Err("Sample weights length must match number of samples");
+            }
+            if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+                return Err("Sample weights must be non-negative and finite");
+            }
+        }
+        if let Some(weights) = val_sample_weight {
+            if let Some(xv) = x_val {
+                if weights.len() != xv.nrows() {
+                    return Err("Validation sample weights length must match validation samples");
+                }
+            }
         }
 
         // Reset state
@@ -234,8 +270,8 @@ where
             let grads = CensoredScorable::censored_grad(&dist, &y, self.natural_gradient);
 
             // Sample data for this iteration
-            let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled) =
-                self.sample(x, &y, &params);
+            let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weights_sampled) =
+                self.sample(x, &y, &params, sample_weight);
             self.col_idxs.push(col_idxs.clone());
 
             let grads_sampled = grads.select(ndarray::Axis(0), &row_idxs);
@@ -247,7 +283,8 @@ where
             for j in 0..n_params {
                 let grad_j = grads_sampled.column(j).to_owned();
                 let learner = self.base_learner.clone();
-                let fitted = learner.fit(&x_sampled, &grad_j)?;
+                let fitted =
+                    learner.fit_with_weights(&x_sampled, &grad_j, weights_sampled.as_ref())?;
                 predictions_cols.push(fitted.predict(&x_sampled));
                 fitted_learners.push(fitted);
             }
@@ -298,7 +335,8 @@ where
                 *vp -= &(self.learning_rate * scale * &val_predictions);
 
                 let val_dist = D::from_params(vp);
-                let val_loss = CensoredScorable::total_censored_score(&val_dist, yv, None);
+                let val_loss =
+                    CensoredScorable::total_censored_score(&val_dist, yv, val_sample_weight);
 
                 if val_loss < best_val_loss {
                     best_val_loss = val_loss;
@@ -318,14 +356,15 @@ where
                 }
 
                 if self.verbose && itr % self.verbose_eval == 0 {
-                    let train_loss = CensoredScorable::total_censored_score(&dist, &y, None);
+                    let train_loss =
+                        CensoredScorable::total_censored_score(&dist, &y, sample_weight);
                     println!(
                         "[iter {}] train_loss={:.4} val_loss={:.4}",
                         itr, train_loss, val_loss
                     );
                 }
             } else if self.verbose && itr % self.verbose_eval == 0 {
-                let train_loss = CensoredScorable::total_censored_score(&dist, &y, None);
+                let train_loss = CensoredScorable::total_censored_score(&dist, &y, sample_weight);
                 println!("[iter {}] loss={:.4} scale={:.4}", itr, train_loss, scale);
             }
         }
@@ -338,12 +377,14 @@ where
         x: &Array2<f64>,
         y: &SurvivalData,
         params: &Array2<f64>,
+        sample_weight: Option<&Array1<f64>>,
     ) -> (
         Vec<usize>,
         Vec<usize>,
         Array2<f64>,
         SurvivalData,
         Array2<f64>,
+        Option<Array1<f64>>,
     ) {
         let n_samples = x.nrows();
         let n_features = x.ncols();
@@ -390,7 +431,18 @@ where
         };
         let params_sampled = params.select(ndarray::Axis(0), &row_idxs);
 
-        (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled)
+        // Sample weights if provided
+        let weights_sampled =
+            sample_weight.map(|weights| weights.select(ndarray::Axis(0), &row_idxs));
+
+        (
+            row_idxs,
+            col_idxs,
+            x_sampled,
+            y_sampled,
+            params_sampled,
+            weights_sampled,
+        )
     }
 
     fn line_search(&self, resids: &Array2<f64>, start: &Array2<f64>, y: &SurvivalData) -> f64 {

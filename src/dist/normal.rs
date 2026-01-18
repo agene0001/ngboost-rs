@@ -43,7 +43,7 @@ impl Distribution for Normal {
         let std_dev = if y.len() <= 1 {
             1.0 // Fallback when we can't compute std dev (matches scipy behavior)
         } else {
-            y.std_dev()
+            y.std(0.0)
         };
         // The parameters are loc and log(scale)
         // Handle edge case where std_dev is 0 or very small - match scipy's robust behavior
