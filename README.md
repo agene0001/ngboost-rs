@@ -1,4 +1,3 @@
-
 # ngboost-rs
 
 A Rust implementation of [NGBoost](https://stanfordmlgroup.github.io/projects/ngboost/) (Natural Gradient Boosting for Probabilistic Prediction).
@@ -43,38 +42,109 @@ ndarray = "0.15"
 
 #### Windows
 
-On Windows, you have three choices depending on how you prefer to manage dependencies:
+On Windows, you have two main options:
 
-**Option 1: OpenBLAS Manual (Easiest for quick setup)**
-Download the OpenBLAS binaries manually.
-1. Download `OpenBLAS-x.x.x-x64.zip` from OpenBLAS Releases.
-2. Extract to a folder (e.g., `C:\OpenBLAS`).
-3. Set environment variable `OPENBLAS_DIR` to that path.
-4. Rename `lib\libopenblas.lib` to `lib\openblas.lib`.
+---
 
-```toml
-[dependencies]
-ngboost-rs = { version = "0.1", features = ["openblas"] }
-```
+**Option 1: Intel MKL (Recommended)**
 
-**Option 2: OpenBLAS System (For vcpkg users)**
-Use this if you installed OpenBLAS via `vcpkg install openblas:x64-windows-static-md`.
-```toml
-[dependencies]
-ngboost-rs = { version = "0.1", features = ["openblas-system"] }
-```
-
-**Option 3: Intel MKL (Recommended for Intel processors)**
-Requires the [Intel OneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html).
+Intel MKL is the easiest option for Windows - it downloads pre-built binaries automatically and works on both Intel and AMD processors.
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["intel-mkl"] }
 ```
 
+That's it! No additional setup required.
+
+> **Note for AMD users**: Intel MKL works fine on AMD processors. Intel removed the artificial slowdown years ago, so performance is good on modern AMD CPUs.
+
+---
+
+**Option 2: OpenBLAS via vcpkg**
+
+If you prefer OpenBLAS, you'll need to install both OpenBLAS and LAPACK via vcpkg. This requires more setup but avoids the Intel dependency.
+
+##### Step 1: Install vcpkg
+
+If you don't have vcpkg installed:
+```powershell
+# Clone vcpkg to a permanent location (e.g., C:\vcpkg)
+git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
+cd C:\vcpkg
+
+# Bootstrap vcpkg
+.\bootstrap-vcpkg.bat
+
+# Integrate with your system (enables automatic library detection)
+.\vcpkg integrate install
+```
+
+##### Step 2: Install OpenBLAS and LAPACK
+```powershell
+# Install OpenBLAS (provides BLAS functions)
+vcpkg install openblas:x64-windows
+
+# Install LAPACK (provides linear algebra functions like matrix decomposition)
+# This is required - OpenBLAS alone doesn't include LAPACK on Windows
+vcpkg install lapack-reference:x64-windows
+```
+
+> **Note**: The `lapack-reference` package may take 20-40 minutes to build as it compiles Fortran code from source.
+
+##### Step 3: Set Environment Variables
+```powershell
+# Set permanently for your user account
+[System.Environment]::SetEnvironmentVariable("OPENBLAS_PATH", "C:\vcpkg\installed\x64-windows", "User")
+[System.Environment]::SetEnvironmentVariable("OPENBLAS_LIB_DIR", "C:\vcpkg\installed\x64-windows\lib", "User")
+```
+
+Restart your terminal after setting these.
+
+##### Step 4: Configure Cargo (Optional but Recommended)
+
+Create a `.cargo/config.toml` file in your project root:
+```toml
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-L", "C:\\vcpkg\\installed\\x64-windows\\lib",
+]
+```
+
+##### Step 5: Add to Cargo.toml
+```toml
+[dependencies]
+ngboost-rs = { version = "0.1", features = ["openblas"] }
+```
+
+##### Troubleshooting OpenBLAS on Windows
+
+If you get linker errors like `unresolved external symbol cblas_dgemm` or `unresolved external symbol sgetrf_`:
+
+1. **Missing LAPACK**: Make sure you installed `lapack-reference:x64-windows`, not just `openblas:x64-windows`
+
+2. **Verify installation**:
+```powershell
+   dir C:\vcpkg\installed\x64-windows\lib\*.lib
+```
+You should see both `openblas.lib` and `lapack.lib` (or similar)
+
+3. **Check environment variables**:
+```powershell
+   echo $env:OPENBLAS_PATH
+   echo $env:OPENBLAS_LIB_DIR
+```
+
+4. **Clean rebuild**:
+```powershell
+   cargo clean
+   cargo build
+```
+
+---
+
 ## Quick Start
 
 ### Regression Example
-
 ```rust
 use ndarray::{Array1, Array2};
 use ngboost_rs::dist::Normal;
@@ -104,7 +174,6 @@ fn main() {
 ```
 
 ### Classification Example
-
 ```rust
 use ngboost_rs::dist::Bernoulli;
 use ngboost_rs::dist::ClassificationDistn;
@@ -164,7 +233,6 @@ NGBoost supports different scoring rules for training:
 
 - **LogScore**: Negative log-likelihood (default, most common)
 - **CRPScore**: Continuous Ranked Probability Score (proper scoring rule)
-
 ```rust
 use ngboost_rs::scores::{LogScore, CRPScore};
 
@@ -178,7 +246,6 @@ let model: NGBoost<Normal, CRPScore, StumpLearner> = NGBoost::new(100, 0.1, Stum
 ## Uncertainty Quantification
 
 One of the key advantages of NGBoost is uncertainty estimation:
-
 ```rust
 let pred_dist = model.pred_dist(&x_test);
 
@@ -198,7 +265,6 @@ for i in 0..n_samples {
 ## Examples
 
 Run the examples to see NGBoost in action:
-
 ```bash
 # Basic regression
 cargo run --example regression
@@ -216,7 +282,6 @@ cargo run --example uncertainty
 ## API Reference
 
 ### NGBoost
-
 ```rust
 impl<D, S, B> NGBoost<D, S, B>
 where
@@ -242,7 +307,6 @@ where
 ```
 
 ### Distribution Trait
-
 ```rust
 pub trait Distribution: Sized + Clone + Debug {
     /// Create distribution from parameters
@@ -270,7 +334,6 @@ pub trait Distribution: Sized + Clone + Debug {
 ### Building for Performance
 
 For best performance, always compile in release mode:
-
 ```bash
 cargo build --release
 cargo run --release --example regression --features accelerate
