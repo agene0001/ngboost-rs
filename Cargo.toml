@@ -36,7 +36,11 @@ default = ["parallel"]
 # BLAS backend features - user must choose one
 accelerate = ["accelerate-src"]
 intel-mkl = ["intel-mkl-src"]
-openblas = ["openblas-src"]
+openblas = ["openblas-src/static"]
+
+# Option 4: OpenBLAS (System / vcpkg)
+# Users who installed via vcpkg should select THIS feature.
+openblas-system = ["openblas-src/system"]
 # Enable parallel training of base learners
 parallel = ["rayon"]
 

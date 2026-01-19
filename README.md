@@ -1,3 +1,4 @@
+
 # ngboost-rs
 
 A Rust implementation of [NGBoost](https://stanfordmlgroup.github.io/projects/ngboost/) (Natural Gradient Boosting for Probabilistic Prediction).
@@ -32,18 +33,7 @@ ndarray = "0.15"
 ```
 
 #### Linux (OpenBLAS)
-First, install OpenBLAS via your package manager:
-```bash
-# Ubuntu/Debian
-sudo apt-get install libopenblas-dev
-
-# Fedora
-sudo dnf install openblas-devel
-
-# Arch
-sudo pacman -S openblas
-```
-
+First, install OpenBLAS via your package manager (e.g., `apt install libopenblas-dev`).
 Then in `Cargo.toml`:
 ```toml
 [dependencies]
@@ -53,24 +43,32 @@ ndarray = "0.15"
 
 #### Windows
 
-On Windows, you have two choices depending on your CPU and setup preference:
+On Windows, you have three choices depending on how you prefer to manage dependencies:
 
-**Option 1: OpenBLAS (Recommended for AMD processors)**
-Use this if you have an AMD processor (Ryzen/Threadripper) or if you do not wish to install the Intel OneAPI Toolkit.
+**Option 1: OpenBLAS Manual (Easiest for quick setup)**
+Download the OpenBLAS binaries manually.
+1. Download `OpenBLAS-x.x.x-x64.zip` from OpenBLAS Releases.
+2. Extract to a folder (e.g., `C:\OpenBLAS`).
+3. Set environment variable `OPENBLAS_DIR` to that path.
+4. Rename `lib\libopenblas.lib` to `lib\openblas.lib`.
+
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["openblas"] }
-ndarray = "0.15"
 ```
 
-**Option 2: Intel MKL (Recommended for Intel processors)**
-This provides the best performance on Intel CPUs but requires external setup.
-*   **Prerequisite:** You must install the [Intel OneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html) (specifically the Math Kernel Library).
-*   **Setup:** You may need to run `setvars.bat` or configure environment variables before building.
+**Option 2: OpenBLAS System (For vcpkg users)**
+Use this if you installed OpenBLAS via `vcpkg install openblas:x64-windows-static-md`.
+```toml
+[dependencies]
+ngboost-rs = { version = "0.1", features = ["openblas-system"] }
+```
+
+**Option 3: Intel MKL (Recommended for Intel processors)**
+Requires the [Intel OneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html).
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["intel-mkl"] }
-ndarray = "0.15"
 ```
 
 ## Quick Start
