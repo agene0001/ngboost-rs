@@ -80,7 +80,7 @@ where
         let count_below: usize = y
             .iter()
             .zip(icdfs.iter())
-            .filter(|(&yi, &qi)| yi < qi)
+            .filter(|&(yi, qi)| yi < qi)
             .count();
         observed.push(count_below as f64 / y.len() as f64);
     }
@@ -345,7 +345,7 @@ pub fn concordance_index_uncensored_only(
     let uncensored_indices: Vec<usize> = events
         .iter()
         .enumerate()
-        .filter(|(_, &e)| e)
+        .filter(|&(_, e)| *e)
         .map(|(i, _)| i)
         .collect();
 
