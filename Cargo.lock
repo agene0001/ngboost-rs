@@ -922,9 +922,10 @@ dependencies = [
 
 [[package]]
 name = "ngboost-rs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "accelerate-src",
+ "approx",
  "bincode",
  "intel-mkl-src",
  "ndarray",

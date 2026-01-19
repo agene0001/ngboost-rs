@@ -1,11 +1,11 @@
-use crate::dist::{Distribution, RegressionDistn};
+use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{
     CRPScore, CRPScoreCensored, CensoredScorable, LogScore, LogScoreCensored, Scorable,
     SurvivalData,
 };
 use ndarray::{array, Array1, Array2, Array3};
-use statrs::distribution::ContinuousCDF;
-use statrs::distribution::Exp;
+use rand::prelude::*;
+use statrs::distribution::{ContinuousCDF, Exp};
 
 /// The Exponential distribution.
 #[derive(Debug, Clone)]
@@ -50,6 +50,94 @@ impl Distribution for Exponential {
 }
 
 impl RegressionDistn for Exponential {}
+
+impl DistributionMethods for Exponential {
+    fn mean(&self) -> Array1<f64> {
+        // Mean of exponential is 1/rate = scale
+        self.scale.clone()
+    }
+
+    fn variance(&self) -> Array1<f64> {
+        // Variance of exponential is 1/rate^2 = scale^2
+        &self.scale * &self.scale
+    }
+
+    fn std(&self) -> Array1<f64> {
+        // Std of exponential is 1/rate = scale
+        self.scale.clone()
+    }
+
+    fn pdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if y[i] >= 0.0 {
+                // pdf = rate * exp(-rate * y)
+                result[i] = self.rate[i] * (-self.rate[i] * y[i]).exp();
+            }
+        }
+        result
+    }
+
+    fn logpdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if y[i] >= 0.0 {
+                // log(pdf) = log(rate) - rate * y
+                result[i] = self.rate[i].ln() - self.rate[i] * y[i];
+            } else {
+                result[i] = f64::NEG_INFINITY;
+            }
+        }
+        result
+    }
+
+    fn cdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if y[i] >= 0.0 {
+                // cdf = 1 - exp(-rate * y)
+                result[i] = 1.0 - (-self.rate[i] * y[i]).exp();
+            }
+        }
+        result
+    }
+
+    fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(q.len());
+        for i in 0..q.len() {
+            // ppf = -log(1 - q) / rate = -log(1 - q) * scale
+            let q_clamped = q[i].clamp(1e-15, 1.0 - 1e-15);
+            result[i] = -(1.0 - q_clamped).ln() / self.rate[i];
+        }
+        result
+    }
+
+    fn sample(&self, n_samples: usize) -> Array2<f64> {
+        let n_obs = self.scale.len();
+        let mut samples = Array2::zeros((n_samples, n_obs));
+        let mut rng = rand::rng();
+
+        for i in 0..n_obs {
+            if let Ok(d) = Exp::new(self.rate[i]) {
+                for s in 0..n_samples {
+                    let u: f64 = rng.random();
+                    samples[[s, i]] = d.inverse_cdf(u);
+                }
+            }
+        }
+        samples
+    }
+
+    fn median(&self) -> Array1<f64> {
+        // Median of exponential is ln(2) / rate = ln(2) * scale
+        self.scale.mapv(|s| s * std::f64::consts::LN_2)
+    }
+
+    fn mode(&self) -> Array1<f64> {
+        // Mode of exponential is 0
+        Array1::zeros(self.scale.len())
+    }
+}
 
 impl Scorable<LogScore> for Exponential {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
@@ -248,5 +336,84 @@ impl CensoredScorable<CRPScoreCensored> for Exponential {
         }
 
         fi
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    #[test]
+    fn test_exponential_distribution_methods() {
+        let params = Array2::from_shape_vec((2, 1), vec![0.0, 1.0_f64.ln()]).unwrap();
+        let dist = Exponential::from_params(&params);
+
+        // Test mean: scale
+        let mean = dist.mean();
+        assert_relative_eq!(mean[0], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(mean[1], 1.0, epsilon = 1e-10);
+
+        // Test variance: scale^2
+        let var = dist.variance();
+        assert_relative_eq!(var[0], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(var[1], 1.0, epsilon = 1e-10);
+
+        // Test mode is 0
+        let mode = dist.mode();
+        assert_relative_eq!(mode[0], 0.0, epsilon = 1e-10);
+        assert_relative_eq!(mode[1], 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_exponential_cdf_ppf() {
+        let params = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
+        let dist = Exponential::from_params(&params);
+
+        // CDF at scale (mean) for exp(rate) should be 1 - 1/e ≈ 0.632
+        let y = Array1::from_vec(vec![1.0]);
+        let cdf = dist.cdf(&y);
+        assert_relative_eq!(cdf[0], 1.0 - (-1.0_f64).exp(), epsilon = 1e-10);
+
+        // PPF inverse test
+        let q = Array1::from_vec(vec![0.5]);
+        let ppf = dist.ppf(&q);
+        let cdf_of_ppf = dist.cdf(&ppf);
+        assert_relative_eq!(cdf_of_ppf[0], 0.5, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_exponential_sample() {
+        let params = Array2::from_shape_vec((1, 1), vec![2.0_f64.ln()]).unwrap();
+        let dist = Exponential::from_params(&params);
+
+        let samples = dist.sample(1000);
+        assert_eq!(samples.shape(), &[1000, 1]);
+
+        // All samples should be non-negative
+        assert!(samples.iter().all(|&x| x >= 0.0));
+
+        // Check that sample mean is close to scale = 2
+        let sample_mean: f64 = samples.column(0).mean().unwrap();
+        assert!((sample_mean - 2.0).abs() < 0.3);
+    }
+
+    #[test]
+    fn test_exponential_median() {
+        let params = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
+        let dist = Exponential::from_params(&params);
+
+        // Median = ln(2) * scale = ln(2) for scale = 1
+        let median = dist.median();
+        assert_relative_eq!(median[0], std::f64::consts::LN_2, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_exponential_fit() {
+        let y = Array1::from_vec(vec![0.5, 1.0, 1.5, 2.0, 2.5]);
+        let params = Exponential::fit(&y);
+        assert_eq!(params.len(), 1);
+        // Mean of y is 1.5, so log(scale) should be log(1.5)
+        assert_relative_eq!(params[0], 1.5_f64.ln(), epsilon = 1e-10);
     }
 }

@@ -45,7 +45,7 @@ fn main() {
         1.0,                          // minibatch_frac
         1.0,                          // col_sample
         false,                        // verbose
-        100,                          // verbose_eval
+        100.0,                        // verbose_eval
         1e-4,                         // tol
         None,                         // early_stopping_rounds
         0.1,                          // validation_fraction
@@ -70,7 +70,7 @@ fn main() {
         1.0,
         1.0,
         false,
-        100,
+        100.0,
         1e-4,
         None,
         0.1,
@@ -95,7 +95,7 @@ fn main() {
         1.0,
         1.0,
         false,
-        100,
+        100.0,
         1e-4,
         None,
         0.1,
@@ -120,7 +120,7 @@ fn main() {
         1.0,
         1.0,
         false,
-        100,
+        100.0,
         1e-4,
         None,
         0.1,

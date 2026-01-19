@@ -5,9 +5,10 @@
 
 use crate::dist::exponential::Exponential;
 use crate::dist::lognormal::LogNormal;
+use crate::dist::weibull::Weibull;
 use crate::dist::{Distribution, RegressionDistn};
 use crate::learners::{default_tree_learner, BaseLearner, DecisionTreeLearner, TrainedBaseLearner};
-use crate::scores::{CensoredScorable, LogScoreCensored, Score, SurvivalData};
+use crate::scores::{CRPScoreCensored, CensoredScorable, LogScoreCensored, Score, SurvivalData};
 use ndarray::{Array1, Array2};
 use rand::prelude::*;
 use rand::rng;
@@ -50,7 +51,10 @@ where
     pub minibatch_frac: f64,
     pub col_sample: f64,
     pub verbose: bool,
-    pub verbose_eval: u32,
+    /// Interval for verbose output during training.
+    /// - If >= 1.0: print every `verbose_eval` iterations (e.g., 100 means every 100 iterations)
+    /// - If < 1.0 and > 0.0: print every `verbose_eval * n_estimators` iterations (e.g., 0.1 means every 10%)
+    pub verbose_eval: f64,
     pub tol: f64,
     pub early_stopping_rounds: Option<u32>,
     pub validation_fraction: f64,
@@ -89,7 +93,7 @@ where
             minibatch_frac: 1.0,
             col_sample: 1.0,
             verbose: false,
-            verbose_eval: 100,
+            verbose_eval: 100.0,
             tol: 1e-4,
             early_stopping_rounds: None,
             validation_fraction: 0.1,
@@ -115,7 +119,7 @@ where
         minibatch_frac: f64,
         col_sample: f64,
         verbose: bool,
-        verbose_eval: u32,
+        verbose_eval: f64,
         tol: f64,
         early_stopping_rounds: Option<u32>,
         validation_fraction: f64,
@@ -355,7 +359,7 @@ where
                     }
                 }
 
-                if self.verbose && itr % self.verbose_eval == 0 {
+                if self.should_print_verbose(itr) {
                     let train_loss =
                         CensoredScorable::total_censored_score(&dist, &y, sample_weight);
                     println!(
@@ -363,7 +367,7 @@ where
                         itr, train_loss, val_loss
                     );
                 }
-            } else if self.verbose && itr % self.verbose_eval == 0 {
+            } else if self.should_print_verbose(itr) {
                 let train_loss = CensoredScorable::total_censored_score(&dist, &y, sample_weight);
                 println!("[iter {}] loss={:.4} scale={:.4}", itr, train_loss, scale);
             }
@@ -566,6 +570,26 @@ where
     pub fn n_features(&self) -> Option<usize> {
         self.n_features
     }
+
+    /// Determine if verbose output should be printed at the given iteration.
+    /// Handles both integer intervals (verbose_eval >= 1.0) and percentage intervals (0 < verbose_eval < 1.0).
+    fn should_print_verbose(&self, iteration: u32) -> bool {
+        if !self.verbose || self.verbose_eval <= 0.0 {
+            return false;
+        }
+
+        // Compute verbose_eval interval:
+        // - If >= 1.0: use as integer iteration count (e.g., 100 = every 100 iterations)
+        // - If 0 < x < 1.0: use as percentage of n_estimators (e.g., 0.1 = every 10%)
+        let verbose_interval = if self.verbose_eval >= 1.0 {
+            self.verbose_eval as u32
+        } else {
+            // Percentage of total iterations
+            (self.n_estimators as f64 * self.verbose_eval).max(1.0) as u32
+        };
+
+        verbose_interval > 0 && iteration % verbose_interval == 0
+    }
 }
 
 fn to_2d_array(cols: Vec<Array1<f64>>) -> Array2<f64> {
@@ -591,6 +615,12 @@ pub type NGBSurvivalLogNormal = NGBSurvival<LogNormal, LogScoreCensored, Decisio
 /// NGBSurvival with Exponential distribution and LogScore (censored).
 pub type NGBSurvivalExponential = NGBSurvival<Exponential, LogScoreCensored, DecisionTreeLearner>;
 
+/// NGBSurvival with Weibull distribution and LogScore (censored).
+pub type NGBSurvivalWeibull = NGBSurvival<Weibull, LogScoreCensored, DecisionTreeLearner>;
+
+/// NGBSurvival with Weibull distribution and CRPScore (censored).
+pub type NGBSurvivalWeibullCRPS = NGBSurvival<Weibull, CRPScoreCensored, DecisionTreeLearner>;
+
 // ============================================================================
 // Simplified constructors
 // ============================================================================
@@ -605,6 +635,20 @@ impl NGBSurvival<LogNormal, LogScoreCensored, DecisionTreeLearner> {
 impl NGBSurvival<Exponential, LogScoreCensored, DecisionTreeLearner> {
     /// Create a new NGBSurvival with Exponential distribution.
     pub fn exponential(n_estimators: u32, learning_rate: f64) -> Self {
+        Self::new(n_estimators, learning_rate, default_tree_learner())
+    }
+}
+
+impl NGBSurvival<Weibull, LogScoreCensored, DecisionTreeLearner> {
+    /// Create a new NGBSurvival with Weibull distribution and LogScore.
+    pub fn weibull(n_estimators: u32, learning_rate: f64) -> Self {
+        Self::new(n_estimators, learning_rate, default_tree_learner())
+    }
+}
+
+impl NGBSurvival<Weibull, CRPScoreCensored, DecisionTreeLearner> {
+    /// Create a new NGBSurvival with Weibull distribution and CRPScore.
+    pub fn weibull_crps(n_estimators: u32, learning_rate: f64) -> Self {
         Self::new(n_estimators, learning_rate, default_tree_learner())
     }
 }

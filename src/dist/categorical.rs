@@ -1,5 +1,5 @@
 use crate::dist::{ClassificationDistn, Distribution};
-use crate::scores::{LogScore, Scorable};
+use crate::scores::{CRPScore, LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, Axis};
 
 /// Minimum probability value to avoid log(0) and division issues.
@@ -172,6 +172,104 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
     }
 }
 
+impl<const K: usize> Scorable<CRPScore> for Categorical<K> {
+    fn score(&self, y: &Array1<f64>) -> Array1<f64> {
+        // For categorical distributions, the CRPS equivalent is the Brier score:
+        // BS = Σ_k (p_k - 1{y == k})^2
+        // This is the sum of squared errors between predicted probs and one-hot encoding
+        //
+        // Note: For ordinal categories, one would use the Ranked Probability Score (RPS)
+        // which is CRPS applied to the cumulative distribution. Here we use Brier score
+        // since categorical typically implies unordered classes.
+
+        let mut scores = Array1::zeros(y.len());
+        for (i, &y_i) in y.iter().enumerate() {
+            let true_class = y_i as usize;
+            let mut brier = 0.0;
+            for k in 0..K {
+                let p_k = self.probs[[k, i]];
+                let indicator = if k == true_class { 1.0 } else { 0.0 };
+                brier += (p_k - indicator).powi(2);
+            }
+            scores[i] = brier;
+        }
+        scores
+    }
+
+    fn d_score(&self, y: &Array1<f64>) -> Array2<f64> {
+        // Gradient of Brier score w.r.t. logits (parameters)
+        // BS = Σ_k (p_k - 1{y == k})^2
+        // d(BS)/d(logit_j) = Σ_k 2*(p_k - 1{y==k}) * d(p_k)/d(logit_j)
+        //
+        // For softmax: d(p_k)/d(logit_j) = p_k * (1{k==j} - p_j)
+        //
+        // d(BS)/d(logit_j) = 2 * Σ_k (p_k - 1{y==k}) * p_k * (1{k==j} - p_j)
+        //                  = 2 * [(p_j - 1{y==j}) * p_j * (1 - p_j)
+        //                        - p_j * Σ_{k≠j} (p_k - 1{y==k}) * p_k]
+        //                  = 2 * p_j * [(p_j - 1{y==j}) * (1 - p_j)
+        //                              - Σ_{k≠j} (p_k - 1{y==k}) * p_k]
+        //
+        // Simplified: d(BS)/d(logit_j) = 2 * p_j * [Σ_k (p_k - 1{y==k}) * (1{k==j} - p_k)]
+
+        let n_obs = y.len();
+        let mut d_params = Array2::zeros((n_obs, K - 1));
+
+        for i in 0..n_obs {
+            let y_i = y[i] as usize;
+
+            // Compute residuals: r_k = p_k - 1{y == k}
+            let mut residuals = vec![0.0; K];
+            for k in 0..K {
+                let indicator = if k == y_i { 1.0 } else { 0.0 };
+                residuals[k] = self.probs[[k, i]] - indicator;
+            }
+
+            // For each parameter (logit_j for j = 1..K)
+            for j in 1..K {
+                let p_j = self.probs[[j, i]];
+
+                // d(BS)/d(logit_j) = 2 * Σ_k r_k * p_k * (1{k==j} - p_j)
+                let mut grad = 0.0;
+                for k in 0..K {
+                    let p_k = self.probs[[k, i]];
+                    let delta_kj = if k == j { 1.0 } else { 0.0 };
+                    grad += residuals[k] * p_k * (delta_kj - p_j);
+                }
+                d_params[[i, j - 1]] = 2.0 * grad;
+            }
+        }
+
+        d_params
+    }
+
+    fn metric(&self) -> Array3<f64> {
+        // Metric for Brier score
+        // We use the Fisher information matrix as an approximation
+        // This is similar to the LogScore metric but scaled
+        let n_obs = self.n_obs;
+        let n_params = K - 1;
+        let mut fi = Array3::zeros((n_obs, n_params, n_params));
+
+        for i in 0..n_obs {
+            for j in 0..n_params {
+                let p_j = self.probs[[j + 1, i]];
+                for k in 0..n_params {
+                    let p_k = self.probs[[k + 1, i]];
+                    if j == k {
+                        // Diagonal: scaled by 4 for Brier score
+                        fi[[i, j, k]] = 4.0 * p_j * (1.0 - p_j);
+                    } else {
+                        // Off-diagonal
+                        fi[[i, j, k]] = -4.0 * p_j * p_k;
+                    }
+                }
+            }
+        }
+
+        fi
+    }
+}
+
 /// Type alias for binary classification (Bernoulli distribution).
 pub type Bernoulli = Categorical<2>;
 
@@ -186,3 +284,104 @@ pub type Categorical5 = Categorical<5>;
 
 /// Type alias for 10-class classification (e.g., digit recognition).
 pub type Categorical10 = Categorical<10>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    #[test]
+    fn test_categorical_crpscore_bernoulli() {
+        // Binary classification with Bernoulli
+        // params: logit for class 1 (class 0 logit is fixed at 0)
+        let params = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap(); // p = [0.5, 0.5]
+        let dist = Bernoulli::from_params(&params);
+
+        // With equal probs [0.5, 0.5], Brier score for y=0:
+        // (0.5 - 1)^2 + (0.5 - 0)^2 = 0.25 + 0.25 = 0.5
+        let y = Array1::from_vec(vec![0.0]);
+        let score = Scorable::<CRPScore>::score(&dist, &y);
+        assert_relative_eq!(score[0], 0.5, epsilon = 1e-6);
+
+        // Same for y=1
+        let y = Array1::from_vec(vec![1.0]);
+        let score = Scorable::<CRPScore>::score(&dist, &y);
+        assert_relative_eq!(score[0], 0.5, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_categorical_crpscore_perfect_prediction() {
+        // Perfect prediction should have Brier score of 0
+        // Use large logit to get probability close to 1
+        let params = Array2::from_shape_vec((1, 1), vec![10.0]).unwrap(); // p ≈ [0, 1]
+        let dist = Bernoulli::from_params(&params);
+
+        // Predicting class 1 when true class is 1
+        let y = Array1::from_vec(vec![1.0]);
+        let score = Scorable::<CRPScore>::score(&dist, &y);
+        assert!(score[0] < 0.01); // Should be very small
+    }
+
+    #[test]
+    fn test_categorical_crpscore_worst_prediction() {
+        // Worst prediction (confident wrong answer)
+        let params = Array2::from_shape_vec((1, 1), vec![10.0]).unwrap(); // p ≈ [0, 1]
+        let dist = Bernoulli::from_params(&params);
+
+        // Predicting class 1 when true class is 0
+        let y = Array1::from_vec(vec![0.0]);
+        let score = Scorable::<CRPScore>::score(&dist, &y);
+        // Brier score ≈ (0 - 1)^2 + (1 - 0)^2 = 2
+        assert!(score[0] > 1.9);
+    }
+
+    #[test]
+    fn test_categorical_crpscore_multiclass() {
+        // 3-class classification
+        let params = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap(); // equal probs
+        let dist = Categorical3::from_params(&params);
+
+        let y = Array1::from_vec(vec![0.0]);
+        let score = Scorable::<CRPScore>::score(&dist, &y);
+
+        // With equal probs [1/3, 1/3, 1/3], Brier for y=0:
+        // (1/3 - 1)^2 + (1/3 - 0)^2 + (1/3 - 0)^2 = 4/9 + 1/9 + 1/9 = 6/9 = 2/3
+        assert_relative_eq!(score[0], 2.0 / 3.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_categorical_crpscore_d_score() {
+        let params = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
+        let dist = Bernoulli::from_params(&params);
+
+        let y = Array1::from_vec(vec![1.0]);
+        let d_score = Scorable::<CRPScore>::d_score(&dist, &y);
+
+        // Gradient should be finite
+        assert!(d_score[[0, 0]].is_finite());
+    }
+
+    #[test]
+    fn test_categorical_crpscore_metric() {
+        let params = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
+        let dist = Bernoulli::from_params(&params);
+
+        let metric = Scorable::<CRPScore>::metric(&dist);
+
+        // Metric should be positive (for diagonal)
+        assert!(metric[[0, 0, 0]] > 0.0);
+    }
+
+    #[test]
+    fn test_categorical_logscore() {
+        // Basic LogScore test
+        let params = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap(); // p = [0.5, 0.5]
+        let dist = Bernoulli::from_params(&params);
+
+        let y = Array1::from_vec(vec![0.0]);
+        let score = Scorable::<LogScore>::score(&dist, &y);
+
+        // -log(0.5) ≈ 0.693
+        assert_relative_eq!(score[0], 0.5_f64.ln().abs(), epsilon = 1e-6);
+    }
+}

@@ -232,7 +232,7 @@ fn test_ngbsurvival_with_options() {
         0.8,   // minibatch_frac
         1.0,   // col_sample
         false, // verbose
-        50,    // verbose_eval
+        50.0,  // verbose_eval
         1e-4,  // tol
         None,  // early_stopping_rounds
         0.1,   // validation_fraction

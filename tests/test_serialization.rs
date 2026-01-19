@@ -130,7 +130,7 @@ fn test_regressor_save_load_with_options() {
     let mut model = NGBRegressor::with_options(
         100, 0.05, true, 0.8, // minibatch_frac
         0.9, // col_sample
-        false, 50, 1e-5, None, 0.15, false,
+        false, 50.0, 1e-5, None, 0.15, false,
     );
     model.fit(&x, &y).expect("Fit should succeed");
 

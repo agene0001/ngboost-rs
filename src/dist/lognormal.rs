@@ -1,9 +1,10 @@
-use crate::dist::{Distribution, RegressionDistn};
+use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{
     CRPScore, CRPScoreCensored, CensoredScorable, LogScore, LogScoreCensored, Scorable,
     SurvivalData,
 };
 use ndarray::{array, Array1, Array2, Array3};
+use rand::prelude::*;
 use statrs::distribution::{
     Continuous, ContinuousCDF, LogNormal as LogNormalDist, Normal as NormalDist,
 };
@@ -52,6 +53,91 @@ impl Distribution for LogNormal {
 }
 
 impl RegressionDistn for LogNormal {}
+
+impl DistributionMethods for LogNormal {
+    fn mean(&self) -> Array1<f64> {
+        // Mean of lognormal is exp(mu + sigma^2 / 2)
+        (&self.loc + &(&self.scale.mapv(|s| s.powi(2)) / 2.0)).mapv(f64::exp)
+    }
+
+    fn variance(&self) -> Array1<f64> {
+        // Var of lognormal is (exp(sigma^2) - 1) * exp(2*mu + sigma^2)
+        let sigma_sq = self.scale.mapv(|s| s.powi(2));
+        let exp_sigma_sq = sigma_sq.mapv(f64::exp);
+        let two_mu_plus_sigma_sq = 2.0 * &self.loc + &sigma_sq;
+        (&exp_sigma_sq - 1.0) * two_mu_plus_sigma_sq.mapv(f64::exp)
+    }
+
+    fn std(&self) -> Array1<f64> {
+        self.variance().mapv(f64::sqrt)
+    }
+
+    fn pdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if let Ok(d) = LogNormalDist::new(self.loc[i], self.scale[i]) {
+                result[i] = d.pdf(y[i]);
+            }
+        }
+        result
+    }
+
+    fn logpdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if let Ok(d) = LogNormalDist::new(self.loc[i], self.scale[i]) {
+                result[i] = d.ln_pdf(y[i]);
+            }
+        }
+        result
+    }
+
+    fn cdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if let Ok(d) = LogNormalDist::new(self.loc[i], self.scale[i]) {
+                result[i] = d.cdf(y[i]);
+            }
+        }
+        result
+    }
+
+    fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(q.len());
+        for i in 0..q.len() {
+            if let Ok(d) = LogNormalDist::new(self.loc[i], self.scale[i]) {
+                result[i] = d.inverse_cdf(q[i]);
+            }
+        }
+        result
+    }
+
+    fn sample(&self, n_samples: usize) -> Array2<f64> {
+        let n_obs = self.loc.len();
+        let mut samples = Array2::zeros((n_samples, n_obs));
+        let mut rng = rand::rng();
+
+        for i in 0..n_obs {
+            if let Ok(d) = LogNormalDist::new(self.loc[i], self.scale[i]) {
+                for s in 0..n_samples {
+                    let u: f64 = rng.random();
+                    samples[[s, i]] = d.inverse_cdf(u);
+                }
+            }
+        }
+        samples
+    }
+
+    fn median(&self) -> Array1<f64> {
+        // Median of lognormal is exp(mu)
+        self.loc.mapv(f64::exp)
+    }
+
+    fn mode(&self) -> Array1<f64> {
+        // Mode of lognormal is exp(mu - sigma^2)
+        (&self.loc - &self.scale.mapv(|s| s.powi(2))).mapv(f64::exp)
+    }
+}
 
 impl Scorable<LogScore> for LogNormal {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
@@ -309,5 +395,80 @@ impl CensoredScorable<CRPScoreCensored> for LogNormal {
 
         fi.mapv_inplace(|x| x / (2.0 * sqrt_pi));
         fi
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    #[test]
+    fn test_lognormal_distribution_methods() {
+        let params = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 1.0, 0.5_f64.ln()]).unwrap();
+        let dist = LogNormal::from_params(&params);
+
+        // Test mean: exp(mu + sigma^2/2)
+        let mean = dist.mean();
+        assert_relative_eq!(mean[0], (0.5_f64).exp(), epsilon = 1e-6);
+
+        // Test median: exp(mu)
+        let median = dist.median();
+        assert_relative_eq!(median[0], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(median[1], std::f64::consts::E, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_lognormal_cdf_ppf() {
+        let params = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+        let dist = LogNormal::from_params(&params);
+
+        // CDF at median should be 0.5
+        let y = Array1::from_vec(vec![1.0]); // exp(0) = 1 is the median
+        let cdf = dist.cdf(&y);
+        assert_relative_eq!(cdf[0], 0.5, epsilon = 1e-10);
+
+        // PPF at 0.5 should return median
+        let q = Array1::from_vec(vec![0.5]);
+        let ppf = dist.ppf(&q);
+        assert_relative_eq!(ppf[0], 1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_lognormal_sample() {
+        let params = Array2::from_shape_vec((1, 2), vec![1.0, 0.5_f64.ln()]).unwrap();
+        let dist = LogNormal::from_params(&params);
+
+        let samples = dist.sample(1000);
+        assert_eq!(samples.shape(), &[1000, 1]);
+
+        // All samples should be positive (lognormal is always positive)
+        assert!(samples.iter().all(|&x| x > 0.0));
+
+        // Check that sample median is close to exp(mu)
+        let mut sample_vec: Vec<f64> = samples.column(0).to_vec();
+        sample_vec.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let sample_median = sample_vec[500];
+        let expected_median = std::f64::consts::E; // exp(1.0)
+        assert!((sample_median - expected_median).abs() / expected_median < 0.15);
+    }
+
+    #[test]
+    fn test_lognormal_fit() {
+        let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let params = LogNormal::fit(&y);
+        assert_eq!(params.len(), 2);
+        // Should fit log-mean and log-std
+    }
+
+    #[test]
+    fn test_lognormal_survival_function() {
+        let params = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+        let dist = LogNormal::from_params(&params);
+
+        // SF at median should be 0.5
+        let y = Array1::from_vec(vec![1.0]);
+        let sf = dist.sf(&y);
+        assert_relative_eq!(sf[0], 0.5, epsilon = 1e-10);
     }
 }

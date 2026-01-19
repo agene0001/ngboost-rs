@@ -1,6 +1,7 @@
-use crate::dist::{Distribution, RegressionDistn};
+use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
 use ndarray::{array, Array1, Array2, Array3};
+use rand::prelude::*;
 use statrs::distribution::{Continuous, ContinuousCDF, Normal as NormalDist};
 use statrs::statistics::Statistics;
 
@@ -65,6 +66,81 @@ impl Distribution for Normal {
 }
 
 impl RegressionDistn for Normal {}
+
+impl DistributionMethods for Normal {
+    fn mean(&self) -> Array1<f64> {
+        self.loc.clone()
+    }
+
+    fn variance(&self) -> Array1<f64> {
+        self.var.clone()
+    }
+
+    fn std(&self) -> Array1<f64> {
+        self.scale.clone()
+    }
+
+    fn pdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if let Ok(d) = NormalDist::new(self.loc[i], self.scale[i]) {
+                result[i] = d.pdf(y[i]);
+            }
+        }
+        result
+    }
+
+    fn logpdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if let Ok(d) = NormalDist::new(self.loc[i], self.scale[i]) {
+                result[i] = d.ln_pdf(y[i]);
+            }
+        }
+        result
+    }
+
+    fn cdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            if let Ok(d) = NormalDist::new(self.loc[i], self.scale[i]) {
+                result[i] = d.cdf(y[i]);
+            }
+        }
+        result
+    }
+
+    fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(q.len());
+        for i in 0..q.len() {
+            if let Ok(d) = NormalDist::new(self.loc[i], self.scale[i]) {
+                result[i] = d.inverse_cdf(q[i]);
+            }
+        }
+        result
+    }
+
+    fn sample(&self, n_samples: usize) -> Array2<f64> {
+        let n_obs = self.loc.len();
+        let mut samples = Array2::zeros((n_samples, n_obs));
+        let mut rng = rand::rng();
+
+        for i in 0..n_obs {
+            if let Ok(d) = NormalDist::new(self.loc[i], self.scale[i]) {
+                for s in 0..n_samples {
+                    let u: f64 = rng.random();
+                    samples[[s, i]] = d.inverse_cdf(u);
+                }
+            }
+        }
+        samples
+    }
+
+    fn mode(&self) -> Array1<f64> {
+        // For Normal, mode = mean
+        self.loc.clone()
+    }
+}
 
 impl Scorable<LogScore> for Normal {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
@@ -233,6 +309,62 @@ impl Distribution for NormalFixedVar {
 
 impl RegressionDistn for NormalFixedVar {}
 
+impl DistributionMethods for NormalFixedVar {
+    fn mean(&self) -> Array1<f64> {
+        self.loc.clone()
+    }
+
+    fn variance(&self) -> Array1<f64> {
+        self.var.clone()
+    }
+
+    fn std(&self) -> Array1<f64> {
+        self.scale.clone()
+    }
+
+    fn pdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            result[i] = d.pdf(y[i]);
+        }
+        result
+    }
+
+    fn cdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            result[i] = d.cdf(y[i]);
+        }
+        result
+    }
+
+    fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(q.len());
+        for i in 0..q.len() {
+            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            result[i] = d.inverse_cdf(q[i]);
+        }
+        result
+    }
+
+    fn sample(&self, n_samples: usize) -> Array2<f64> {
+        let n_obs = self.loc.len();
+        let mut samples = Array2::zeros((n_samples, n_obs));
+        let mut rng = rand::rng();
+
+        for i in 0..n_obs {
+            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            for s in 0..n_samples {
+                let u: f64 = rng.random();
+                samples[[s, i]] = d.inverse_cdf(u);
+            }
+        }
+        samples
+    }
+}
+
 impl Scorable<LogScore> for NormalFixedVar {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         let mut scores = Array1::zeros(y.len());
@@ -362,6 +494,62 @@ impl Distribution for NormalFixedMean {
 
 impl RegressionDistn for NormalFixedMean {}
 
+impl DistributionMethods for NormalFixedMean {
+    fn mean(&self) -> Array1<f64> {
+        self.loc.clone()
+    }
+
+    fn variance(&self) -> Array1<f64> {
+        self.var.clone()
+    }
+
+    fn std(&self) -> Array1<f64> {
+        self.scale.clone()
+    }
+
+    fn pdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            result[i] = d.pdf(y[i]);
+        }
+        result
+    }
+
+    fn cdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(y.len());
+        for i in 0..y.len() {
+            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            result[i] = d.cdf(y[i]);
+        }
+        result
+    }
+
+    fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
+        let mut result = Array1::zeros(q.len());
+        for i in 0..q.len() {
+            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            result[i] = d.inverse_cdf(q[i]);
+        }
+        result
+    }
+
+    fn sample(&self, n_samples: usize) -> Array2<f64> {
+        let n_obs = self.loc.len();
+        let mut samples = Array2::zeros((n_samples, n_obs));
+        let mut rng = rand::rng();
+
+        for i in 0..n_obs {
+            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            for s in 0..n_samples {
+                let u: f64 = rng.random();
+                samples[[s, i]] = d.inverse_cdf(u);
+            }
+        }
+        samples
+    }
+}
+
 impl Scorable<LogScore> for NormalFixedMean {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         let mut scores = Array1::zeros(y.len());
@@ -440,5 +628,98 @@ impl Scorable<CRPScore> for NormalFixedMean {
         }
 
         fi
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    #[test]
+    fn test_normal_distribution_methods() {
+        let params =
+            Array2::from_shape_vec((3, 2), vec![0.0, 0.0, 1.0, 0.0, 2.0, 1.0_f64.ln()]).unwrap();
+        let dist = Normal::from_params(&params);
+
+        // Test mean
+        let mean = dist.mean();
+        assert_relative_eq!(mean[0], 0.0, epsilon = 1e-10);
+        assert_relative_eq!(mean[1], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(mean[2], 2.0, epsilon = 1e-10);
+
+        // Test variance
+        let var = dist.variance();
+        assert_relative_eq!(var[0], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(var[1], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(var[2], 1.0, epsilon = 1e-10);
+
+        // Test CDF
+        let y = Array1::from_vec(vec![0.0, 1.0, 2.0]);
+        let cdf = dist.cdf(&y);
+        assert_relative_eq!(cdf[0], 0.5, epsilon = 1e-10);
+        assert_relative_eq!(cdf[1], 0.5, epsilon = 1e-10);
+        assert_relative_eq!(cdf[2], 0.5, epsilon = 1e-10);
+
+        // Test PPF (inverse CDF)
+        let q = Array1::from_vec(vec![0.5, 0.5, 0.5]);
+        let ppf = dist.ppf(&q);
+        assert_relative_eq!(ppf[0], 0.0, epsilon = 1e-10);
+        assert_relative_eq!(ppf[1], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(ppf[2], 2.0, epsilon = 1e-10);
+
+        // Test interval
+        let (lower, upper) = dist.interval(0.05);
+        assert!(lower[0] < 0.0);
+        assert!(upper[0] > 0.0);
+    }
+
+    #[test]
+    fn test_normal_sample() {
+        let params = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 5.0, 1.0_f64.ln()]).unwrap();
+        let dist = Normal::from_params(&params);
+
+        let samples = dist.sample(1000);
+        assert_eq!(samples.shape(), &[1000, 2]);
+
+        // Check that samples have approximately correct mean
+        let sample_mean_0: f64 = samples.column(0).iter().sum::<f64>() / samples.nrows() as f64;
+        let sample_mean_1: f64 = samples.column(1).iter().sum::<f64>() / samples.nrows() as f64;
+
+        assert!((sample_mean_0 - 0.0).abs() < 0.2);
+        assert!((sample_mean_1 - 5.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn test_normal_fit() {
+        let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let params = Normal::fit(&y);
+        assert_eq!(params.len(), 2);
+        assert_relative_eq!(params[0], 3.0, epsilon = 1e-10); // mean
+    }
+
+    #[test]
+    fn test_normal_fixed_var_distribution_methods() {
+        let params = Array2::from_shape_vec((2, 1), vec![0.0, 5.0]).unwrap();
+        let dist = NormalFixedVar::from_params(&params);
+
+        assert_relative_eq!(dist.mean()[0], 0.0, epsilon = 1e-10);
+        assert_relative_eq!(dist.mean()[1], 5.0, epsilon = 1e-10);
+        assert_relative_eq!(dist.variance()[0], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(dist.variance()[1], 1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_normal_fixed_mean_distribution_methods() {
+        // params = [log(scale)] for NormalFixedMean
+        // First obs: log(scale) = 0, so scale = 1
+        // Second obs: log(scale) = 1, so scale = e
+        let params = Array2::from_shape_vec((2, 1), vec![0.0, 1.0]).unwrap();
+        let dist = NormalFixedMean::from_params(&params);
+
+        assert_relative_eq!(dist.mean()[0], 0.0, epsilon = 1e-10);
+        assert_relative_eq!(dist.mean()[1], 0.0, epsilon = 1e-10);
+        assert_relative_eq!(dist.std()[0], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(dist.std()[1], std::f64::consts::E, epsilon = 1e-10);
     }
 }

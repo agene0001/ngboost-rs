@@ -145,7 +145,7 @@ fn test_regression() {
     let (x_train, x_test, y_train, y_test) = train_test_split(x, y, 0.2);
 
     let mut ngb = NGBRegressor::with_options(
-        500, 0.01, true, 1.0, 1.0, false, 100, 1e-4, None, 0.1, false,
+        500, 0.01, true, 1.0, 1.0, false, 100.0, 1e-4, None, 0.1, false,
     );
 
     ngb.fit(&x_train, &y_train).expect("Fit should succeed");
@@ -179,7 +179,7 @@ fn test_regression_with_early_stopping() {
         1.0,
         1.0,
         false,
-        100,
+        100.0,
         1e-4,
         Some(10),
         0.1,
@@ -205,7 +205,7 @@ fn test_classification() {
     let (x_train, x_test, y_train, y_test) = train_test_split(x, y, 0.2);
 
     let mut ngb = NGBClassifier::with_options(
-        500, 0.01, true, 1.0, 1.0, false, 100, 1e-4, None, 0.1, false,
+        500, 0.01, true, 1.0, 1.0, false, 100.0, 1e-4, None, 0.1, false,
     );
 
     ngb.fit(&x_train, &y_train).expect("Fit should succeed");
@@ -250,7 +250,7 @@ fn test_classification_with_validation() {
         1.0,
         1.0,
         false,
-        100,
+        100.0,
         1e-4,
         Some(10),
         0.1,
