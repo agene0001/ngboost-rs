@@ -1,6 +1,6 @@
 [package]
 name = "ngboost-rs"
-version = "0.4.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Felix Agene agene001@umn.edu>"]
 description = "Natural Gradient Boosting for Probabilistic Prediction - A Rust implementation of NGBoost"

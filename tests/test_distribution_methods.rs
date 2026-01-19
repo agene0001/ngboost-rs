@@ -3,7 +3,7 @@
 use approx::assert_relative_eq;
 use ndarray::{Array1, Array2};
 use ngboost_rs::dist::{
-    Bernoulli, Categorical, Cauchy, CauchyFixedVar, Distribution, DistributionMethods, Exponential,
+   Cauchy, CauchyFixedVar, Distribution, DistributionMethods, Exponential,
     Gamma, HalfNormal, Laplace, LogNormal, Normal, NormalFixedMean, NormalFixedVar, Poisson,
     StudentT, TFixedDf, TFixedDfFixedVar, Weibull,
 };
