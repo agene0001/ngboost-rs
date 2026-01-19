@@ -13,45 +13,26 @@ NGBoost is a modular boosting algorithm that allows you to obtain full probabili
 - **Natural Gradient Boosting**: Uses the natural gradient for efficient optimization on probability distribution manifolds
 - **Generic Design**: Easily extensible with custom distributions and base learners
 
-  ## Installation
+## Installation
 
-  **⚠️ Important: No BLAS backend is enabled by default.**
+**⚠️ Important: No BLAS backend is enabled by default.**
 
-  This library relies on a BLAS/LAPACK backend for matrix operations. To ensure cross-platform compatibility (e.g., macOS vs Windows), no backend is selected by default. You **must** explicitly enable one of the features below in your `Cargo.toml`, otherwise the project will fail to link.
-
-  Add this to your `Cargo.toml`:
-
-    ```toml
-    [dependencies]
-    # Replace "openblas" with "accelerate" (macOS) or "intel-mkl" (Windows/Linux) as needed
-    ngboost-rs = { version = "0.1", features = ["openblas"] }
-    ndarray = "0.15"
-    ```
-
-  ### Platform-Specific BLAS Backend
-
-  This library requires a BLAS/LAPACK backend. Choose one based on your platform:
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-ngboost-rs = { version = "0.1", features = ["openblas"] }
-ndarray = "0.15"
-```
+This library relies on a BLAS/LAPACK backend for matrix operations. To ensure cross-platform compatibility (e.g., macOS vs Windows), no backend is selected by default. You **must** explicitly enable one of the features below in your `Cargo.toml`, otherwise the project will fail to link.
 
 ### Platform-Specific BLAS Backend
 
-This library requires a BLAS/LAPACK backend. Choose one based on your platform:
+Choose the configuration that matches your operating system and hardware.
 
-#### macOS (Accelerate - recommended)
+#### macOS (Accelerate - Recommended)
+Uses Apple's native Accelerate framework.
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["accelerate"] }
+ndarray = "0.15"
 ```
 
 #### Linux (OpenBLAS)
-First install OpenBLAS:
+First, install OpenBLAS via your package manager:
 ```bash
 # Ubuntu/Debian
 sudo apt-get install libopenblas-dev
@@ -63,27 +44,34 @@ sudo dnf install openblas-devel
 sudo pacman -S openblas
 ```
 
-Then in Cargo.toml:
+Then in `Cargo.toml`:
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["openblas"] }
+ndarray = "0.15"
 ```
 
-#### Windows (OpenBLAS or Intel MKL)
-For Windows, you can use Intel MKL or build OpenBLAS from source.
+#### Windows
 
-Using Intel MKL (easier on Windows):
+On Windows, you have two choices depending on your CPU and setup preference:
+
+**Option 1: OpenBLAS (Recommended for AMD processors)**
+Use this if you have an AMD processor (Ryzen/Threadripper) or if you do not wish to install the Intel OneAPI Toolkit.
+```toml
+[dependencies]
+ngboost-rs = { version = "0.1", features = ["openblas"] }
+ndarray = "0.15"
+```
+
+**Option 2: Intel MKL (Recommended for Intel processors)**
+This provides the best performance on Intel CPUs but requires external setup.
+*   **Prerequisite:** You must install the [Intel OneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html) (specifically the Math Kernel Library).
+*   **Setup:** You may need to run `setvars.bat` or configure environment variables before building.
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["intel-mkl"] }
+ndarray = "0.15"
 ```
-
-#### Intel MKL (any platform - high performance)
-```toml
-[dependencies]
-ngboost-rs = { version = "0.1", features = ["intel-mkl"] }
-```
-Note: Intel MKL requires the MKL libraries to be installed.
 
 ## Quick Start
 
@@ -292,7 +280,7 @@ cargo run --release --example regression --features accelerate
 
 The release profile includes:
 - Full optimizations (`opt-level = 3`)
-- Link-time optimization (`lto = "thin"`)
+- Link-time optimization (`lto = "fat"`)
 
 Debug builds are intentionally slower but compile faster during development.
 
