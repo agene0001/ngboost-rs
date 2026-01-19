@@ -23,7 +23,7 @@ rayon = { version = "1.11.0", optional = true }
 # Optional BLAS backends - user must enable one
 accelerate-src = { version = "0.3.2", optional = true }
 intel-mkl-src = { version = "0.8.1", optional = true }
-openblas-src = { version = "0.10.14", optional = true, features = ["system"] }
+openblas-src = { version = "0.10.14", optional = true, features = ["cblas", "lapacke"] }
 
 [dev-dependencies]
 ndarray-rand = "0.16.0"
