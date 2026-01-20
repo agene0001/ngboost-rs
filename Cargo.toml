@@ -35,8 +35,8 @@ approx = "0.5.1"
 default = ["parallel"]
 # BLAS backend features - user must choose one
 accelerate = ["accelerate-src"]
-intel-mkl = ["intel-mkl-src"]
-openblas = ["openblas-src"]
+intel-mkl = ["intel-mkl-src", "ndarray-linalg/intel-mkl-static"]
+openblas = ["openblas-src", "ndarray-linalg/openblas-system"]
 # Enable parallel training of base learners
 parallel = ["rayon"]
 
