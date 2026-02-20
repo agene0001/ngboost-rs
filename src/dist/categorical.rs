@@ -2,21 +2,37 @@ use crate::dist::{ClassificationDistn, Distribution};
 use crate::scores::{CRPScore, LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, Axis};
 
-/// Minimum probability value to avoid log(0) and division issues.
-const PROB_EPS: f64 = 1e-10;
-/// Maximum probability value (1 - PROB_EPS) to maintain numerical stability.
-const PROB_MAX: f64 = 1.0 - PROB_EPS;
-
 /// Softmax function applied along axis 0 with numerical stability improvements.
-/// Returns probabilities clamped to [PROB_EPS, PROB_MAX] to avoid log(0).
+/// Optimized with in-place operations to reduce memory allocations.
+#[inline]
 fn softmax_axis0(logits: &Array2<f64>) -> Array2<f64> {
+    // Compute max values for numerical stability (log-sum-exp trick)
     let max_vals = logits.fold_axis(Axis(0), f64::NEG_INFINITY, |&a, &b| a.max(b));
-    let shifted = logits - &max_vals;
-    let exp_vals = shifted.mapv(f64::exp);
-    let sum_exp = exp_vals.sum_axis(Axis(0));
-    let probs = exp_vals / &sum_exp;
-    // Clamp probabilities to avoid numerical issues in log computations
-    probs.mapv(|p| p.clamp(PROB_EPS, PROB_MAX))
+
+    // Pre-allocate result array
+    let mut probs = Array2::zeros(logits.raw_dim());
+
+    // Compute exp(logits - max) and sum in one pass per column
+    let (k, n) = (logits.nrows(), logits.ncols());
+    for j in 0..n {
+        let max_j = max_vals[j];
+        let mut sum_exp = 0.0;
+
+        // First pass: compute exp values and their sum
+        for i in 0..k {
+            let exp_val = (logits[[i, j]] - max_j).exp();
+            probs[[i, j]] = exp_val;
+            sum_exp += exp_val;
+        }
+
+        // Second pass: normalize
+        let inv_sum = 1.0 / sum_exp;
+        for i in 0..k {
+            probs[[i, j]] = probs[[i, j]] * inv_sum;
+        }
+    }
+
+    probs
 }
 
 /// A K-class Categorical distribution for classification.
@@ -31,8 +47,6 @@ pub struct Categorical<const K: usize> {
     pub probs: Array2<f64>,
     /// Number of observations.
     n_obs: usize,
-    /// The parameters of the distribution (K-1 x N).
-    _params: Array2<f64>,
 }
 
 impl<const K: usize> Distribution for Categorical<K> {
@@ -54,7 +68,6 @@ impl<const K: usize> Distribution for Categorical<K> {
             logits,
             probs,
             n_obs,
-            _params: params.clone(),
         }
     }
 
@@ -69,11 +82,8 @@ impl<const K: usize> Distribution for Categorical<K> {
             }
         }
 
-        // Convert to probabilities with smoothing to avoid log(0)
-        let probs: Vec<f64> = counts
-            .iter()
-            .map(|&c| (c as f64 / n as f64).max(PROB_EPS))
-            .collect();
+        // Convert to probabilities (no smoothing, matching Python)
+        let probs: Vec<f64> = counts.iter().map(|&c| c as f64 / n as f64).collect();
 
         // Return logits relative to class 0: log(p_k) - log(p_0)
         let log_p0 = probs[0].ln();
@@ -106,8 +116,15 @@ impl<const K: usize> Distribution for Categorical<K> {
         predictions
     }
 
-    fn params(&self) -> &Array2<f64> {
-        &self._params
+    fn params(&self) -> Array2<f64> {
+        // Reconstruct params (N, K-1) from logits (K, N)
+        let mut p = Array2::zeros((self.n_obs, K - 1));
+        for i in 0..self.n_obs {
+            for j in 0..(K - 1) {
+                p[[i, j]] = self.logits[[j + 1, i]];
+            }
+        }
+        p
     }
 }
 
@@ -121,10 +138,11 @@ impl<const K: usize> ClassificationDistn for Categorical<K> {
 impl<const K: usize> Scorable<LogScore> for Categorical<K> {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         // -log(p[y_i]) for each observation
+        // Match Python: no probability clipping, -log(p) directly
         let mut scores = Array1::zeros(y.len());
         for (i, &y_i) in y.iter().enumerate() {
             let class = y_i as usize;
-            scores[i] = -self.probs[[class, i]].max(PROB_EPS).ln();
+            scores[i] = -self.probs[[class, i]].ln();
         }
         scores
     }
@@ -243,24 +261,43 @@ impl<const K: usize> Scorable<CRPScore> for Categorical<K> {
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Metric for Brier score
-        // We use the Fisher information matrix as an approximation
-        // This is similar to the LogScore metric but scaled
+        // Metric for Brier score: M_{jl} = E_Y[g_j * g_l]
+        // where g_j = 2 * Σ_k (p_k - 1{Y==k}) * p_k * (δ_{kj} - p_j)
+        // and the expectation is over Y ~ Categorical(p).
         let n_obs = self.n_obs;
         let n_params = K - 1;
         let mut fi = Array3::zeros((n_obs, n_params, n_params));
 
         for i in 0..n_obs {
-            for j in 0..n_params {
-                let p_j = self.probs[[j + 1, i]];
-                for k in 0..n_params {
-                    let p_k = self.probs[[k + 1, i]];
-                    if j == k {
-                        // Diagonal: scaled by 4 for Brier score
-                        fi[[i, j, k]] = 4.0 * p_j * (1.0 - p_j);
-                    } else {
-                        // Off-diagonal
-                        fi[[i, j, k]] = -4.0 * p_j * p_k;
+            // For each possible outcome c (with probability p_c),
+            // compute the gradient vector, then accumulate g * g^T weighted by p_c.
+            for c in 0..K {
+                let p_c = self.probs[[c, i]];
+
+                // Compute residuals for outcome Y = c
+                let mut residuals = vec![0.0; K];
+                for k in 0..K {
+                    let indicator = if k == c { 1.0 } else { 0.0 };
+                    residuals[k] = self.probs[[k, i]] - indicator;
+                }
+
+                // Compute gradient for each parameter
+                let mut grad = vec![0.0; n_params];
+                for j in 0..n_params {
+                    let p_j = self.probs[[j + 1, i]];
+                    let mut g = 0.0;
+                    for k in 0..K {
+                        let p_k = self.probs[[k, i]];
+                        let delta_kj = if k == j + 1 { 1.0 } else { 0.0 };
+                        g += residuals[k] * p_k * (delta_kj - p_j);
+                    }
+                    grad[j] = 2.0 * g;
+                }
+
+                // Accumulate p_c * grad * grad^T
+                for j in 0..n_params {
+                    for l in 0..n_params {
+                        fi[[i, j, l]] += p_c * grad[j] * grad[l];
                     }
                 }
             }

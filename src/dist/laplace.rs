@@ -1,6 +1,6 @@
 use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, Zip, array};
 use rand::prelude::*;
 
 /// The Laplace distribution.
@@ -10,19 +10,13 @@ pub struct Laplace {
     pub loc: Array1<f64>,
     /// The scale parameter.
     pub scale: Array1<f64>,
-    /// The parameters of the distribution, stored as a 2D array.
-    _params: Array2<f64>,
 }
 
 impl Distribution for Laplace {
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
         let scale = params.column(1).mapv(f64::exp);
-        Laplace {
-            loc,
-            scale,
-            _params: params.clone(),
-        }
+        Laplace { loc, scale }
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
@@ -56,8 +50,12 @@ impl Distribution for Laplace {
         self.loc.clone()
     }
 
-    fn params(&self) -> &Array2<f64> {
-        &self._params
+    fn params(&self) -> Array2<f64> {
+        let n = self.loc.len();
+        let mut p = Array2::zeros((n, 2));
+        p.column_mut(0).assign(&self.loc);
+        p.column_mut(1).assign(&self.scale.mapv(f64::ln));
+        p
     }
 }
 
@@ -78,54 +76,70 @@ impl DistributionMethods for Laplace {
     }
 
     fn pdf(&self, y: &Array1<f64>) -> Array1<f64> {
-        // pdf = 1/(2*scale) * exp(-|y - loc| / scale)
+        // Vectorized PDF: f(x) = 1/(2*scale) * exp(-|x - loc| / scale)
         let mut result = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            let abs_diff = (y[i] - self.loc[i]).abs();
-            result[i] = (-abs_diff / self.scale[i]).exp() / (2.0 * self.scale[i]);
-        }
+        Zip::from(&mut result)
+            .and(y)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|r, &y_i, &loc, &scale| {
+                let abs_diff = (y_i - loc).abs();
+                *r = (-abs_diff / scale).exp() / (2.0 * scale);
+            });
         result
     }
 
     fn logpdf(&self, y: &Array1<f64>) -> Array1<f64> {
-        // log(pdf) = -|y - loc| / scale - log(2 * scale)
+        // Vectorized log PDF: ln(f(x)) = -|x - loc| / scale - ln(2 * scale)
         let mut result = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            let abs_diff = (y[i] - self.loc[i]).abs();
-            result[i] = -abs_diff / self.scale[i] - (2.0 * self.scale[i]).ln();
-        }
+        Zip::from(&mut result)
+            .and(y)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|r, &y_i, &loc, &scale| {
+                let abs_diff = (y_i - loc).abs();
+                *r = -abs_diff / scale - (2.0 * scale).ln();
+            });
         result
     }
 
     fn cdf(&self, y: &Array1<f64>) -> Array1<f64> {
-        // CDF for Laplace:
+        // Vectorized CDF for Laplace:
         // if y < loc: 0.5 * exp((y - loc) / scale)
         // if y >= loc: 1 - 0.5 * exp(-(y - loc) / scale)
         let mut result = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            let diff = y[i] - self.loc[i];
-            if diff < 0.0 {
-                result[i] = 0.5 * (diff / self.scale[i]).exp();
-            } else {
-                result[i] = 1.0 - 0.5 * (-diff / self.scale[i]).exp();
-            }
-        }
+        Zip::from(&mut result)
+            .and(y)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|r, &y_i, &loc, &scale| {
+                let diff = y_i - loc;
+                if diff < 0.0 {
+                    *r = 0.5 * (diff / scale).exp();
+                } else {
+                    *r = 1.0 - 0.5 * (-diff / scale).exp();
+                }
+            });
         result
     }
 
     fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
-        // Inverse CDF (quantile function) for Laplace:
+        // Vectorized PPF (inverse CDF) for Laplace:
         // if q < 0.5: loc + scale * ln(2*q)
         // if q >= 0.5: loc - scale * ln(2*(1-q))
         let mut result = Array1::zeros(q.len());
-        for i in 0..q.len() {
-            let q_clamped = q[i].clamp(1e-15, 1.0 - 1e-15);
-            if q_clamped < 0.5 {
-                result[i] = self.loc[i] + self.scale[i] * (2.0 * q_clamped).ln();
-            } else {
-                result[i] = self.loc[i] - self.scale[i] * (2.0 * (1.0 - q_clamped)).ln();
-            }
-        }
+        Zip::from(&mut result)
+            .and(q)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|r, &q_i, &loc, &scale| {
+                let q_clamped = q_i.clamp(1e-15, 1.0 - 1e-15);
+                if q_clamped < 0.5 {
+                    *r = loc + scale * (2.0 * q_clamped).ln();
+                } else {
+                    *r = loc - scale * (2.0 * (1.0 - q_clamped)).ln();
+                }
+            });
         result
     }
 
@@ -160,13 +174,32 @@ impl DistributionMethods for Laplace {
 }
 
 impl Scorable<LogScore> for Laplace {
+    fn is_diagonal_metric(&self) -> bool {
+        true
+    }
+
+    fn diagonal_metric(&self) -> Array2<f64> {
+        let n_obs = self.loc.len();
+        let mut diag = Array2::zeros((n_obs, 2));
+        Zip::from(diag.rows_mut())
+            .and(&self.scale)
+            .for_each(|mut row, &scale| {
+                row[0] = 1.0 / (scale * scale);
+                row[1] = 1.0;
+            });
+        diag
+    }
+
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         // -logpdf(y) = |y - loc| / scale + log(2 * scale)
         let mut scores = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            let abs_diff = (y[i] - self.loc[i]).abs();
-            scores[i] = abs_diff / self.scale[i] + (2.0 * self.scale[i]).ln();
-        }
+        Zip::from(&mut scores)
+            .and(y)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|s, &y_i, &loc, &scale| {
+                *s = (y_i - loc).abs() / scale + (2.0 * scale).ln();
+            });
         scores
     }
 
@@ -174,15 +207,38 @@ impl Scorable<LogScore> for Laplace {
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 2));
 
-        for i in 0..n_obs {
-            let diff = self.loc[i] - y[i];
-            // d/d(loc) = sign(loc - y) / scale
-            d_params[[i, 0]] = diff.signum() / self.scale[i];
-            // d/d(log(scale)) = 1 - |loc - y| / scale
-            d_params[[i, 1]] = 1.0 - diff.abs() / self.scale[i];
-        }
+        Zip::from(d_params.rows_mut())
+            .and(y)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|mut row, &y_i, &loc, &scale| {
+                let diff = loc - y_i;
+                row[0] = diff.signum() / scale;
+                row[1] = 1.0 - diff.abs() / scale;
+            });
 
         d_params
+    }
+
+    fn d_score_and_diagonal_metric(&self, y: &Array1<f64>) -> (Array2<f64>, Array2<f64>) {
+        let n_obs = y.len();
+        let mut d_params = Array2::zeros((n_obs, 2));
+        let mut diag = Array2::zeros((n_obs, 2));
+
+        Zip::from(d_params.rows_mut())
+            .and(diag.rows_mut())
+            .and(y)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|mut d_row, mut m_row, &y_i, &loc, &scale| {
+                let diff = loc - y_i;
+                d_row[0] = diff.signum() / scale;
+                d_row[1] = 1.0 - diff.abs() / scale;
+                m_row[0] = 1.0 / (scale * scale);
+                m_row[1] = 1.0;
+            });
+
+        (d_params, diag)
     }
 
     fn metric(&self) -> Array3<f64> {
@@ -190,26 +246,47 @@ impl Scorable<LogScore> for Laplace {
         let n_obs = self.loc.len();
         let mut fi = Array3::zeros((n_obs, 2, 2));
 
-        for i in 0..n_obs {
-            let scale_sq = self.scale[i] * self.scale[i];
-            fi[[i, 0, 0]] = 1.0 / scale_sq;
-            fi[[i, 1, 1]] = 1.0;
-        }
+        Zip::from(fi.outer_iter_mut())
+            .and(&self.scale)
+            .for_each(|mut fi_i, &scale| {
+                fi_i[[0, 0]] = 1.0 / (scale * scale);
+                fi_i[[1, 1]] = 1.0;
+            });
 
         fi
     }
 }
 
 impl Scorable<CRPScore> for Laplace {
+    fn is_diagonal_metric(&self) -> bool {
+        true
+    }
+
+    fn diagonal_metric(&self) -> Array2<f64> {
+        let n_obs = self.loc.len();
+        let mut diag = Array2::zeros((n_obs, 2));
+        Zip::from(diag.rows_mut())
+            .and(&self.scale)
+            .for_each(|mut row, &scale| {
+                row[0] = 0.5 / scale;
+                row[1] = 0.25 * scale;
+            });
+        diag
+    }
+
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         // CRPS for Laplace distribution:
         // CRPS(F, y) = |y - loc| + scale * exp(-|y - loc|/scale) - 0.75 * scale
         let mut scores = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            let abs_diff = (y[i] - self.loc[i]).abs();
-            let exp_term = (-abs_diff / self.scale[i]).exp();
-            scores[i] = abs_diff + self.scale[i] * exp_term - 0.75 * self.scale[i];
-        }
+        Zip::from(&mut scores)
+            .and(y)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|s, &y_i, &loc, &scale| {
+                let abs_diff = (y_i - loc).abs();
+                let exp_term = (-abs_diff / scale).exp();
+                *s = abs_diff + scale * exp_term - 0.75 * scale;
+            });
         scores
     }
 
@@ -217,17 +294,17 @@ impl Scorable<CRPScore> for Laplace {
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 2));
 
-        for i in 0..n_obs {
-            let diff = self.loc[i] - y[i];
-            let abs_diff = diff.abs();
-            let exp_term = (-abs_diff / self.scale[i]).exp();
-
-            // d/d(loc)
-            d_params[[i, 0]] = diff.signum() * (1.0 - exp_term);
-
-            // d/d(log(scale)) - multiply by scale due to chain rule for log(scale)
-            d_params[[i, 1]] = exp_term * (self.scale[i] + abs_diff) - 0.75 * self.scale[i];
-        }
+        Zip::from(d_params.rows_mut())
+            .and(y)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|mut row, &y_i, &loc, &scale| {
+                let diff = loc - y_i;
+                let abs_diff = diff.abs();
+                let exp_term = (-abs_diff / scale).exp();
+                row[0] = diff.signum() * (1.0 - exp_term);
+                row[1] = exp_term * (scale + abs_diff) - 0.75 * scale;
+            });
 
         d_params
     }
@@ -237,10 +314,12 @@ impl Scorable<CRPScore> for Laplace {
         let n_obs = self.loc.len();
         let mut fi = Array3::zeros((n_obs, 2, 2));
 
-        for i in 0..n_obs {
-            fi[[i, 0, 0]] = 0.5 / self.scale[i];
-            fi[[i, 1, 1]] = 0.25 * self.scale[i];
-        }
+        Zip::from(fi.outer_iter_mut())
+            .and(&self.scale)
+            .for_each(|mut fi_i, &scale| {
+                fi_i[[0, 0]] = 0.5 / scale;
+                fi_i[[1, 1]] = 0.25 * scale;
+            });
 
         fi
     }

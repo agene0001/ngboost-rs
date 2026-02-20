@@ -1,8 +1,9 @@
 use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, Zip, array};
 use rand::prelude::*;
 use statrs::distribution::{Continuous, ContinuousCDF, Normal as NormalDist};
+use statrs::function::erf::erf;
 
 /// The Half-Normal distribution.
 ///
@@ -12,17 +13,12 @@ use statrs::distribution::{Continuous, ContinuousCDF, Normal as NormalDist};
 pub struct HalfNormal {
     /// The scale parameter (sigma).
     pub scale: Array1<f64>,
-    /// The parameters of the distribution, stored as a 2D array.
-    _params: Array2<f64>,
 }
 
 impl Distribution for HalfNormal {
     fn from_params(params: &Array2<f64>) -> Self {
         let scale = params.column(0).mapv(f64::exp);
-        HalfNormal {
-            scale,
-            _params: params.clone(),
-        }
+        HalfNormal { scale }
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
@@ -49,8 +45,11 @@ impl Distribution for HalfNormal {
         &self.scale * sqrt_2_over_pi
     }
 
-    fn params(&self) -> &Array2<f64> {
-        &self._params
+    fn params(&self) -> Array2<f64> {
+        let n = self.scale.len();
+        let mut p = Array2::zeros((n, 1));
+        p.column_mut(0).assign(&self.scale.mapv(f64::ln));
+        p
     }
 }
 
@@ -162,17 +161,27 @@ impl DistributionMethods for HalfNormal {
 }
 
 impl Scorable<LogScore> for HalfNormal {
+    fn is_diagonal_metric(&self) -> bool {
+        true
+    }
+
+    fn diagonal_metric(&self) -> Array2<f64> {
+        // Fisher Information for HalfNormal is constant 2.0 (1 param)
+        Array2::from_elem((self.scale.len(), 1), 2.0)
+    }
+
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
-        // -logpdf(y) for half-normal
-        // logpdf = log(sqrt(2/pi)) - log(scale) - y^2 / (2 * scale^2)
-        // -logpdf = -log(sqrt(2/pi)) + log(scale) + y^2 / (2 * scale^2)
+        // -logpdf(y) = -log(sqrt(2/pi)) + log(scale) + y^2 / (2 * scale^2)
         let log_sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt().ln();
         let mut scores = Array1::zeros(y.len());
 
-        for i in 0..y.len() {
-            let scale_sq = self.scale[i] * self.scale[i];
-            scores[i] = -log_sqrt_2_over_pi + self.scale[i].ln() + (y[i] * y[i]) / (2.0 * scale_sq);
-        }
+        Zip::from(&mut scores)
+            .and(y)
+            .and(&self.scale)
+            .for_each(|s, &y_i, &scale| {
+                let scale_sq = scale * scale;
+                *s = -log_sqrt_2_over_pi + scale.ln() + (y_i * y_i) / (2.0 * scale_sq);
+            });
         scores
     }
 
@@ -180,13 +189,12 @@ impl Scorable<LogScore> for HalfNormal {
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 1));
 
-        for i in 0..n_obs {
-            let scale_sq = self.scale[i] * self.scale[i];
-            // d/d(log(scale)) = scale * d/d(scale)
-            // d(-logpdf)/d(scale) = 1/scale - y^2/scale^3
-            // d(-logpdf)/d(log(scale)) = 1 - y^2/scale^2
-            d_params[[i, 0]] = 1.0 - (y[i] * y[i]) / scale_sq;
-        }
+        Zip::from(d_params.column_mut(0))
+            .and(y)
+            .and(&self.scale)
+            .for_each(|d, &y_i, &scale| {
+                *d = 1.0 - (y_i * y_i) / (scale * scale);
+            });
 
         d_params
     }
@@ -195,109 +203,110 @@ impl Scorable<LogScore> for HalfNormal {
         // Fisher Information for half-normal is 2 (constant)
         let n_obs = self.scale.len();
         let mut fi = Array3::zeros((n_obs, 1, 1));
-
-        for i in 0..n_obs {
-            fi[[i, 0, 0]] = 2.0;
-        }
-
+        fi.mapv_inplace(|_| 2.0);
         fi
     }
 }
 
 impl Scorable<CRPScore> for HalfNormal {
-    fn score(&self, y: &Array1<f64>) -> Array1<f64> {
-        // CRPS for Half-Normal distribution
-        // For a half-normal with scale σ and observation y >= 0:
-        // CRPS = σ * [z * (2*Φ(z) - 1) + 2*φ(z) - (1/√π) * (2*Φ(z*√2) - 1)]
-        // where z = y/σ, Φ is standard normal CDF, φ is standard normal PDF
-        //
-        // Simplified form:
-        // CRPS = σ * [z * erf(z/√2) + √(2/π) * (exp(-z²/2) - 1) + z]
-        //      = y * erf(y/(σ*√2)) + σ * √(2/π) * (exp(-y²/(2σ²)) - 1) + y
-        //
-        // Alternative form using standard normal:
-        // CRPS = σ * [z*(2Φ(z)-1) + 2φ(z) - 1/√π]   for y >= 0
+    fn is_diagonal_metric(&self) -> bool {
+        true
+    }
 
-        let std_normal = NormalDist::new(0.0, 1.0).unwrap();
-        let sqrt_pi = std::f64::consts::PI.sqrt();
-        let sqrt_2 = std::f64::consts::SQRT_2;
+    fn diagonal_metric(&self) -> Array2<f64> {
+        // CRPScore metric: C_HN * sigma^2 (1 param)
+        const C_HN: f64 = 0.19298832395618;
+        let n_obs = self.scale.len();
+        let mut diag = Array2::zeros((n_obs, 1));
+        Zip::from(diag.column_mut(0))
+            .and(&self.scale)
+            .for_each(|d, &sigma| {
+                *d = C_HN * sigma * sigma;
+            });
+        diag
+    }
+
+    fn score(&self, y: &Array1<f64>) -> Array1<f64> {
+        // CRPS for Half-Normal distribution (vectorized with inline math)
+        // CRPS = σ * [z*(2Φ(z)-1) + 2φ(z) - (2Φ(z√2)-1)/√π - 1/√π]
+        // where z = y/σ
+        // Inline: φ(z) = INV_SQRT_2PI * exp(-z²/2)
+        //         Φ(z) = 0.5 * (1 + erf(z/√2))
+        //         2Φ(z)-1 = erf(z/√2)
+        //         2Φ(z√2)-1 = erf(z)   [since (z√2)/√2 = z]
+        const INV_SQRT_2PI: f64 = 0.3989422804014327;
+        let inv_sqrt_pi = std::f64::consts::FRAC_2_SQRT_PI * 0.5; // 1/√π
+        let frac_1_sqrt_2 = std::f64::consts::FRAC_1_SQRT_2;
 
         let mut scores = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            let y_i = y[i].max(0.0); // Half-normal only supports y >= 0
-            let sigma = self.scale[i];
-            let z = y_i / sigma;
+        Zip::from(&mut scores)
+            .and(y)
+            .and(&self.scale)
+            .for_each(|s, &y_i, &sigma| {
+                let y_pos = y_i.max(0.0);
+                let z = y_pos / sigma;
+                let erf_z_over_sqrt2 = erf(z * frac_1_sqrt_2);
+                let phi_z = INV_SQRT_2PI * (-0.5 * z * z).exp();
+                let erf_z = erf(z);
 
-            // CRPS for folded/half-normal:
-            // CRPS = σ * [z*(2Φ(z) - 1) + 2φ(z)] - σ/√π * (2Φ(z√2) - 1) - σ/√π
-            // Simplified: CRPS = σ * [z*(2Φ(z)-1) + 2φ(z) - (2Φ(z√2)-1)/√π - 1/√π]
-
-            let phi_z = std_normal.pdf(z);
-            let big_phi_z = std_normal.cdf(z);
-            let big_phi_z_sqrt2 = std_normal.cdf(z * sqrt_2);
-
-            // CRPS for half-normal
-            scores[i] = sigma
-                * (z * (2.0 * big_phi_z - 1.0) + 2.0 * phi_z
-                    - (2.0 * big_phi_z_sqrt2 - 1.0) / sqrt_pi
-                    - 1.0 / sqrt_pi);
-        }
+                *s = sigma
+                    * (z * erf_z_over_sqrt2 + 2.0 * phi_z - erf_z * inv_sqrt_pi - inv_sqrt_pi);
+            });
         scores
     }
 
     fn d_score(&self, y: &Array1<f64>) -> Array2<f64> {
-        // Gradient of CRPS w.r.t. log(scale)
-        let std_normal = NormalDist::new(0.0, 1.0).unwrap();
-        let sqrt_pi = std::f64::consts::PI.sqrt();
+        // Gradient of CRPS w.r.t. log(scale) (vectorized with inline math)
+        // S = z*(2Φ(z)-1) + 2φ(z) - (2Φ(z√2)-1)/√π - 1/√π
+        // dS/dz = (2Φ(z)-1) - 2√2*φ(z√2)/√π
+        // d(CRPS)/d(log(σ)) = σ * (S - z * dS/dz)
+        //
+        // Inline: 2Φ(z)-1 = erf(z/√2), 2Φ(z√2)-1 = erf(z)
+        //         φ(z) = INV_SQRT_2PI * exp(-z²/2)
+        //         φ(z√2) = INV_SQRT_2PI * exp(-z²)
+        const INV_SQRT_2PI: f64 = 0.3989422804014327;
+        let inv_sqrt_pi = std::f64::consts::FRAC_2_SQRT_PI * 0.5;
+        let frac_1_sqrt_2 = std::f64::consts::FRAC_1_SQRT_2;
         let sqrt_2 = std::f64::consts::SQRT_2;
 
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 1));
 
-        for i in 0..n_obs {
-            let y_i = y[i].max(0.0);
-            let sigma = self.scale[i];
-            let z = y_i / sigma;
+        Zip::from(d_params.column_mut(0))
+            .and(y)
+            .and(&self.scale)
+            .for_each(|d, &y_i, &sigma| {
+                let y_pos = y_i.max(0.0);
+                let z = y_pos / sigma;
+                let z_sq = z * z;
 
-            let phi_z = std_normal.pdf(z);
-            let big_phi_z = std_normal.cdf(z);
-            let phi_z_sqrt2 = std_normal.pdf(z * sqrt_2);
-            let big_phi_z_sqrt2 = std_normal.cdf(z * sqrt_2);
+                let erf_z_over_sqrt2 = erf(z * frac_1_sqrt_2); // = 2Φ(z)-1
+                let phi_z = INV_SQRT_2PI * (-0.5 * z_sq).exp();
+                let phi_z_sqrt2 = INV_SQRT_2PI * (-z_sq).exp(); // φ(z√2)
+                let erf_z = erf(z); // = 2Φ(z√2)-1
 
-            // d(CRPS)/d(σ) then multiply by σ to get d(CRPS)/d(log(σ))
-            // Let S = CRPS/σ = z*(2Φ(z)-1) + 2φ(z) - (2Φ(z√2)-1)/√π - 1/√π
-            // d(CRPS)/d(σ) = S + σ * dS/dσ
-            // dz/dσ = -z/σ
-            // dS/dσ = dS/dz * dz/dσ = -z/σ * dS/dz
+                let s = z * erf_z_over_sqrt2 + 2.0 * phi_z - erf_z * inv_sqrt_pi - inv_sqrt_pi;
 
-            // dS/dz = (2Φ(z)-1) + z*2φ(z) + 2*(-z*φ(z)) - 2*√2*φ(z√2)/√π
-            //       = (2Φ(z)-1) - 2√2*φ(z√2)/√π
-            let ds_dz = 2.0 * big_phi_z - 1.0 - 2.0 * sqrt_2 * phi_z_sqrt2 / sqrt_pi;
+                let ds_dz = erf_z_over_sqrt2 - 2.0 * sqrt_2 * phi_z_sqrt2 * inv_sqrt_pi;
 
-            let s = z * (2.0 * big_phi_z - 1.0) + 2.0 * phi_z
-                - (2.0 * big_phi_z_sqrt2 - 1.0) / sqrt_pi
-                - 1.0 / sqrt_pi;
-
-            // d(CRPS)/d(log(σ)) = σ * d(CRPS)/d(σ) = σ * (S - z * dS/dz)
-            d_params[[i, 0]] = sigma * (s - z * ds_dz);
-        }
+                *d = sigma * (s - z * ds_dz);
+            });
 
         d_params
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Fisher Information matrix for CRPS
-        // For half-normal, this is approximately constant
+        // Analytical CRPScore metric: E_Y[g(Y)^2]
+        // E[g^2] = C_HN * σ^2 where C_HN was computed via quadrature.
+        const C_HN: f64 = 0.19298832395618;
         let n_obs = self.scale.len();
         let mut fi = Array3::zeros((n_obs, 1, 1));
 
-        // The metric is E[∇S ∇S^T] which for half-normal CRPS
-        // is approximately 2/(π) based on the variance structure
-        let metric_val = 2.0 / std::f64::consts::PI;
-
-        for i in 0..n_obs {
-            fi[[i, 0, 0]] = metric_val;
-        }
+        Zip::from(fi.outer_iter_mut())
+            .and(&self.scale)
+            .for_each(|mut fi_i, &sigma| {
+                fi_i[[0, 0]] = C_HN * sigma * sigma;
+            });
 
         fi
     }
@@ -509,5 +518,61 @@ mod tests {
         let score2 = Scorable::<CRPScore>::score(&dist2, &y);
 
         assert_relative_eq!(score2[0] / score1[0], 2.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_halfnormal_crp_score_matches_library() {
+        // Verify vectorized CRPScore matches the original library-based computation
+        let std_normal = NormalDist::new(0.0, 1.0).unwrap();
+        let sqrt_pi = std::f64::consts::PI.sqrt();
+        let sqrt_2 = std::f64::consts::SQRT_2;
+
+        let scales: Vec<f64> = vec![0.5, 1.0, 1.5, 2.0, 3.0];
+        let y_vals: Vec<f64> = vec![0.0, 0.1, 0.5, 1.0, 2.0, 5.0];
+
+        for &scale in &scales {
+            let params = Array2::from_shape_vec((1, 1), vec![scale.ln()]).unwrap();
+            let dist = HalfNormal::from_params(&params);
+
+            for &y_val in &y_vals {
+                let y = Array1::from_vec(vec![y_val]);
+                let score = Scorable::<CRPScore>::score(&dist, &y);
+
+                // Reference: library-based computation
+                let z = y_val.max(0.0) / scale;
+                let phi_z = std_normal.pdf(z);
+                let big_phi_z = std_normal.cdf(z);
+                let big_phi_z_sqrt2 = std_normal.cdf(z * sqrt_2);
+                let expected = scale
+                    * (z * (2.0 * big_phi_z - 1.0) + 2.0 * phi_z
+                        - (2.0 * big_phi_z_sqrt2 - 1.0) / sqrt_pi
+                        - 1.0 / sqrt_pi);
+
+                assert_relative_eq!(score[0], expected, epsilon = 1e-12,);
+            }
+        }
+    }
+
+    #[test]
+    fn test_halfnormal_crp_d_score_numerical() {
+        // Verify CRPScore d_score via numerical finite differences
+        let eps = 1e-6;
+        let params = Array2::from_shape_vec((1, 1), vec![0.5_f64.ln()]).unwrap();
+        let dist = HalfNormal::from_params(&params);
+        let y = Array1::from_vec(vec![1.5]);
+
+        let d_score = Scorable::<CRPScore>::d_score(&dist, &y);
+
+        // Numerical gradient: d(score)/d(log_scale) via central differences
+        let log_scale = 0.5_f64.ln();
+        let params_plus = Array2::from_shape_vec((1, 1), vec![log_scale + eps]).unwrap();
+        let params_minus = Array2::from_shape_vec((1, 1), vec![log_scale - eps]).unwrap();
+        let dist_plus = HalfNormal::from_params(&params_plus);
+        let dist_minus = HalfNormal::from_params(&params_minus);
+        let score_plus = Scorable::<CRPScore>::score(&dist_plus, &y);
+        let score_minus = Scorable::<CRPScore>::score(&dist_minus, &y);
+        let numerical = (score_plus[0] - score_minus[0]) / (2.0 * eps);
+
+        assert_relative_eq!(d_score[[0, 0]], numerical, epsilon = 1e-5);
     }
 }

@@ -1,8 +1,8 @@
 use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, Zip, array};
 use rand::prelude::*;
-use statrs::distribution::{Continuous, ContinuousCDF, Gamma as GammaDist};
+use statrs::distribution::{ContinuousCDF, Gamma as GammaDist};
 use statrs::function::gamma::digamma;
 
 /// The Gamma distribution.
@@ -10,28 +10,47 @@ use statrs::function::gamma::digamma;
 pub struct Gamma {
     pub shape: Array1<f64>, // alpha
     pub rate: Array1<f64>,  // beta
-    _params: Array2<f64>,
 }
 
 impl Distribution for Gamma {
     fn from_params(params: &Array2<f64>) -> Self {
         let shape = params.column(0).mapv(f64::exp);
         let rate = params.column(1).mapv(f64::exp);
-        Gamma {
-            shape,
-            rate,
-            _params: params.clone(),
-        }
+        Gamma { shape, rate }
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
-        // This is a simplification, MLE for Gamma is complex.
-        // Using method of moments.
+        // MLE for Gamma with fixed loc=0, matching scipy.stats.gamma.fit(Y, floc=0).
+        // Uses Newton's method on: log(shape) - digamma(shape) = log(mean(Y)) - mean(log(Y))
+        let n = y.len() as f64;
         let mean = y.mean().unwrap_or(1.0);
-        let var = y.var(0.0);
-        let shape = mean * mean / var.max(1e-9);
-        let scale = var / mean.max(1e-9);
-        let rate: f64 = 1.0 / scale;
+        let mean_log: f64 = y.iter().map(|&v| v.max(1e-300).ln()).sum::<f64>() / n;
+        let s = mean.max(1e-300).ln() - mean_log; // s = log(mean(Y)) - mean(log(Y))
+
+        // Initial estimate using Minka's approximation
+        let mut shape = if s > 0.0 {
+            (3.0 - s + ((s - 3.0) * (s - 3.0) + 24.0 * s).sqrt()) / (12.0 * s)
+        } else {
+            1.0
+        };
+
+        // Newton iterations: f(a) = log(a) - digamma(a) - s, f'(a) = 1/a - trigamma(a)
+        for _ in 0..50 {
+            let f = shape.ln() - digamma(shape) - s;
+            let f_prime = 1.0 / shape - trigamma(shape);
+            if f_prime.abs() < 1e-15 {
+                break;
+            }
+            let step = f / f_prime;
+            shape -= step;
+            shape = shape.max(1e-10);
+            if step.abs() < 1e-10 {
+                break;
+            }
+        }
+
+        let scale = mean / shape; // MLE scale = mean(Y) / shape
+        let rate = 1.0 / scale;
         array![shape.ln(), rate.ln()]
     }
 
@@ -44,8 +63,12 @@ impl Distribution for Gamma {
         &self.shape / &self.rate
     }
 
-    fn params(&self) -> &Array2<f64> {
-        &self._params
+    fn params(&self) -> Array2<f64> {
+        let n = self.shape.len();
+        let mut p = Array2::zeros((n, 2));
+        p.column_mut(0).assign(&self.shape.mapv(f64::ln));
+        p.column_mut(1).assign(&self.rate.mapv(f64::ln));
+        p
     }
 }
 
@@ -67,43 +90,57 @@ impl DistributionMethods for Gamma {
     }
 
     fn pdf(&self, y: &Array1<f64>) -> Array1<f64> {
-        let mut result = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            if let Ok(d) = GammaDist::new(self.shape[i], self.rate[i]) {
-                result[i] = d.pdf(y[i]);
-            }
-        }
-        result
+        // Inline formula: f(x; k, β) = (β^k * x^(k-1) * e^(-β*x)) / Γ(k)
+        // Compute via exp(logpdf) to avoid overflow
+        self.logpdf(y).mapv(f64::exp)
     }
 
     fn logpdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        // Inline formula: ln(f(x)) = k*ln(β) + (k-1)*ln(x) - β*x - ln(Γ(k))
+        use statrs::function::gamma::ln_gamma;
         let mut result = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            if let Ok(d) = GammaDist::new(self.shape[i], self.rate[i]) {
-                result[i] = d.ln_pdf(y[i]);
-            }
-        }
+        Zip::from(&mut result)
+            .and(y)
+            .and(&self.shape)
+            .and(&self.rate)
+            .for_each(|r, &y_i, &k, &beta| {
+                if y_i > 0.0 && k > 0.0 && beta > 0.0 {
+                    *r = k * beta.ln() + (k - 1.0) * y_i.ln() - beta * y_i - ln_gamma(k);
+                } else {
+                    *r = f64::NEG_INFINITY;
+                }
+            });
         result
     }
 
     fn cdf(&self, y: &Array1<f64>) -> Array1<f64> {
+        // Vectorized CDF using statrs library for accuracy
         let mut result = Array1::zeros(y.len());
-        for i in 0..y.len() {
-            if let Ok(d) = GammaDist::new(self.shape[i], self.rate[i]) {
-                result[i] = d.cdf(y[i]);
-            }
-        }
+        Zip::from(&mut result)
+            .and(y)
+            .and(&self.shape)
+            .and(&self.rate)
+            .for_each(|r, &y_i, &shape, &rate| {
+                if let Ok(d) = GammaDist::new(shape, rate) {
+                    *r = d.cdf(y_i);
+                }
+            });
         result
     }
 
     fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
+        // Vectorized PPF using statrs library for accuracy
         let mut result = Array1::zeros(q.len());
-        for i in 0..q.len() {
-            if let Ok(d) = GammaDist::new(self.shape[i], self.rate[i]) {
-                let q_clamped = q[i].clamp(1e-15, 1.0 - 1e-15);
-                result[i] = d.inverse_cdf(q_clamped);
-            }
-        }
+        Zip::from(&mut result)
+            .and(q)
+            .and(&self.shape)
+            .and(&self.rate)
+            .for_each(|r, &q_i, &shape, &rate| {
+                if let Ok(d) = GammaDist::new(shape, rate) {
+                    let q_clamped = q_i.clamp(1e-15, 1.0 - 1e-15);
+                    *r = d.inverse_cdf(q_clamped);
+                }
+            });
         result
     }
 
@@ -143,47 +180,51 @@ impl DistributionMethods for Gamma {
 
 impl Scorable<LogScore> for Gamma {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
+        // Vectorized -ln_pdf: -(k*ln(β) + (k-1)*ln(y) - β*y - ln_gamma(k))
+        use statrs::function::gamma::ln_gamma;
         let mut scores = Array1::zeros(y.len());
-        for (i, &y_i) in y.iter().enumerate() {
-            let d = GammaDist::new(self.shape[i], self.rate[i]).unwrap();
-            scores[i] = -d.ln_pdf(y_i);
-        }
+        Zip::from(&mut scores)
+            .and(y)
+            .and(&self.shape)
+            .and(&self.rate)
+            .for_each(|s, &y_i, &k, &beta| {
+                *s = -(k * beta.ln() + (k - 1.0) * y_i.max(1e-300).ln() - beta * y_i - ln_gamma(k));
+            });
         scores
     }
 
     fn d_score(&self, y: &Array1<f64>) -> Array2<f64> {
+        // Vectorized gradient w.r.t. log(shape) and log(rate)
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 2));
 
-        for i in 0..n_obs {
-            let shape_i = self.shape[i];
-            let rate_i = self.rate[i];
-
-            // d/d(log(shape))
-            let d_log_shape = shape_i * (digamma(shape_i) - (y[i] * rate_i).max(1e-9).ln());
-            d_params[[i, 0]] = d_log_shape;
-
-            // d/d(log(rate))
-            let d_log_rate = y[i] * rate_i - shape_i;
-            d_params[[i, 1]] = d_log_rate;
-        }
+        Zip::from(d_params.rows_mut())
+            .and(y)
+            .and(&self.shape)
+            .and(&self.rate)
+            .for_each(|mut row, &y_i, &shape_i, &rate_i| {
+                // d/d(log(shape)) - matches Python: log(eps + beta * Y) with eps=1e-10
+                row[0] = shape_i * (digamma(shape_i) - (1e-10 + y_i * rate_i).ln());
+                // d/d(log(rate))
+                row[1] = y_i * rate_i - shape_i;
+            });
 
         d_params
     }
 
     fn metric(&self) -> Array3<f64> {
+        // Vectorized Fisher Information Matrix
         let n_obs = self.shape.len();
         let mut fi = Array3::zeros((n_obs, 2, 2));
 
-        for i in 0..n_obs {
-            let shape_i = self.shape[i];
-
-            // We use our local helper function for trigamma
-            fi[[i, 0, 0]] = shape_i * shape_i * trigamma(shape_i);
-            fi[[i, 1, 1]] = shape_i;
-            fi[[i, 0, 1]] = -shape_i;
-            fi[[i, 1, 0]] = -shape_i;
-        }
+        Zip::from(fi.outer_iter_mut())
+            .and(&self.shape)
+            .for_each(|mut fi_i, &shape_i| {
+                fi_i[[0, 0]] = shape_i * shape_i * trigamma(shape_i);
+                fi_i[[1, 1]] = shape_i;
+                fi_i[[0, 1]] = -shape_i;
+                fi_i[[1, 0]] = -shape_i;
+            });
 
         fi
     }
@@ -222,54 +263,92 @@ impl Scorable<CRPScore> for Gamma {
             // = sqrt(pi) * Gamma(a) / Gamma(a + 0.5)
             let beta_term = beta(0.5, shape);
 
-            // CRPS formula
+            // CRPS formula (Gneiting & Raftery 2007, scoringRules R package):
+            // CRPS = y*(2*F(y) - 1) - (shape/rate)*(2*F_{shape+1}(y) - 1) - 1/(rate*B(0.5, shape))
             let mean = shape / rate;
-            scores[i] = y_i * (2.0 * f_y - 1.0) - mean * (2.0 * f_alpha1_y - 1.0)
-                + mean / (std::f64::consts::PI.sqrt() * beta_term);
+            scores[i] = y_i * (2.0 * f_y - 1.0)
+                - mean * (2.0 * f_alpha1_y - 1.0)
+                - 1.0 / (rate * beta_term);
         }
         scores
     }
 
     fn d_score(&self, y: &Array1<f64>) -> Array2<f64> {
-        // Numerical gradient for CRPS (analytical form is complex)
+        // Numerical gradient for CRPS using central differences
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 2));
-        let eps = 1e-6;
+        let eps = 1e-5;
 
         for i in 0..n_obs {
             let shape_i = self.shape[i];
             let rate_i = self.rate[i];
             let y_i = y[i];
 
-            // Compute score at current params
-            let score_center = self.crps_single(y_i, shape_i, rate_i);
-
-            // Derivative w.r.t. log(shape) via finite difference
+            // Derivative w.r.t. log(shape) via central finite difference
             let shape_plus = shape_i * (1.0 + eps);
+            let shape_minus = shape_i * (1.0 - eps);
             let score_shape_plus = self.crps_single(y_i, shape_plus, rate_i);
-            d_params[[i, 0]] = (score_shape_plus - score_center) / (shape_i * eps);
+            let score_shape_minus = self.crps_single(y_i, shape_minus, rate_i);
+            d_params[[i, 0]] = (score_shape_plus - score_shape_minus) / (2.0 * eps);
 
-            // Derivative w.r.t. log(rate) via finite difference
+            // Derivative w.r.t. log(rate) via central finite difference
             let rate_plus = rate_i * (1.0 + eps);
+            let rate_minus = rate_i * (1.0 - eps);
             let score_rate_plus = self.crps_single(y_i, shape_i, rate_plus);
-            d_params[[i, 1]] = (score_rate_plus - score_center) / (rate_i * eps);
+            let score_rate_minus = self.crps_single(y_i, shape_i, rate_minus);
+            d_params[[i, 1]] = (score_rate_plus - score_rate_minus) / (2.0 * eps);
         }
 
         d_params
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Use identity matrix scaled by estimated variance as a simple metric
+        // Deterministic quadrature for E[g * g^T].
+        // Uses probability integral transform: u = F(y), y = F^{-1}(u)
+        // so E[h(Y)] = ∫_0^1 h(F^{-1}(u)) du, computed via midpoint rule.
         let n_obs = self.shape.len();
-        let mut fi = Array3::zeros((n_obs, 2, 2));
+        let n_params = 2;
+        let n_points = 200;
+        let eps = 1e-5;
+
+        let mut fi = Array3::zeros((n_obs, n_params, n_params));
 
         for i in 0..n_obs {
-            // Use a simple diagonal metric
-            let mean = self.shape[i] / self.rate[i];
-            fi[[i, 0, 0]] = mean;
-            fi[[i, 1, 1]] = mean;
+            let shape_i = self.shape[i];
+            let rate_i = self.rate[i];
+
+            let d = match GammaDist::new(shape_i, rate_i) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            for j in 0..n_points {
+                let u = (j as f64 + 0.5) / n_points as f64;
+                let y_i = d.inverse_cdf(u);
+
+                // Compute gradient via finite differences (same as d_score)
+                let shape_plus = shape_i * (1.0 + eps);
+                let shape_minus = shape_i * (1.0 - eps);
+                let g0 = (self.crps_single(y_i, shape_plus, rate_i)
+                    - self.crps_single(y_i, shape_minus, rate_i))
+                    / (2.0 * eps);
+
+                let rate_plus = rate_i * (1.0 + eps);
+                let rate_minus = rate_i * (1.0 - eps);
+                let g1 = (self.crps_single(y_i, shape_i, rate_plus)
+                    - self.crps_single(y_i, shape_i, rate_minus))
+                    / (2.0 * eps);
+
+                let grads = [g0, g1];
+                for a in 0..n_params {
+                    for b in 0..n_params {
+                        fi[[i, a, b]] += grads[a] * grads[b];
+                    }
+                }
+            }
         }
 
+        fi.mapv_inplace(|x| x / n_points as f64);
         fi
     }
 }
@@ -294,8 +373,7 @@ impl Gamma {
         let beta_term = beta(0.5, shape);
         let mean = shape / rate;
 
-        y * (2.0 * f_y - 1.0) - mean * (2.0 * f_alpha1_y - 1.0)
-            + mean / (std::f64::consts::PI.sqrt() * beta_term)
+        y * (2.0 * f_y - 1.0) - mean * (2.0 * f_alpha1_y - 1.0) - 1.0 / (rate * beta_term)
     }
 }
 

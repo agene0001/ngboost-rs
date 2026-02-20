@@ -4,15 +4,15 @@ pub type LossMonitor<D> = Box<dyn Fn(&D, &Array1<f64>, Option<&Array1<f64>>) -> 
 use crate::dist::categorical::{Bernoulli, Categorical};
 use crate::dist::normal::Normal;
 use crate::dist::{ClassificationDistn, Distribution};
-use crate::learners::{default_tree_learner, BaseLearner, DecisionTreeLearner, TrainedBaseLearner};
+use crate::learners::{BaseLearner, DecisionTreeLearner, TrainedBaseLearner, default_tree_learner};
 use crate::scores::{LogScore, Scorable, Score};
 use ndarray::{Array1, Array2};
+use rand::SeedableRng;
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
-#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 /// Learning rate schedule for controlling step size during training.
@@ -126,52 +126,76 @@ where
     S: Score,
     B: BaseLearner + Clone,
 {
-    // Hyperparameters
-    pub n_estimators: u32,
+    // ==========================================================================
+    // Fields ordered by alignment for optimal memory layout (largest first)
+    // ==========================================================================
+
+    // --- 24-byte aligned (Vec = ptr + len + cap) ---
+    /// Trained base models for each iteration and parameter.
+    pub base_models: Vec<Vec<Box<dyn TrainedBaseLearner>>>,
+    /// Scaling factors from line search at each iteration.
+    pub scalings: Vec<f64>,
+    /// Effective learning rates used at each iteration (for LR schedule support).
+    pub effective_learning_rates: Vec<f64>,
+    /// Column indices used at each iteration (for col_sample).
+    pub col_idxs: Vec<Vec<usize>>,
+    /// Training history containing loss values at each iteration.
+    pub evals_result: EvalsResult,
+
+    // --- 16-byte aligned (Option<Box<...>> with fat pointer) ---
+    train_loss_monitor: Option<LossMonitor<D>>,
+    val_loss_monitor: Option<LossMonitor<D>>,
+
+    // --- 8-byte aligned (f64, usize, Option<usize>, Array1, StdRng, enums with f64) ---
+    /// Learning rate (step size shrinkage).
     pub learning_rate: f64,
-    pub natural_gradient: bool,
+    /// Fraction of samples to use per iteration (1.0 = all samples).
     pub minibatch_frac: f64,
+    /// Fraction of features to use per iteration (1.0 = all features).
     pub col_sample: f64,
-    pub verbose: bool,
     /// Interval for verbose output during training.
     /// - If >= 1.0: print every `verbose_eval` iterations (e.g., 100 means every 100 iterations)
     /// - If < 1.0 and > 0.0: print every `verbose_eval * n_estimators` iterations (e.g., 0.1 means every 10%)
     /// - If <= 0.0: no verbose output regardless of `verbose` setting
     pub verbose_eval: f64,
+    /// Tolerance for early stopping based on gradient norm.
     pub tol: f64,
-    pub early_stopping_rounds: Option<u32>,
+    /// Fraction of training data to use for validation when no explicit validation set provided.
     pub validation_fraction: f64,
-    pub adaptive_learning_rate: bool, // Enable adaptive learning rate for better convergence (deprecated, use lr_schedule)
-    /// Learning rate schedule for controlling step size during training.
-    pub lr_schedule: LearningRateSchedule,
     /// Tikhonov regularization parameter for stabilizing Fisher matrix inversion.
     /// Added to diagonal of Fisher Information Matrix: F + tikhonov_reg * I.
     /// Set to 0.0 to disable (default). Typical values: 1e-6 to 1e-3.
     pub tikhonov_reg: f64,
+    /// Learning rate schedule for controlling step size during training.
+    pub lr_schedule: LearningRateSchedule,
     /// Line search method for finding optimal step size.
     pub line_search_method: LineSearchMethod,
-
-    // Base learner
-    base_learner: B,
-
-    // State
-    pub base_models: Vec<Vec<Box<dyn TrainedBaseLearner>>>,
-    pub scalings: Vec<f64>,
+    /// Initial distribution parameters fitted from training data.
     pub init_params: Option<Array1<f64>>,
-    pub col_idxs: Vec<Vec<usize>>,
-    train_loss_monitor: Option<LossMonitor<D>>,
-    val_loss_monitor: Option<LossMonitor<D>>,
-    best_val_loss_itr: Option<usize>,
-    n_features: Option<usize>,
-    /// Training history containing loss values at each iteration.
-    pub evals_result: EvalsResult,
-
-    // Random number generator (seeded for reproducibility)
-    rng: StdRng,
     /// Optional random seed for reproducibility. If None, uses entropy from the OS.
     random_state: Option<u64>,
+    best_val_loss_itr: Option<usize>,
+    n_features: Option<usize>,
+    /// Random number generator (seeded for reproducibility).
+    rng: StdRng,
+    /// Base learner to use for fitting gradients.
+    base_learner: B,
 
-    // Generics
+    // --- 4-byte aligned (u32) ---
+    /// Number of boosting iterations.
+    pub n_estimators: u32,
+    /// Number of rounds without improvement before stopping.
+    pub early_stopping_rounds: Option<u32>,
+
+    // --- 1-byte aligned (bool) ---
+    /// Whether to use natural gradient (recommended).
+    pub natural_gradient: bool,
+    /// Whether to print training progress.
+    pub verbose: bool,
+    /// Enable adaptive learning rate for better convergence (deprecated, use lr_schedule).
+    pub adaptive_learning_rate: bool,
+
+    // --- 0-byte (PhantomData) ---
     _dist: PhantomData<D>,
     _score: PhantomData<S>,
 }
@@ -184,32 +208,39 @@ where
 {
     pub fn new(n_estimators: u32, learning_rate: f64, base_learner: B) -> Self {
         NGBoost {
-            n_estimators,
-            learning_rate,
-            natural_gradient: true,
-            minibatch_frac: 1.0,
-            col_sample: 1.0,
-            verbose: false,
-            verbose_eval: 100.0,
-            tol: 1e-4,
-            early_stopping_rounds: None,
-            validation_fraction: 0.1,
-            adaptive_learning_rate: false,
-            lr_schedule: LearningRateSchedule::Constant,
-            tikhonov_reg: 0.0,
-            line_search_method: LineSearchMethod::Binary,
-            base_learner,
+            // 24-byte aligned
             base_models: Vec::new(),
             scalings: Vec::new(),
-            init_params: None,
+            effective_learning_rates: Vec::new(),
             col_idxs: Vec::new(),
+            evals_result: EvalsResult::default(),
+            // 16-byte aligned
             train_loss_monitor: None,
             val_loss_monitor: None,
+            // 8-byte aligned
+            learning_rate,
+            minibatch_frac: 1.0,
+            col_sample: 1.0,
+            verbose_eval: 100.0,
+            tol: 1e-4,
+            validation_fraction: 0.1,
+            tikhonov_reg: 0.0,
+            lr_schedule: LearningRateSchedule::Constant,
+            line_search_method: LineSearchMethod::Binary,
+            init_params: None,
+            random_state: None,
             best_val_loss_itr: None,
             n_features: None,
-            evals_result: EvalsResult::default(),
             rng: StdRng::from_rng(&mut rand::rng()),
-            random_state: None,
+            base_learner,
+            // 4-byte aligned
+            n_estimators,
+            early_stopping_rounds: None,
+            // 1-byte aligned
+            natural_gradient: true,
+            verbose: false,
+            adaptive_learning_rate: false,
+            // 0-byte
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -219,32 +250,39 @@ where
     /// This is equivalent to Python's `random_state` parameter.
     pub fn with_seed(n_estimators: u32, learning_rate: f64, base_learner: B, seed: u64) -> Self {
         NGBoost {
-            n_estimators,
-            learning_rate,
-            natural_gradient: true,
-            minibatch_frac: 1.0,
-            col_sample: 1.0,
-            verbose: false,
-            verbose_eval: 100.0,
-            tol: 1e-4,
-            early_stopping_rounds: None,
-            validation_fraction: 0.1,
-            adaptive_learning_rate: false,
-            lr_schedule: LearningRateSchedule::Constant,
-            tikhonov_reg: 0.0,
-            line_search_method: LineSearchMethod::Binary,
-            base_learner,
+            // 24-byte aligned
             base_models: Vec::new(),
             scalings: Vec::new(),
-            init_params: None,
+            effective_learning_rates: Vec::new(),
             col_idxs: Vec::new(),
+            evals_result: EvalsResult::default(),
+            // 16-byte aligned
             train_loss_monitor: None,
             val_loss_monitor: None,
+            // 8-byte aligned
+            learning_rate,
+            minibatch_frac: 1.0,
+            col_sample: 1.0,
+            verbose_eval: 100.0,
+            tol: 1e-4,
+            validation_fraction: 0.1,
+            tikhonov_reg: 0.0,
+            lr_schedule: LearningRateSchedule::Constant,
+            line_search_method: LineSearchMethod::Binary,
+            init_params: None,
+            random_state: Some(seed),
             best_val_loss_itr: None,
             n_features: None,
-            evals_result: EvalsResult::default(),
             rng: StdRng::seed_from_u64(seed),
-            random_state: Some(seed),
+            base_learner,
+            // 4-byte aligned
+            n_estimators,
+            early_stopping_rounds: None,
+            // 1-byte aligned
+            natural_gradient: true,
+            verbose: false,
+            adaptive_learning_rate: false,
+            // 0-byte
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -282,32 +320,39 @@ where
         adaptive_learning_rate: bool,
     ) -> Self {
         NGBoost {
-            n_estimators,
-            learning_rate,
-            natural_gradient,
-            minibatch_frac,
-            col_sample,
-            verbose,
-            verbose_eval,
-            tol,
-            early_stopping_rounds,
-            validation_fraction,
-            adaptive_learning_rate,
-            lr_schedule: LearningRateSchedule::Constant,
-            tikhonov_reg: 0.0,
-            line_search_method: LineSearchMethod::Binary,
-            base_learner,
+            // 24-byte aligned
             base_models: Vec::new(),
             scalings: Vec::new(),
-            init_params: None,
+            effective_learning_rates: Vec::new(),
             col_idxs: Vec::new(),
+            evals_result: EvalsResult::default(),
+            // 16-byte aligned
             train_loss_monitor: None,
             val_loss_monitor: None,
+            // 8-byte aligned
+            learning_rate,
+            minibatch_frac,
+            col_sample,
+            verbose_eval,
+            tol,
+            validation_fraction,
+            tikhonov_reg: 0.0,
+            lr_schedule: LearningRateSchedule::Constant,
+            line_search_method: LineSearchMethod::Binary,
+            init_params: None,
+            random_state: None,
             best_val_loss_itr: None,
             n_features: None,
-            evals_result: EvalsResult::default(),
             rng: StdRng::from_rng(&mut rand::rng()),
-            random_state: None,
+            base_learner,
+            // 4-byte aligned
+            n_estimators,
+            early_stopping_rounds,
+            // 1-byte aligned
+            natural_gradient,
+            verbose,
+            adaptive_learning_rate,
+            // 0-byte
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -335,32 +380,39 @@ where
             None => StdRng::from_rng(&mut rand::rng()),
         };
         NGBoost {
-            n_estimators,
-            learning_rate,
-            natural_gradient,
-            minibatch_frac,
-            col_sample,
-            verbose,
-            verbose_eval,
-            tol,
-            early_stopping_rounds,
-            validation_fraction,
-            adaptive_learning_rate,
-            lr_schedule: LearningRateSchedule::Constant,
-            tikhonov_reg: 0.0,
-            line_search_method: LineSearchMethod::Binary,
-            base_learner,
+            // 24-byte aligned
             base_models: Vec::new(),
             scalings: Vec::new(),
-            init_params: None,
+            effective_learning_rates: Vec::new(),
             col_idxs: Vec::new(),
+            evals_result: EvalsResult::default(),
+            // 16-byte aligned
             train_loss_monitor: None,
             val_loss_monitor: None,
+            // 8-byte aligned
+            learning_rate,
+            minibatch_frac,
+            col_sample,
+            verbose_eval,
+            tol,
+            validation_fraction,
+            tikhonov_reg: 0.0,
+            lr_schedule: LearningRateSchedule::Constant,
+            line_search_method: LineSearchMethod::Binary,
+            init_params: None,
+            random_state,
             best_val_loss_itr: None,
             n_features: None,
-            evals_result: EvalsResult::default(),
             rng,
-            random_state,
+            base_learner,
+            // 4-byte aligned
+            n_estimators,
+            early_stopping_rounds,
+            // 1-byte aligned
+            natural_gradient,
+            verbose,
+            adaptive_learning_rate,
+            // 0-byte
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -385,32 +437,39 @@ where
         line_search_method: LineSearchMethod,
     ) -> Self {
         NGBoost {
-            n_estimators,
-            learning_rate,
-            natural_gradient,
-            minibatch_frac,
-            col_sample,
-            verbose,
-            verbose_eval,
-            tol,
-            early_stopping_rounds,
-            validation_fraction,
-            adaptive_learning_rate: false,
-            lr_schedule,
-            tikhonov_reg,
-            line_search_method,
-            base_learner,
+            // 24-byte aligned
             base_models: Vec::new(),
             scalings: Vec::new(),
-            init_params: None,
+            effective_learning_rates: Vec::new(),
             col_idxs: Vec::new(),
+            evals_result: EvalsResult::default(),
+            // 16-byte aligned
             train_loss_monitor: None,
             val_loss_monitor: None,
+            // 8-byte aligned
+            learning_rate,
+            minibatch_frac,
+            col_sample,
+            verbose_eval,
+            tol,
+            validation_fraction,
+            tikhonov_reg,
+            lr_schedule,
+            line_search_method,
+            init_params: None,
+            random_state: None,
             best_val_loss_itr: None,
             n_features: None,
-            evals_result: EvalsResult::default(),
             rng: StdRng::from_rng(&mut rand::rng()),
-            random_state: None,
+            base_learner,
+            // 4-byte aligned
+            n_estimators,
+            early_stopping_rounds,
+            // 1-byte aligned
+            natural_gradient,
+            verbose,
+            adaptive_learning_rate: false,
+            // 0-byte
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -440,32 +499,39 @@ where
             None => StdRng::from_rng(&mut rand::rng()),
         };
         NGBoost {
-            n_estimators,
-            learning_rate,
-            natural_gradient,
-            minibatch_frac,
-            col_sample,
-            verbose,
-            verbose_eval,
-            tol,
-            early_stopping_rounds,
-            validation_fraction,
-            adaptive_learning_rate: false,
-            lr_schedule,
-            tikhonov_reg,
-            line_search_method,
-            base_learner,
+            // 24-byte aligned
             base_models: Vec::new(),
             scalings: Vec::new(),
-            init_params: None,
+            effective_learning_rates: Vec::new(),
             col_idxs: Vec::new(),
+            evals_result: EvalsResult::default(),
+            // 16-byte aligned
             train_loss_monitor: None,
             val_loss_monitor: None,
+            // 8-byte aligned
+            learning_rate,
+            minibatch_frac,
+            col_sample,
+            verbose_eval,
+            tol,
+            validation_fraction,
+            tikhonov_reg,
+            lr_schedule,
+            line_search_method,
+            init_params: None,
+            random_state,
             best_val_loss_itr: None,
             n_features: None,
-            evals_result: EvalsResult::default(),
             rng,
-            random_state,
+            base_learner,
+            // 4-byte aligned
+            n_estimators,
+            early_stopping_rounds,
+            // 1-byte aligned
+            natural_gradient,
+            verbose,
+            adaptive_learning_rate: false,
+            // 0-byte
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -622,6 +688,7 @@ where
         if reset_state {
             self.base_models.clear();
             self.scalings.clear();
+            self.effective_learning_rates.clear();
             self.col_idxs.clear();
             self.best_val_loss_itr = None;
             self.evals_result = EvalsResult::default();
@@ -629,7 +696,9 @@ where
         self.n_features = Some(x.ncols());
 
         // Handle automatic validation split if early stopping is enabled
-        let (x_train, y_train, x_val_auto, y_val_auto) = if self.early_stopping_rounds.is_some()
+        let (x_train, y_train, x_val_auto, y_val_auto, train_weight_auto, val_weight_auto) = if self
+            .early_stopping_rounds
+            .is_some()
             && x_val.is_none()
             && y_val.is_none()
             && self.validation_fraction > 0.0
@@ -656,16 +725,40 @@ where
             let x_val_auto = Some(x.select(ndarray::Axis(0), &val_indices));
             let y_val_auto = Some(y.select(ndarray::Axis(0), &val_indices));
 
-            (x_train, y_train, x_val_auto, y_val_auto)
+            // Split sample weights along with the data (matches Python's train_test_split)
+            let train_weight_auto =
+                sample_weight.map(|w| w.select(ndarray::Axis(0), &train_indices));
+            let val_weight_auto = sample_weight.map(|w| w.select(ndarray::Axis(0), &val_indices));
+
+            (
+                Cow::Owned(x_train),
+                Cow::Owned(y_train),
+                x_val_auto,
+                y_val_auto,
+                train_weight_auto,
+                val_weight_auto,
+            )
         } else {
-            (x.to_owned(), y.to_owned(), x_val.cloned(), y_val.cloned())
+            (
+                Cow::Borrowed(x),
+                Cow::Borrowed(y),
+                x_val.cloned(),
+                y_val.cloned(),
+                None,
+                None,
+            )
         };
 
-        // Use the automatically split or provided validation data
-        let x_train = x_train;
-        let y_train = y_train;
+        // Use the automatically split or provided data
+        // For sample weights: if we auto-split, use the split weights;
+        // otherwise use the original references passed in.
+        let x_train = &*x_train;
+        let y_train = &*y_train;
         let x_val = x_val_auto.as_ref().or(x_val);
         let y_val = y_val_auto.as_ref().or(y_val);
+        let sample_weight: Option<&Array1<f64>> = train_weight_auto.as_ref().or(sample_weight);
+        let val_sample_weight: Option<&Array1<f64>> =
+            val_weight_auto.as_ref().or(val_sample_weight);
 
         // Validate validation data if provided
         if let (Some(xv), Some(yv)) = (x_val, y_val) {
@@ -677,91 +770,105 @@ where
             }
         }
 
+        // Match Python: always re-fit init_params from the current training data.
+        // Python's partial_fit calls fit_init_params_to_marginal(Y) every time.
         self.init_params = Some(D::fit(&y_train));
         let n_params = self.init_params.as_ref().unwrap().len();
-        let mut params = Array2::from_elem((x_train.nrows(), n_params), 0.0);
 
-        // Safe unwrap with proper error handling
-        let init_params = self.init_params.as_ref().unwrap();
-        params
-            .outer_iter_mut()
-            .for_each(|mut row| row.assign(init_params));
+        // For partial_fit, replay all existing base models to reconstruct current params
+        // (matches Python's pred_param(X) call at start of partial_fit)
+        let mut params = if !reset_state && !self.base_models.is_empty() {
+            self.get_params_at(&x_train, None)
+        } else {
+            let mut p = Array2::from_elem((x_train.nrows(), n_params), 0.0);
+            let init_params = self.init_params.as_ref().unwrap();
+            p.outer_iter_mut()
+                .for_each(|mut row| row.assign(init_params));
+            p
+        };
 
         // Prepare validation params if validation data is provided
         let mut val_params = if let (Some(xv), Some(_yv)) = (x_val, y_val) {
-            let mut v_params = Array2::from_elem((xv.nrows(), n_params), 0.0);
-            v_params
-                .outer_iter_mut()
-                .for_each(|mut row| row.assign(init_params));
-            Some(v_params)
+            if !reset_state && !self.base_models.is_empty() {
+                Some(self.get_params_at(xv, None))
+            } else {
+                let mut v_params = Array2::from_elem((xv.nrows(), n_params), 0.0);
+                let init_params = self.init_params.as_ref().unwrap();
+                v_params
+                    .outer_iter_mut()
+                    .for_each(|mut row| row.assign(init_params));
+                Some(v_params)
+            }
         } else {
             None
         };
 
         let mut best_val_loss = f64::INFINITY;
         let mut best_iter = 0;
-        let mut no_improvement_count = 0;
+        let mut val_loss_list: Vec<f64> = Vec::new();
 
         for itr in 0..self.n_estimators {
-            let dist = D::from_params(&params);
+            // Sample data for this iteration
+            let (col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
+                self.sample(&x_train, &y_train, &params, sample_weight);
+            self.col_idxs.push(col_idxs);
 
-            // Compute gradients with optional Tikhonov regularization
-            let grads = if self.natural_gradient && self.tikhonov_reg > 0.0 {
-                // Use regularized natural gradient for better numerical stability
-                let standard_grad = Scorable::d_score(&dist, &y_train);
-                let metric = Scorable::metric(&dist);
-                crate::scores::natural_gradient_regularized(
-                    &standard_grad,
-                    &metric,
-                    self.tikhonov_reg,
-                )
+            // Dereference Cow to get &Array references (zero-cost for Borrowed)
+            let x_sampled_ref = &*x_sampled;
+            let y_sampled_ref = &*y_sampled;
+            let params_sampled_ref = &*params_sampled;
+            let weight_ref: Option<&Array1<f64>> = weight_sampled.as_ref().map(|w| w.as_ref());
+
+            // Build distribution from minibatch params (matches Python: D = Manifold(P_batch.T))
+            let batch_dist = D::from_params(params_sampled_ref);
+
+            // Compute training loss on minibatch BEFORE update (matches Python)
+            let train_loss = if let Some(monitor) = &self.train_loss_monitor {
+                monitor(&batch_dist, y_sampled_ref, weight_ref)
             } else {
-                Scorable::grad(&dist, &y_train, self.natural_gradient)
+                Scorable::total_score(&batch_dist, y_sampled_ref, weight_ref)
+            };
+            self.evals_result.train.push(train_loss);
+
+            // Compute gradients on minibatch (matches Python: D.grad(Y_batch, ...))
+            let grads = if self.natural_gradient && self.tikhonov_reg > 0.0 {
+                // Fast path: diagonal metric uses fused d_score + diagonal_metric
+                if Scorable::<S>::is_diagonal_metric(&batch_dist) {
+                    Scorable::<S>::diagonal_natural_grad(
+                        &batch_dist,
+                        y_sampled_ref,
+                        self.tikhonov_reg,
+                    )
+                } else {
+                    let standard_grad = Scorable::d_score(&batch_dist, y_sampled_ref);
+                    let metric = Scorable::metric(&batch_dist);
+                    crate::scores::natural_gradient_regularized(
+                        &standard_grad,
+                        &metric,
+                        self.tikhonov_reg,
+                    )
+                }
+            } else {
+                Scorable::grad(&batch_dist, y_sampled_ref, self.natural_gradient)
             };
 
-            // Sample data for this iteration
-            let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
-                self.sample(&x_train, &y_train, &params, sample_weight);
-            self.col_idxs.push(col_idxs.clone());
+            // Fit base learners for each parameter in parallel using rayon
+            let grad_cols: Vec<Array1<f64>> =
+                (0..n_params).map(|j| grads.column(j).to_owned()).collect();
 
-            let grads_sampled = grads.select(ndarray::Axis(0), &row_idxs);
-
-            // Fit base learners for each parameter - parallelized when feature enabled
-            #[cfg(feature = "parallel")]
-            let fit_results: Vec<
-                Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>,
-            > = {
-                // Pre-clone learners to avoid borrow issues in parallel iterator
+            let fit_results: Vec<Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>> = {
                 let learners: Vec<B> = (0..n_params).map(|_| self.base_learner.clone()).collect();
                 learners
                     .into_par_iter()
-                    .enumerate()
-                    .map(|(j, learner)| {
-                        let grad_j = grads_sampled.column(j).to_owned();
-                        let fitted = learner.fit_with_weights(
-                            &x_sampled,
-                            &grad_j,
-                            weight_sampled.as_ref(),
-                        )?;
-                        let preds = fitted.predict(&x_sampled);
+                    .zip(grad_cols.into_par_iter())
+                    .map(|(learner, grad_j)| {
+                        let fitted =
+                            learner.fit_with_weights(x_sampled_ref, &grad_j, weight_ref)?;
+                        let preds = fitted.predict(x_sampled_ref);
                         Ok((fitted, preds))
                     })
                     .collect()
             };
-
-            #[cfg(not(feature = "parallel"))]
-            let fit_results: Vec<
-                Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>,
-            > = (0..n_params)
-                .map(|j| {
-                    let grad_j = grads_sampled.column(j).to_owned();
-                    let learner = self.base_learner.clone();
-                    let fitted =
-                        learner.fit_with_weights(&x_sampled, &grad_j, weight_sampled.as_ref())?;
-                    let preds = fitted.predict(&x_sampled);
-                    Ok((fitted, preds))
-                })
-                .collect();
 
             // Unpack results, propagating any errors
             let mut fitted_learners: Vec<Box<dyn TrainedBaseLearner>> =
@@ -773,172 +880,178 @@ where
                 predictions_cols.push(preds);
             }
 
-            let predictions = to_2d_array(predictions_cols);
+            let proj_grad = to_2d_array(predictions_cols);
 
+            // Pass precomputed train_loss to avoid redundant from_params + total_score
+            // in line search. Only valid when no custom train_loss_monitor changes the score.
+            let precomputed_score = if self.train_loss_monitor.is_none() {
+                Some(train_loss)
+            } else {
+                None
+            };
             let scale = self.line_search(
-                &predictions,
-                &params_sampled,
-                &y_sampled,
-                weight_sampled.as_ref(),
+                &proj_grad,
+                params_sampled_ref,
+                y_sampled_ref,
+                weight_ref,
+                precomputed_score,
             );
             self.scalings.push(scale);
             self.base_models.push(fitted_learners);
 
-            // Apply learning rate schedule
+            // Apply learning rate schedule and store it for prediction-time replay
             let progress = itr as f64 / self.n_estimators as f64;
             let effective_learning_rate = self.compute_learning_rate(itr, progress);
+            self.effective_learning_rates.push(effective_learning_rate);
 
-            // Update parameters for ALL training samples by re-predicting on full X
-            // This matches Python's behavior: after fitting base learners on minibatch,
-            // we predict on the FULL training set to update all parameters
-            // This is critical for correct convergence with minibatch_frac < 1.0
+            // Update parameters for ALL training samples (matches Python)
+            // Fused predict + scale + subtract avoids intermediate Array2 allocations
+            let col_idxs_ref = self.col_idxs.last().unwrap();
             let fitted_learners = self.base_models.last().unwrap();
-            let full_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == x_train.ncols() {
-                fitted_learners
-                    .iter()
-                    .map(|learner| learner.predict(&x_train))
-                    .collect()
-            } else {
-                let x_subset = x_train.select(ndarray::Axis(1), &col_idxs);
-                fitted_learners
-                    .iter()
-                    .map(|learner| learner.predict(&x_subset))
-                    .collect()
-            };
-            let full_predictions = to_2d_array(full_predictions_cols);
-
-            params -= &(effective_learning_rate * scale * &full_predictions);
+            let factor = effective_learning_rate * scale;
+            Self::predict_and_update_params(
+                fitted_learners,
+                &x_train,
+                col_idxs_ref,
+                &mut params,
+                factor,
+            );
 
             // Update validation parameters if validation data is provided
+            let mut val_loss = 0.0;
             if let (Some(xv), Some(yv), Some(vp)) = (x_val, y_val, val_params.as_mut()) {
-                // Get predictions on validation data from the fitted base learners
-                // Apply column subsampling to match training
-                let fitted_learners = self.base_models.last().unwrap();
-                let val_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == xv.ncols() {
-                    fitted_learners
-                        .iter()
-                        .map(|learner| learner.predict(xv))
-                        .collect()
-                } else {
-                    let xv_subset = xv.select(ndarray::Axis(1), &col_idxs);
-                    fitted_learners
-                        .iter()
-                        .map(|learner| learner.predict(&xv_subset))
-                        .collect()
-                };
-                let val_predictions = to_2d_array(val_predictions_cols);
-                *vp -= &(effective_learning_rate * scale * &val_predictions);
+                Self::predict_and_update_params(fitted_learners, xv, col_idxs_ref, vp, factor);
 
-                // Calculate validation loss using monitor or default
                 let val_dist = D::from_params(vp);
-                let val_loss = if let Some(monitor) = &self.val_loss_monitor {
+                val_loss = if let Some(monitor) = &self.val_loss_monitor {
                     monitor(&val_dist, yv, val_sample_weight)
                 } else {
                     Scorable::total_score(&val_dist, yv, val_sample_weight)
                 };
 
-                // Track validation loss in evals_result
                 self.evals_result.val.push(val_loss);
+                val_loss_list.push(val_loss);
 
-                // Early stopping logic
                 if val_loss < best_val_loss {
                     best_val_loss = val_loss;
                     best_iter = itr;
-                    no_improvement_count = 0;
                     self.best_val_loss_itr = Some(itr as usize);
-                } else {
-                    no_improvement_count += 1;
                 }
 
-                // Check if we should stop early
+                // Early stopping: match Python's sliding-window logic
+                // Stop if len(val_loss_list) > early_stopping_rounds AND
+                // best_val_loss < min(val_loss_list[-early_stopping_rounds:])
                 if let Some(rounds) = self.early_stopping_rounds {
-                    if no_improvement_count >= rounds {
-                        if self.verbose {
-                            println!("== Early stopping achieved.");
-                            println!(
-                                "== Best iteration / VAL{} (val_loss={:.4})",
-                                best_iter, best_val_loss
-                            );
+                    let rounds = rounds as usize;
+                    if val_loss_list.len() > rounds {
+                        let recent_min = val_loss_list[val_loss_list.len() - rounds..]
+                            .iter()
+                            .cloned()
+                            .fold(f64::INFINITY, f64::min);
+                        if best_val_loss < recent_min {
+                            if self.verbose {
+                                println!("== Early stopping achieved.");
+                                println!(
+                                    "== Best iteration / VAL{} (val_loss={:.4})",
+                                    best_iter, best_val_loss
+                                );
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
+            }
 
-                // Calculate and track training loss
-                let dist = D::from_params(&params);
-                let train_loss = if let Some(monitor) = &self.train_loss_monitor {
-                    monitor(&dist, &y_train, sample_weight)
-                } else {
-                    Scorable::total_score(&dist, &y_train, sample_weight)
-                };
-                self.evals_result.train.push(train_loss);
-
-                // Verbose logging with validation
-                if self.should_print_verbose(itr) {
+            // Verbose logging
+            if self.should_print_verbose(itr) {
+                let grad_norm: f64 = grads
+                    .rows()
+                    .into_iter()
+                    .map(|row| {
+                        let norm_sq: f64 = row.iter().map(|&x| x * x).sum();
+                        norm_sq.sqrt()
+                    })
+                    .sum::<f64>()
+                    / grads.nrows() as f64
+                    * scale;
+                if x_val.is_some() {
                     println!(
-                        "[iter {}] train_loss={:.4} val_loss={:.4}",
-                        itr, train_loss, val_loss
+                        "[iter {}] loss={:.4} val_loss={:.4} scale={:.4} norm={:.4}",
+                        itr, train_loss, val_loss, scale, grad_norm
+                    );
+                } else {
+                    println!(
+                        "[iter {}] loss={:.4} scale={:.4} norm={:.4}",
+                        itr, train_loss, scale, grad_norm
                     );
                 }
-            } else {
-                // Calculate and track training loss
-                let dist = D::from_params(&params);
-                let train_loss = if let Some(monitor) = &self.train_loss_monitor {
-                    monitor(&dist, &y_train, sample_weight)
-                } else {
-                    Scorable::total_score(&dist, &y_train, sample_weight)
-                };
-                self.evals_result.train.push(train_loss);
+            }
 
-                // Verbose logging without validation
-                if self.should_print_verbose(itr) {
-                    // Calculate gradient norm for debugging
-                    let grad_norm: f64 =
-                        grads.iter().map(|x| x * x).sum::<f64>().sqrt() / grads.len() as f64;
-
-                    println!(
-                        "[iter {}] loss={:.4} grad_norm={:.4} scale={:.4}",
-                        itr, train_loss, grad_norm, scale
-                    );
+            // Gradient-norm convergence check (matches Python)
+            // Uses proj_grad (base learner predictions on minibatch), not raw grads
+            let proj_grad_norm: f64 = proj_grad
+                .rows()
+                .into_iter()
+                .map(|row| {
+                    let norm_sq: f64 = row.iter().map(|&x| x * x).sum();
+                    norm_sq.sqrt()
+                })
+                .sum::<f64>()
+                / proj_grad.nrows() as f64;
+            if proj_grad_norm < self.tol {
+                if self.verbose {
+                    println!("== Quitting at iteration / GRAD {}", itr);
                 }
+                break;
             }
         }
 
         Ok(())
     }
 
-    fn sample(
+    fn sample<'a>(
         &mut self,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-        params: &Array2<f64>,
-        sample_weight: Option<&Array1<f64>>,
+        x: &'a Array2<f64>,
+        y: &'a Array1<f64>,
+        params: &'a Array2<f64>,
+        sample_weight: Option<&'a Array1<f64>>,
     ) -> (
         Vec<usize>,
-        Vec<usize>,
-        Array2<f64>,
-        Array1<f64>,
-        Array2<f64>,
-        Option<Array1<f64>>,
+        Cow<'a, Array2<f64>>,
+        Cow<'a, Array1<f64>>,
+        Cow<'a, Array2<f64>>,
+        Option<Cow<'a, Array1<f64>>>,
     ) {
         let n_samples = x.nrows();
         let n_features = x.ncols();
 
+        let no_row_sampling = self.minibatch_frac >= 1.0;
+        let no_col_sampling = self.col_sample >= 1.0;
+
+        // Fast path: no sampling at all — borrow original data, zero copies
+        if no_row_sampling && no_col_sampling {
+            let col_idxs: Vec<usize> = (0..n_features).collect();
+            return (
+                col_idxs,
+                Cow::Borrowed(x),
+                Cow::Borrowed(y),
+                Cow::Borrowed(params),
+                sample_weight.map(Cow::Borrowed),
+            );
+        }
+
         // Sample rows (minibatch)
-        let sample_size = if self.minibatch_frac >= 1.0 {
+        let sample_size = if no_row_sampling {
             n_samples
         } else {
             ((n_samples as f64) * self.minibatch_frac) as usize
         };
 
         // Uniform random sampling without replacement (matches Python's np.random.choice behavior)
-        // Note: Python does NOT do weighted sampling for minibatch selection,
-        // it only passes the weights to the base learner's fit method
         let row_idxs: Vec<usize> = if sample_size == n_samples {
             (0..n_samples).collect()
         } else {
             let mut indices: Vec<usize> = (0..n_samples).collect();
-            // Use Fisher-Yates shuffle for better randomness (matches numpy's algorithm)
             for i in (1..indices.len()).rev() {
                 let j = self.rng.random_range(0..=i);
                 indices.swap(i, j);
@@ -946,11 +1059,11 @@ where
             indices.into_iter().take(sample_size).collect()
         };
 
-        // Sample columns
-        let col_size = if self.col_sample >= 1.0 {
+        // Sample columns (matches Python: max(1, int(col_sample * n_features)))
+        let col_size = if no_col_sampling {
             n_features
         } else if self.col_sample > 0.0 {
-            ((n_features as f64) * self.col_sample) as usize
+            (((n_features as f64) * self.col_sample) as usize).max(1)
         } else {
             0
         };
@@ -963,14 +1076,10 @@ where
             indices.into_iter().take(col_size).collect()
         };
 
-        // Create sampled data with optimized single-pass selection
-        // Instead of two sequential selects (which create an intermediate array),
-        // we directly construct the result array
+        // Create sampled data
         let x_sampled = if col_size == n_features {
-            // No column sampling - just select rows (single allocation)
             x.select(ndarray::Axis(0), &row_idxs)
         } else {
-            // Both row and column sampling - single allocation with direct indexing
             let mut result = Array2::zeros((row_idxs.len(), col_idxs.len()));
             for (new_row, &old_row) in row_idxs.iter().enumerate() {
                 for (new_col, &old_col) in col_idxs.iter().enumerate() {
@@ -982,18 +1091,92 @@ where
         let y_sampled = y.select(ndarray::Axis(0), &row_idxs);
         let params_sampled = params.select(ndarray::Axis(0), &row_idxs);
 
-        // Handle sample weights
         let sample_weights_sampled =
-            sample_weight.map(|weights| weights.select(ndarray::Axis(0), &row_idxs));
+            sample_weight.map(|weights| Cow::Owned(weights.select(ndarray::Axis(0), &row_idxs)));
 
         (
-            row_idxs,
             col_idxs,
-            x_sampled,
-            y_sampled,
-            params_sampled,
+            Cow::Owned(x_sampled),
+            Cow::Owned(y_sampled),
+            Cow::Owned(params_sampled),
             sample_weights_sampled,
         )
+    }
+
+    /// Compute predictions from a set of learners on input data.
+    /// Handles column subsampling if col_idxs doesn't match all columns.
+    /// Returns an Array2 with shape (n_samples, n_learners).
+    #[inline]
+    fn predict_from_learners(
+        learners: &[Box<dyn TrainedBaseLearner>],
+        x: &Array2<f64>,
+        col_idxs: &[usize],
+    ) -> Array2<f64> {
+        if learners.is_empty() {
+            return Array2::zeros((x.nrows(), 0));
+        }
+
+        let n_samples = x.nrows();
+        let n_params = learners.len();
+
+        // Pre-allocate the result array
+        let mut result = Array2::zeros((n_samples, n_params));
+
+        if col_idxs.len() == x.ncols() {
+            // No column subsampling - predict directly
+            for (j, learner) in learners.iter().enumerate() {
+                let preds = learner.predict(x);
+                result.column_mut(j).assign(&preds);
+            }
+        } else {
+            // Column subsampling - create subset once and reuse
+            let x_subset = x.select(ndarray::Axis(1), col_idxs);
+            for (j, learner) in learners.iter().enumerate() {
+                let preds = learner.predict(&x_subset);
+                result.column_mut(j).assign(&preds);
+            }
+        }
+
+        result
+    }
+
+    /// Fused predict + scale + subtract: params -= factor * predictions.
+    /// Avoids allocating the full predictions Array2 and intermediate scaled copies.
+    /// Instead, predicts one parameter at a time and updates params in-place.
+    #[inline]
+    fn predict_and_update_params(
+        learners: &[Box<dyn TrainedBaseLearner>],
+        x: &Array2<f64>,
+        col_idxs: &[usize],
+        params: &mut Array2<f64>,
+        factor: f64,
+    ) {
+        if learners.is_empty() {
+            return;
+        }
+
+        if col_idxs.len() == x.ncols() {
+            for (j, learner) in learners.iter().enumerate() {
+                let preds = learner.predict(x);
+                let mut col = params.column_mut(j);
+                ndarray::Zip::from(&mut col)
+                    .and(&preds)
+                    .for_each(|p, &pred| {
+                        *p -= factor * pred;
+                    });
+            }
+        } else {
+            let x_subset = x.select(ndarray::Axis(1), col_idxs);
+            for (j, learner) in learners.iter().enumerate() {
+                let preds = learner.predict(&x_subset);
+                let mut col = params.column_mut(j);
+                ndarray::Zip::from(&mut col)
+                    .and(&preds)
+                    .for_each(|p, &pred| {
+                        *p -= factor * pred;
+                    });
+            }
+        }
     }
 
     fn get_params(&self, x: &Array2<f64>) -> Array2<f64> {
@@ -1015,9 +1198,12 @@ where
             .outer_iter_mut()
             .for_each(|mut row| row.assign(init_params));
 
-        let n_iters = max_iter
-            .unwrap_or(self.base_models.len())
-            .min(self.base_models.len());
+        // Match Python: `if max_iter and i == max_iter` — in Python, max_iter=0
+        // is falsy, so it iterates ALL models. Only a positive max_iter limits.
+        let n_iters = match max_iter {
+            Some(m) if m > 0 => m.min(self.base_models.len()),
+            _ => self.base_models.len(),
+        };
 
         for (i, (learners, col_idx)) in self
             .base_models
@@ -1027,22 +1213,13 @@ where
             .take(n_iters)
         {
             let scale = self.scalings[i];
-
-            // Apply column subsampling during prediction to match training
-            // This is critical when col_sample < 1.0
-            let predictions_cols: Vec<Array1<f64>> = if col_idx.len() == x.ncols() {
-                learners.iter().map(|learner| learner.predict(x)).collect()
+            let lr = if i < self.effective_learning_rates.len() {
+                self.effective_learning_rates[i]
             } else {
-                let x_subset = x.select(ndarray::Axis(1), col_idx);
-                learners
-                    .iter()
-                    .map(|learner| learner.predict(&x_subset))
-                    .collect()
+                self.learning_rate
             };
-
-            let predictions = to_2d_array(predictions_cols);
-
-            params -= &(self.learning_rate * scale * &predictions);
+            let factor = lr * scale;
+            Self::predict_and_update_params(learners, x, col_idx, &mut params, factor);
         }
         params
     }
@@ -1077,17 +1254,50 @@ where
         self.pred_dist_at(x, max_iter).predict()
     }
 
-    /// Returns an iterator over staged predictions (predictions at each boosting iteration)
-    pub fn staged_predict<'a>(
-        &'a self,
-        x: &'a Array2<f64>,
-    ) -> impl Iterator<Item = Array1<f64>> + 'a {
-        (1..=self.base_models.len()).map(move |i| self.predict_at(x, i))
+    /// Returns staged predictions (predictions at each boosting iteration).
+    /// Uses incremental parameter accumulation — O(n_estimators) total work
+    /// instead of O(n_estimators²).
+    pub fn staged_predict(&self, x: &Array2<f64>) -> Vec<Array1<f64>> {
+        self.staged_pred_dist(x)
+            .into_iter()
+            .map(|d| d.predict())
+            .collect()
     }
 
-    /// Returns an iterator over staged distribution predictions
-    pub fn staged_pred_dist<'a>(&'a self, x: &'a Array2<f64>) -> impl Iterator<Item = D> + 'a {
-        (1..=self.base_models.len()).map(move |i| self.pred_dist_at(x, i))
+    /// Returns staged distribution predictions.
+    /// Uses incremental parameter accumulation — O(n_estimators) total work
+    /// instead of O(n_estimators²).
+    pub fn staged_pred_dist(&self, x: &Array2<f64>) -> Vec<D> {
+        let init_params = match self.init_params.as_ref() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let n_params = init_params.len();
+        let mut params = Array2::from_elem((x.nrows(), n_params), 0.0);
+        params
+            .outer_iter_mut()
+            .for_each(|mut row| row.assign(init_params));
+
+        let mut results = Vec::with_capacity(self.base_models.len());
+
+        for (i, (learners, col_idx)) in self
+            .base_models
+            .iter()
+            .zip(self.col_idxs.iter())
+            .enumerate()
+        {
+            let scale = self.scalings[i];
+            let lr = if i < self.effective_learning_rates.len() {
+                self.effective_learning_rates[i]
+            } else {
+                self.learning_rate
+            };
+            let factor = lr * scale;
+            Self::predict_and_update_params(learners, x, col_idx, &mut params, factor);
+            results.push(D::from_params(&params));
+        }
+
+        results
     }
 
     /// Compute the average score (loss) on the given data
@@ -1158,17 +1368,66 @@ where
         }
 
         let n_params = self.init_params.as_ref()?.len();
-        let mut importances = Array2::zeros((n_params, n_features));
+        let n_iters = self.base_models.len();
 
-        // Aggregate feature usage across all iterations, weighted by scaling factor
+        // Collect per-param, per-iteration importance vectors mapped to full feature space
+        // all_params_importances[param][iter] = Array1<f64> of length n_features
+        let mut all_params_importances: Vec<Vec<Array1<f64>>> =
+            (0..n_params).map(|_| Vec::with_capacity(n_iters)).collect();
+
         for (iter_idx, learners) in self.base_models.iter().enumerate() {
-            let scale = self.scalings[iter_idx].abs();
+            let col_idxs = if iter_idx < self.col_idxs.len() {
+                &self.col_idxs[iter_idx]
+            } else {
+                // No column subsampling info — assume all columns
+                &vec![]
+            };
 
             for (param_idx, learner) in learners.iter().enumerate() {
-                if let Some(feature_idx) = learner.split_feature() {
-                    if feature_idx < n_features {
-                        importances[[param_idx, feature_idx]] += scale;
+                let mut full_importance = Array1::zeros(n_features);
+
+                if let Some(tree_importance) = learner.feature_importances() {
+                    // Map subsampled feature importances back to full feature space
+                    if col_idxs.is_empty() || col_idxs.len() == n_features {
+                        // No column subsampling — use directly
+                        let len = tree_importance.len().min(n_features);
+                        for j in 0..len {
+                            full_importance[j] = tree_importance[j];
+                        }
+                    } else {
+                        // Column subsampling — map back using col_idxs
+                        for (local_idx, &global_idx) in col_idxs.iter().enumerate() {
+                            if local_idx < tree_importance.len() && global_idx < n_features {
+                                full_importance[global_idx] = tree_importance[local_idx];
+                            }
+                        }
                     }
+                }
+
+                if param_idx < n_params {
+                    all_params_importances[param_idx].push(full_importance);
+                }
+            }
+        }
+
+        // Weighted average of importance by tree scaling factors (matches Python's np.average)
+        let mut importances = Array2::zeros((n_params, n_features));
+        let weight_sum: f64 = self.scalings.iter().sum();
+
+        for param_idx in 0..n_params {
+            if weight_sum > 0.0 {
+                for (iter_idx, imp) in all_params_importances[param_idx].iter().enumerate() {
+                    let w = if iter_idx < self.scalings.len() {
+                        self.scalings[iter_idx]
+                    } else {
+                        0.0
+                    };
+                    for j in 0..n_features {
+                        importances[[param_idx, j]] += imp[j] * w;
+                    }
+                }
+                for j in 0..n_features {
+                    importances[[param_idx, j]] /= weight_sum;
                 }
             }
         }
@@ -1234,41 +1493,87 @@ where
         Some(aggregated)
     }
 
+    /// Compute mean of per-row L2 norms of (scale * resids), matching Python's
+    /// `np.mean(np.linalg.norm(scaled_resids, axis=1))`.
+    fn mean_row_norms(&self, resids: &Array2<f64>, scale: f64) -> f64 {
+        let n_rows = resids.nrows();
+        if n_rows == 0 {
+            return 0.0;
+        }
+        let abs_scale = scale.abs();
+        let sum_norms: f64 = resids
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let row_norm_sq: f64 = row.iter().map(|&x| x * x).sum();
+                row_norm_sq.sqrt()
+            })
+            .sum();
+        abs_scale * sum_norms / n_rows as f64
+    }
+
     fn line_search(
         &self,
         resids: &Array2<f64>,
         start: &Array2<f64>,
         y: &Array1<f64>,
         sample_weight: Option<&Array1<f64>>,
+        initial_score: Option<f64>,
     ) -> f64 {
         match self.line_search_method {
-            LineSearchMethod::Binary => self.line_search_binary(resids, start, y, sample_weight),
-            LineSearchMethod::GoldenSection { max_iters } => {
-                self.line_search_golden_section(resids, start, y, sample_weight, max_iters)
+            LineSearchMethod::Binary => {
+                self.line_search_binary(resids, start, y, sample_weight, initial_score)
             }
+            LineSearchMethod::GoldenSection { max_iters } => self.line_search_golden_section(
+                resids,
+                start,
+                y,
+                sample_weight,
+                max_iters,
+                initial_score,
+            ),
         }
     }
 
     /// Binary line search (original NGBoost method).
+    /// Optimized to reuse a single buffer for next_params computation and cache distributions.
     fn line_search_binary(
         &self,
         resids: &Array2<f64>,
         start: &Array2<f64>,
         y: &Array1<f64>,
         sample_weight: Option<&Array1<f64>>,
+        precomputed_initial_score: Option<f64>,
     ) -> f64 {
         let mut scale = 1.0;
-        let initial_score = Scorable::total_score(&D::from_params(start), y, sample_weight);
+        let initial_score = precomputed_initial_score
+            .unwrap_or_else(|| Scorable::total_score(&D::from_params(start), y, sample_weight));
 
-        // Scale up phase: try to find a larger step that still reduces loss
+        // Pre-allocate buffer for next_params - reused across all iterations
+        let mut next_params = Array2::zeros(start.raw_dim());
+
+        // Helper to compute next_params in-place: next_params = start - scale * resids
+        // Uses efficient Zip operation to avoid intermediate allocations
+        let compute_next_params = |next_params: &mut Array2<f64>, scale: f64| {
+            ndarray::Zip::from(next_params)
+                .and(start)
+                .and(resids)
+                .for_each(|np, &s, &r| {
+                    *np = s - scale * r;
+                });
+        };
+
+        // Helper to compute score - distribution is constructed only once per scale value
+        let compute_score_at_scale = |next_params: &mut Array2<f64>, scale: f64| -> f64 {
+            compute_next_params(next_params, scale);
+            Scorable::total_score(&D::from_params(next_params), y, sample_weight)
+        };
+
+        // Scale up phase: test at current scale, then double if good.
+        // Matches Python: exits with scale = first value that failed.
         loop {
-            if scale > 256.0 {
-                break;
-            }
-            let scaled_resids = resids * (scale * 2.0);
-            let next_params = start - &scaled_resids;
-            let score = Scorable::total_score(&D::from_params(&next_params), y, sample_weight);
-            if score >= initial_score || !score.is_finite() {
+            let score = compute_score_at_scale(&mut next_params, scale);
+            if !score.is_finite() || score > initial_score || scale > 256.0 {
                 break;
             }
             scale *= 2.0;
@@ -1276,27 +1581,16 @@ where
 
         // Scale down phase: find a step that actually reduces loss
         loop {
-            let scaled_resids = resids * scale;
-            let norm: f64 = scaled_resids
-                .rows()
-                .into_iter()
-                .map(|row| row.iter().map(|x| x * x).sum::<f64>().sqrt())
-                .sum::<f64>()
-                / scaled_resids.nrows() as f64;
+            let norm = self.mean_row_norms(resids, scale);
             if norm < self.tol {
                 break;
             }
 
-            let next_params = start - &scaled_resids;
-            let score = Scorable::total_score(&D::from_params(&next_params), y, sample_weight);
-            if score < initial_score && score.is_finite() {
+            let score = compute_score_at_scale(&mut next_params, scale);
+            if score.is_finite() && score < initial_score {
                 break;
             }
             scale *= 0.5;
-
-            if scale < 1e-10 {
-                break;
-            }
         }
 
         scale
@@ -1304,6 +1598,8 @@ where
 
     /// Golden section line search for more accurate step size.
     /// Uses the golden ratio to efficiently narrow down the optimal step size.
+    /// Optimized to reuse a single buffer for next_params computation and minimize
+    /// distribution constructions by caching scores at interior points.
     fn line_search_golden_section(
         &self,
         resids: &Array2<f64>,
@@ -1311,15 +1607,23 @@ where
         y: &Array1<f64>,
         sample_weight: Option<&Array1<f64>>,
         max_iters: usize,
+        precomputed_initial_score: Option<f64>,
     ) -> f64 {
-        // Helper to compute score at a given scale
-        let compute_score = |scale: f64| -> f64 {
-            let scaled_resids = resids * scale;
-            let next_params = start - &scaled_resids;
+        // Pre-allocate buffer for next_params - reused across all iterations
+        let mut next_params = Array2::zeros(start.raw_dim());
+
+        // Helper to compute score at a given scale, reusing the buffer
+        let mut compute_score = |scale: f64| -> f64 {
+            ndarray::Zip::from(&mut next_params)
+                .and(start)
+                .and(resids)
+                .for_each(|np, &s, &r| {
+                    *np = s - scale * r;
+                });
             Scorable::total_score(&D::from_params(&next_params), y, sample_weight)
         };
 
-        let initial_score = compute_score(0.0);
+        let initial_score = precomputed_initial_score.unwrap_or_else(|| compute_score(0.0));
 
         // First, find a reasonable upper bound by scaling up
         let mut upper = 1.0;
@@ -1335,7 +1639,6 @@ where
         let mut a = 0.0;
         let mut b = upper;
         let inv_phi = 1.0 / GOLDEN_RATIO;
-        let _inv_phi2 = 1.0 / (GOLDEN_RATIO * GOLDEN_RATIO); // Available for Brent's method extension
 
         // Initial interior points
         let mut c = b - (b - a) * inv_phi;
@@ -1405,6 +1708,7 @@ where
             validation_fraction: self.validation_fraction,
             init_params: self.init_params.as_ref().map(|p| p.to_vec()),
             scalings: self.scalings.clone(),
+            effective_learning_rates: self.effective_learning_rates.clone(),
             col_idxs: self.col_idxs.clone(),
             best_val_loss_itr: self.best_val_loss_itr,
             base_models: serialized_base_models,
@@ -1447,6 +1751,7 @@ where
             model.init_params = Some(Array1::from(init_params));
         }
         model.scalings = serialized.scalings;
+        model.effective_learning_rates = serialized.effective_learning_rates;
         model.col_idxs = serialized.col_idxs;
         model.best_val_loss_itr = serialized.best_val_loss_itr;
 
@@ -1483,6 +1788,9 @@ pub struct SerializedNGBoost {
     pub validation_fraction: f64,
     pub init_params: Option<Vec<f64>>,
     pub scalings: Vec<f64>,
+    /// Effective learning rates per iteration (for LR schedule replay)
+    #[serde(default)]
+    pub effective_learning_rates: Vec<f64>,
     pub col_idxs: Vec<Vec<usize>>,
     pub best_val_loss_itr: Option<usize>,
     /// Serialized base models - each inner Vec contains learners for each parameter
@@ -1510,11 +1818,12 @@ fn to_2d_array(cols: Vec<Array1<f64>>) -> Array2<f64> {
     }
     let nrows = cols[0].len();
     let ncols = cols.len();
-    let mut arr = Array2::zeros((nrows, ncols));
+    // Build directly in row-major order — avoids the column-major → row-major copy
+    let mut result = Array2::zeros((nrows, ncols));
     for (j, col) in cols.iter().enumerate() {
-        arr.column_mut(j).assign(col);
+        result.column_mut(j).assign(col);
     }
-    arr
+    result
 }
 
 // High-level API
@@ -1580,10 +1889,7 @@ impl NGBRegressor {
     }
 
     /// Returns an iterator over staged predictions
-    pub fn staged_predict<'a>(
-        &'a self,
-        x: &'a Array2<f64>,
-    ) -> impl Iterator<Item = Array1<f64>> + 'a {
+    pub fn staged_predict(&self, x: &Array2<f64>) -> Vec<Array1<f64>> {
         self.model.staged_predict(x)
     }
 
@@ -1596,8 +1902,8 @@ impl NGBRegressor {
         self.model.pred_dist_at(x, max_iter)
     }
 
-    /// Returns an iterator over staged distribution predictions
-    pub fn staged_pred_dist<'a>(&'a self, x: &'a Array2<f64>) -> impl Iterator<Item = Normal> + 'a {
+    /// Returns staged distribution predictions
+    pub fn staged_pred_dist(&self, x: &Array2<f64>) -> Vec<Normal> {
         self.model.staged_pred_dist(x)
     }
 
@@ -1975,10 +2281,7 @@ impl<const K: usize> NGBMultiClassifier<K> {
     }
 
     /// Returns an iterator over staged predictions.
-    pub fn staged_predict<'a>(
-        &'a self,
-        x: &'a Array2<f64>,
-    ) -> impl Iterator<Item = Array1<f64>> + 'a {
+    pub fn staged_predict(&self, x: &Array2<f64>) -> Vec<Array1<f64>> {
         self.model.staged_predict(x)
     }
 
@@ -1995,12 +2298,12 @@ impl<const K: usize> NGBMultiClassifier<K> {
         dist.class_probs()
     }
 
-    /// Returns an iterator over staged probability predictions.
-    pub fn staged_predict_proba<'a>(
-        &'a self,
-        x: &'a Array2<f64>,
-    ) -> impl Iterator<Item = Array2<f64>> + 'a {
-        (1..=self.model.base_models.len()).map(move |i| self.predict_proba_at(x, i))
+    /// Returns staged probability predictions.
+    pub fn staged_predict_proba(&self, x: &Array2<f64>) -> Vec<Array2<f64>> {
+        self.staged_pred_dist(x)
+            .into_iter()
+            .map(|d| d.class_probs())
+            .collect()
     }
 
     /// Get the predicted distribution.
@@ -2013,11 +2316,8 @@ impl<const K: usize> NGBMultiClassifier<K> {
         self.model.pred_dist_at(x, max_iter)
     }
 
-    /// Returns an iterator over staged distribution predictions.
-    pub fn staged_pred_dist<'a>(
-        &'a self,
-        x: &'a Array2<f64>,
-    ) -> impl Iterator<Item = Categorical<K>> + 'a {
+    /// Returns staged distribution predictions.
+    pub fn staged_pred_dist(&self, x: &Array2<f64>) -> Vec<Categorical<K>> {
         self.model.staged_pred_dist(x)
     }
 
@@ -2284,11 +2584,8 @@ impl NGBClassifier {
         self.model.predict_at(x, max_iter)
     }
 
-    /// Returns an iterator over staged predictions
-    pub fn staged_predict<'a>(
-        &'a self,
-        x: &'a Array2<f64>,
-    ) -> impl Iterator<Item = Array1<f64>> + 'a {
+    /// Returns staged predictions
+    pub fn staged_predict(&self, x: &Array2<f64>) -> Vec<Array1<f64>> {
         self.model.staged_predict(x)
     }
 
@@ -2303,12 +2600,12 @@ impl NGBClassifier {
         dist.class_probs()
     }
 
-    /// Returns an iterator over staged probability predictions
-    pub fn staged_predict_proba<'a>(
-        &'a self,
-        x: &'a Array2<f64>,
-    ) -> impl Iterator<Item = Array2<f64>> + 'a {
-        (1..=self.model.base_models.len()).map(move |i| self.predict_proba_at(x, i))
+    /// Returns staged probability predictions
+    pub fn staged_predict_proba(&self, x: &Array2<f64>) -> Vec<Array2<f64>> {
+        self.staged_pred_dist(x)
+            .into_iter()
+            .map(|d| d.class_probs())
+            .collect()
     }
 
     pub fn pred_dist(&self, x: &Array2<f64>) -> Bernoulli {
@@ -2320,11 +2617,8 @@ impl NGBClassifier {
         self.model.pred_dist_at(x, max_iter)
     }
 
-    /// Returns an iterator over staged distribution predictions
-    pub fn staged_pred_dist<'a>(
-        &'a self,
-        x: &'a Array2<f64>,
-    ) -> impl Iterator<Item = Bernoulli> + 'a {
+    /// Returns staged distribution predictions
+    pub fn staged_pred_dist(&self, x: &Array2<f64>) -> Vec<Bernoulli> {
         self.model.staged_pred_dist(x)
     }
 

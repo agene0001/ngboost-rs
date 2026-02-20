@@ -7,8 +7,8 @@ extern crate accelerate_src;
 // using synthetic data that mimics real-world datasets.
 
 use ndarray::{Array1, Array2, Axis};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 use ngboost_rs::dist::{ClassificationDistn, Distribution};
 use ngboost_rs::ngboost::{NGBClassifier, NGBRegressor};
 
@@ -279,7 +279,7 @@ fn test_staged_predict_regression() {
     let mut ngb = NGBRegressor::new(50, 0.1);
     ngb.fit(&x_train, &y_train).expect("Fit should succeed");
 
-    let staged_preds: Vec<_> = ngb.staged_predict(&x_test).collect();
+    let staged_preds = ngb.staged_predict(&x_test);
     assert_eq!(staged_preds.len(), 50);
 
     for pred in staged_preds.iter() {
@@ -295,7 +295,7 @@ fn test_staged_predict_classification() {
     let mut ngb = NGBClassifier::new(30, 0.1);
     ngb.fit(&x_train, &y_train).expect("Fit should succeed");
 
-    let staged_proba: Vec<_> = ngb.staged_predict_proba(&x_test).collect();
+    let staged_proba = ngb.staged_predict_proba(&x_test);
     assert_eq!(staged_proba.len(), 30);
 
     for proba in staged_proba.iter() {

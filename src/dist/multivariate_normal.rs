@@ -1,6 +1,6 @@
 use crate::dist::{Distribution, RegressionDistn};
 use crate::scores::{LogScore, Scorable};
-use ndarray::{s, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, s};
 use ndarray_linalg::Inverse;
 
 /// Get the lower triangular indices for a p x p matrix.
@@ -66,8 +66,6 @@ pub struct MultivariateNormal<const P: usize> {
     cov: Option<Array3<f64>>,
     /// Number of observations.
     n_obs: usize,
-    /// The parameters.
-    _params: Array2<f64>,
 }
 
 impl<const P: usize> MultivariateNormal<P> {
@@ -195,7 +193,6 @@ impl<const P: usize> Distribution for MultivariateNormal<P> {
             cov_inv,
             cov: None,
             n_obs,
-            _params: params.clone(),
         }
     }
 
@@ -289,8 +286,30 @@ impl<const P: usize> Distribution for MultivariateNormal<P> {
         self.loc.column(0).to_owned()
     }
 
-    fn params(&self) -> &Array2<f64> {
-        &self._params
+    fn params(&self) -> Array2<f64> {
+        let n_params = Self::N_PARAMS;
+        let mut p = Array2::zeros((self.n_obs, n_params));
+        // First P columns: loc (identity transform)
+        for j in 0..P {
+            for i in 0..self.n_obs {
+                p[[i, j]] = self.loc[[i, j]];
+            }
+        }
+        // Remaining columns: lower triangle of L
+        // Diagonal elements are log-transformed (inverse of exp in build_cholesky_factor)
+        let (rows, cols) = tril_indices(P);
+        for (par_idx, (&row, &col)) in rows.iter().zip(cols.iter()).enumerate() {
+            for i in 0..self.n_obs {
+                let val = self.l[[i, row, col]];
+                if row == col {
+                    // Diagonal: apply log (inverse of exp + 1e-6)
+                    p[[i, P + par_idx]] = (val - 1e-6).ln();
+                } else {
+                    p[[i, P + par_idx]] = val;
+                }
+            }
+        }
+        p
     }
 }
 
@@ -348,11 +367,11 @@ impl<const P: usize> Scorable<LogScore> for MultivariateNormal<P> {
         let (rows, cols) = tril_indices(P);
 
         for i in 0..n {
-            // Gradient of the mean: L^T @ eta (transposed back)
+            // Gradient of the mean: L @ eta
             for j in 0..P {
                 let mut sum = 0.0;
                 for k in 0..P {
-                    sum += self.l[[i, k, j]] * eta[[i, k]];
+                    sum += self.l[[i, j, k]] * eta[[i, k]];
                 }
                 gradient[[i, j]] = sum;
             }

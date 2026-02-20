@@ -1,6 +1,6 @@
 use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, Zip, array};
 use rand::prelude::*;
 use statrs::distribution::{Discrete, DiscreteCDF, Poisson as PoissonDist};
 
@@ -8,16 +8,12 @@ use statrs::distribution::{Discrete, DiscreteCDF, Poisson as PoissonDist};
 #[derive(Debug, Clone)]
 pub struct Poisson {
     pub rate: Array1<f64>,
-    _params: Array2<f64>,
 }
 
 impl Distribution for Poisson {
     fn from_params(params: &Array2<f64>) -> Self {
         let rate = params.column(0).mapv(f64::exp);
-        Poisson {
-            rate,
-            _params: params.clone(),
-        }
+        Poisson { rate }
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
@@ -33,8 +29,11 @@ impl Distribution for Poisson {
         self.rate.clone()
     }
 
-    fn params(&self) -> &Array2<f64> {
-        &self._params
+    fn params(&self) -> Array2<f64> {
+        let n = self.rate.len();
+        let mut p = Array2::zeros((n, 1));
+        p.column_mut(0).assign(&self.rate.mapv(f64::ln));
+        p
     }
 }
 
@@ -171,15 +170,37 @@ impl Poisson {
 }
 
 impl Scorable<LogScore> for Poisson {
+    fn is_diagonal_metric(&self) -> bool {
+        true
+    }
+
+    fn diagonal_metric(&self) -> Array2<f64> {
+        // Fisher Information for Poisson: rate (1 param)
+        let n_obs = self.rate.len();
+        let mut diag = Array2::zeros((n_obs, 1));
+        Zip::from(diag.column_mut(0))
+            .and(&self.rate)
+            .for_each(|d, &rate| {
+                *d = rate;
+            });
+        diag
+    }
+
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
+        // -log_pmf = -(y * ln(rate) - rate - ln_gamma(y + 1))
         let mut scores = Array1::zeros(y.len());
-        for (i, &y_i) in y.iter().enumerate() {
-            if let Ok(d) = PoissonDist::new(self.rate[i]) {
-                scores[i] = -d.ln_pmf(y_i.round() as u64);
-            } else {
-                scores[i] = f64::MAX;
-            }
-        }
+        Zip::from(&mut scores)
+            .and(y)
+            .and(&self.rate)
+            .for_each(|s, &y_i, &rate| {
+                if rate > 0.0 {
+                    let log_pmf =
+                        y_i * rate.ln() - rate - statrs::function::gamma::ln_gamma(y_i + 1.0);
+                    *s = -log_pmf;
+                } else {
+                    *s = f64::MAX;
+                }
+            });
         scores
     }
 
@@ -210,6 +231,51 @@ impl Scorable<LogScore> for Poisson {
 }
 
 impl Scorable<CRPScore> for Poisson {
+    fn is_diagonal_metric(&self) -> bool {
+        true
+    }
+
+    fn diagonal_metric(&self) -> Array2<f64> {
+        // CRPScore metric for Poisson: M = Σ_y g(y)^2 * P(Y=y) (1 param)
+        let n_obs = self.rate.len();
+        let mut diag = Array2::zeros((n_obs, 1));
+
+        for i in 0..n_obs {
+            let lambda = self.rate[i];
+            let std_dev = lambda.sqrt();
+            let k_max = ((lambda + 8.0 * std_dev).ceil() as i64).max(5);
+
+            if let Ok(d) = PoissonDist::new(lambda) {
+                let mut metric_val = 0.0;
+
+                for y_int in 0..=k_max {
+                    let pmf_y = d.pmf(y_int as u64);
+                    if pmf_y < 1e-300 {
+                        continue;
+                    }
+
+                    let mut d_crps = 0.0;
+                    let inner_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_int + 10);
+
+                    for k in 0..=inner_max {
+                        let f_k = d.cdf(k as u64);
+                        let indicator = if y_int <= k { 1.0 } else { 0.0 };
+                        let diff = f_k - indicator;
+                        let pmf_k = d.pmf(k as u64);
+                        d_crps += 2.0 * diff * (-pmf_k);
+                    }
+                    let g = lambda * d_crps;
+
+                    metric_val += g * g * pmf_y;
+                }
+
+                diag[[i, 0]] = metric_val;
+            }
+        }
+
+        diag
+    }
+
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         // CRPS for Poisson distribution (discrete CRPS)
         // For discrete distributions:
@@ -305,16 +371,44 @@ impl Scorable<CRPScore> for Poisson {
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Metric for discrete CRPS
-        // Using an approximation based on the Poisson variance structure
+        // Deterministic CRPScore metric: M = Σ_y g(y)^2 * P(Y=y)
+        // Since Poisson is discrete, the expectation is an exact finite sum
+        // over the support, truncated where probability mass is negligible.
         let n_obs = self.rate.len();
         let mut fi = Array3::zeros((n_obs, 1, 1));
 
-        // For Poisson CRPS, the metric scales with rate
-        // Approximation: metric ≈ 2 * sqrt(rate) / sqrt(pi)
         for i in 0..n_obs {
             let lambda = self.rate[i];
-            fi[[i, 0, 0]] = 2.0 * lambda.sqrt() / std::f64::consts::PI.sqrt();
+            let std_dev = lambda.sqrt();
+            let k_max = ((lambda + 8.0 * std_dev).ceil() as i64).max(5);
+
+            if let Ok(d) = PoissonDist::new(lambda) {
+                let mut metric_val = 0.0;
+
+                for y_int in 0..=k_max {
+                    let pmf_y = d.pmf(y_int as u64);
+                    if pmf_y < 1e-300 {
+                        continue;
+                    }
+
+                    // Compute CRPS gradient at this y value
+                    let mut d_crps = 0.0;
+                    let inner_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_int + 10);
+
+                    for k in 0..=inner_max {
+                        let f_k = d.cdf(k as u64);
+                        let indicator = if y_int <= k { 1.0 } else { 0.0 };
+                        let diff = f_k - indicator;
+                        let pmf_k = d.pmf(k as u64);
+                        d_crps += 2.0 * diff * (-pmf_k);
+                    }
+                    let g = lambda * d_crps; // d/d(log(λ)) = λ * d/d(λ)
+
+                    metric_val += g * g * pmf_y;
+                }
+
+                fi[[i, 0, 0]] = metric_val;
+            }
         }
 
         fi

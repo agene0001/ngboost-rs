@@ -54,6 +54,7 @@ pub enum SerializableTrainedLearner {
     DecisionTree(TrainedDecisionTree),
     HistogramTree(TrainedHistogramTree),
     Ridge(TrainedRidgeLearner),
+    ArenaTree(ArenaDecisionTree),
 }
 
 impl SerializableTrainedLearner {
@@ -72,6 +73,7 @@ impl SerializableTrainedLearner {
             SerializableTrainedLearner::DecisionTree(t) => Box::new(t),
             SerializableTrainedLearner::HistogramTree(h) => Box::new(h),
             SerializableTrainedLearner::Ridge(r) => Box::new(r),
+            SerializableTrainedLearner::ArenaTree(a) => Box::new(a),
         }
     }
 }
@@ -83,6 +85,7 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::DecisionTree(t) => t.predict(x),
             SerializableTrainedLearner::HistogramTree(h) => h.predict(x),
             SerializableTrainedLearner::Ridge(r) => r.predict(x),
+            SerializableTrainedLearner::ArenaTree(a) => a.predict(x),
         }
     }
 
@@ -92,6 +95,7 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::DecisionTree(t) => t.feature_importances(),
             SerializableTrainedLearner::HistogramTree(h) => h.feature_importances(),
             SerializableTrainedLearner::Ridge(r) => r.feature_importances(),
+            SerializableTrainedLearner::ArenaTree(a) => a.feature_importances(),
         }
     }
 
@@ -101,6 +105,7 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::DecisionTree(t) => t.split_feature(),
             SerializableTrainedLearner::HistogramTree(h) => h.split_feature(),
             SerializableTrainedLearner::Ridge(_) => None, // Linear models don't split
+            SerializableTrainedLearner::ArenaTree(a) => a.split_feature(),
         }
     }
 
@@ -110,6 +115,7 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::DecisionTree(t) => t.split_features(),
             SerializableTrainedLearner::HistogramTree(h) => h.split_features(),
             SerializableTrainedLearner::Ridge(_) => None, // Linear models don't split
+            SerializableTrainedLearner::ArenaTree(a) => a.split_features(),
         }
     }
 }
@@ -151,10 +157,20 @@ impl BaseLearner for StumpLearner {
 
         let feature_col = x.column(best_feature);
 
-        let mut left_y = Vec::new();
-        let mut left_weights = Vec::new();
-        let mut right_y = Vec::new();
-        let mut right_weights = Vec::new();
+        // Pre-allocate with estimated capacity for better performance
+        let estimated_size = y.len() / 2;
+        let mut left_y = Vec::with_capacity(estimated_size);
+        let mut left_weights = Vec::with_capacity(if sample_weight.is_some() {
+            estimated_size
+        } else {
+            0
+        });
+        let mut right_y = Vec::with_capacity(estimated_size);
+        let mut right_weights = Vec::with_capacity(if sample_weight.is_some() {
+            estimated_size
+        } else {
+            0
+        });
 
         for (i, &y_val) in y.iter().enumerate() {
             if feature_col[i] < best_threshold {
@@ -212,6 +228,7 @@ pub struct TrainedStumpLearner {
 }
 
 impl TrainedBaseLearner for TrainedStumpLearner {
+    #[inline]
     fn predict(&self, x: &Array2<f64>) -> Array1<f64> {
         if x.shape()[1] <= self.feature_index {
             return Array1::from_elem(x.nrows(), self.left_value);
@@ -225,6 +242,7 @@ impl TrainedBaseLearner for TrainedStumpLearner {
         })
     }
 
+    #[inline]
     fn split_feature(&self) -> Option<usize> {
         // Only return the feature if there's an actual split (non-NaN threshold)
         if self.threshold.is_nan() {
@@ -252,8 +270,10 @@ fn find_best_split(x: &Array2<f64>, y: &Array1<f64>) -> (usize, f64, f64) {
         unique_values.dedup();
 
         for &threshold in &unique_values {
-            let mut left_y = Vec::new();
-            let mut right_y = Vec::new();
+            // Pre-allocate with estimated capacity
+            let estimated_size = y.len() / 2;
+            let mut left_y = Vec::with_capacity(estimated_size);
+            let mut right_y = Vec::with_capacity(estimated_size);
 
             for i in 0..y.len() {
                 if feature_values[i] < threshold {
@@ -687,7 +707,9 @@ pub enum HistTreeNode {
 }
 
 impl HistTreeNode {
-    fn predict_single(&self, row: &[f64]) -> f64 {
+    /// Predict for a single row using direct array indexing (no allocation)
+    #[inline]
+    fn predict_row(&self, x: &Array2<f64>, row_idx: usize) -> f64 {
         match self {
             HistTreeNode::Leaf { value } => *value,
             HistTreeNode::Split {
@@ -697,10 +719,10 @@ impl HistTreeNode {
                 right,
                 ..
             } => {
-                if row[*feature_index] < *threshold_value {
-                    left.predict_single(row)
+                if x[[row_idx, *feature_index]] < *threshold_value {
+                    left.predict_row(x, row_idx)
                 } else {
-                    right.predict_single(row)
+                    right.predict_row(x, row_idx)
                 }
             }
         }
@@ -730,11 +752,11 @@ pub struct TrainedHistogramTree {
 }
 
 impl TrainedBaseLearner for TrainedHistogramTree {
+    #[inline]
     fn predict(&self, x: &Array2<f64>) -> Array1<f64> {
         let mut predictions = Array1::zeros(x.nrows());
-        for (i, row) in x.rows().into_iter().enumerate() {
-            let row_vec: Vec<f64> = row.iter().cloned().collect();
-            predictions[i] = self.root.predict_single(&row_vec);
+        for i in 0..x.nrows() {
+            predictions[i] = self.root.predict_row(x, i);
         }
         predictions
     }
@@ -822,9 +844,10 @@ fn build_histogram_tree_node(
         return HistTreeNode::Leaf { value: node_value };
     }
 
-    // Partition indices
-    let mut left_indices = Vec::new();
-    let mut right_indices = Vec::new();
+    // Partition indices - pre-allocate with estimated capacity
+    let estimated_size = indices.len() / 2;
+    let mut left_indices = Vec::with_capacity(estimated_size);
+    let mut right_indices = Vec::with_capacity(estimated_size);
     for &i in indices {
         if binned_x[best_feature][i] < best_bin {
             left_indices.push(i);
@@ -1037,6 +1060,8 @@ impl BaseLearner for DecisionTreeLearner {
         }
 
         let indices: Vec<usize> = (0..x.nrows()).collect();
+        // Pre-allocate sort buffer once — reused across all recursive calls
+        let mut sort_buf: Vec<(f64, usize)> = Vec::with_capacity(x.nrows());
         let root = build_tree_node(
             x,
             y,
@@ -1046,6 +1071,7 @@ impl BaseLearner for DecisionTreeLearner {
             self.max_depth,
             self.min_samples_split,
             self.min_samples_leaf,
+            &mut sort_buf,
         );
 
         Ok(Box::new(TrainedDecisionTree {
@@ -1055,7 +1081,57 @@ impl BaseLearner for DecisionTreeLearner {
     }
 }
 
-/// Internal tree node structure
+// ============================================================================
+// Arena-style tree nodes using flat vector storage for cache efficiency
+// ============================================================================
+
+/// Sentinel value indicating no child (used for leaf nodes)
+const NO_CHILD: u32 = u32::MAX;
+
+/// Compact tree node using indices instead of Box pointers.
+/// All nodes are stored in a contiguous Vec for better cache locality.
+/// This is an "arena-style" allocation pattern without lifetime complexity.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ArenaTreeNode {
+    /// Feature index for split nodes, unused for leaves
+    pub feature_index: u16,
+    /// Left child index (NO_CHILD for leaves)
+    pub left: u32,
+    /// Right child index (NO_CHILD for leaves)
+    pub right: u32,
+    /// Split threshold for split nodes, prediction value for leaves
+    pub threshold_or_value: f64,
+}
+
+impl ArenaTreeNode {
+    #[inline]
+    fn is_leaf(&self) -> bool {
+        self.left == NO_CHILD
+    }
+
+    #[inline]
+    fn new_leaf(value: f64) -> Self {
+        ArenaTreeNode {
+            feature_index: 0,
+            left: NO_CHILD,
+            right: NO_CHILD,
+            threshold_or_value: value,
+        }
+    }
+
+    #[inline]
+    fn new_split(feature_index: usize, threshold: f64, left: u32, right: u32) -> Self {
+        ArenaTreeNode {
+            feature_index: feature_index as u16,
+            left,
+            right,
+            threshold_or_value: threshold,
+        }
+    }
+}
+
+/// Legacy tree node enum for backward compatibility with serialization.
+/// New code should use ArenaTreeNode for better performance.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum TreeNode {
     Leaf {
@@ -1070,7 +1146,9 @@ pub enum TreeNode {
 }
 
 impl TreeNode {
-    fn predict_single(&self, row: &[f64]) -> f64 {
+    /// Predict for a single row using direct array indexing (no allocation)
+    #[inline]
+    fn predict_row(&self, x: &Array2<f64>, row_idx: usize) -> f64 {
         match self {
             TreeNode::Leaf { value } => *value,
             TreeNode::Split {
@@ -1079,10 +1157,10 @@ impl TreeNode {
                 left,
                 right,
             } => {
-                if row[*feature_index] < *threshold {
-                    left.predict_single(row)
+                if x[[row_idx, *feature_index]] < *threshold {
+                    left.predict_row(x, row_idx)
                 } else {
-                    right.predict_single(row)
+                    right.predict_row(x, row_idx)
                 }
             }
         }
@@ -1103,8 +1181,322 @@ impl TreeNode {
             }
         }
     }
+
+    /// Convert legacy TreeNode to arena format
+    fn to_arena_nodes(&self, nodes: &mut Vec<ArenaTreeNode>) -> u32 {
+        let idx = nodes.len() as u32;
+        match self {
+            TreeNode::Leaf { value } => {
+                nodes.push(ArenaTreeNode::new_leaf(*value));
+                idx
+            }
+            TreeNode::Split {
+                feature_index,
+                threshold,
+                left,
+                right,
+            } => {
+                // Reserve space for this node
+                nodes.push(ArenaTreeNode::new_leaf(0.0)); // placeholder
+                let left_idx = left.to_arena_nodes(nodes);
+                let right_idx = right.to_arena_nodes(nodes);
+                nodes[idx as usize] =
+                    ArenaTreeNode::new_split(*feature_index, *threshold, left_idx, right_idx);
+                idx
+            }
+        }
+    }
 }
 
+/// Arena-based decision tree with flat node storage.
+/// Provides better cache locality and fewer allocations than Box-based trees.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ArenaDecisionTree {
+    /// All nodes stored contiguously. Root is always at index 0.
+    pub nodes: Vec<ArenaTreeNode>,
+    pub n_features: usize,
+}
+
+impl ArenaDecisionTree {
+    /// Predict for a single row using direct array indexing (no allocation)
+    #[inline]
+    fn predict_row(&self, x: &Array2<f64>, row_idx: usize) -> f64 {
+        let mut node_idx = 0usize;
+        loop {
+            let node = &self.nodes[node_idx];
+            if node.is_leaf() {
+                return node.threshold_or_value;
+            }
+            let feature_val = x[[row_idx, node.feature_index as usize]];
+            if feature_val < node.threshold_or_value {
+                node_idx = node.left as usize;
+            } else {
+                node_idx = node.right as usize;
+            }
+        }
+    }
+
+    fn collect_split_features(&self, node_idx: usize, features: &mut Vec<usize>) {
+        let node = &self.nodes[node_idx];
+        if !node.is_leaf() {
+            features.push(node.feature_index as usize);
+            self.collect_split_features(node.left as usize, features);
+            self.collect_split_features(node.right as usize, features);
+        }
+    }
+
+    /// Convert from legacy TreeNode format
+    pub fn from_tree_node(root: &TreeNode, n_features: usize) -> Self {
+        let mut nodes = Vec::new();
+        root.to_arena_nodes(&mut nodes);
+        ArenaDecisionTree { nodes, n_features }
+    }
+}
+
+impl TrainedBaseLearner for ArenaDecisionTree {
+    #[inline]
+    fn predict(&self, x: &Array2<f64>) -> Array1<f64> {
+        let mut predictions = Array1::zeros(x.nrows());
+        for i in 0..x.nrows() {
+            predictions[i] = self.predict_row(x, i);
+        }
+        predictions
+    }
+
+    fn split_features(&self) -> Option<Vec<usize>> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let mut features = Vec::new();
+        self.collect_split_features(0, &mut features);
+        if features.is_empty() {
+            None
+        } else {
+            Some(features)
+        }
+    }
+
+    fn feature_importances(&self) -> Option<Array1<f64>> {
+        let features = self.split_features()?;
+        let mut importances = Array1::zeros(self.n_features);
+        for &f in &features {
+            if f < self.n_features {
+                importances[f] += 1.0;
+            }
+        }
+        let sum: f64 = importances.sum();
+        if sum > 0.0 {
+            importances.mapv_inplace(|v| v / sum);
+        }
+        Some(importances)
+    }
+
+    fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
+        Some(SerializableTrainedLearner::ArenaTree(self.clone()))
+    }
+}
+
+/// Arena-based decision tree learner - faster than DecisionTreeLearner.
+/// Uses flat vector storage for better cache locality and fewer allocations.
+#[derive(Clone)]
+pub struct ArenaDecisionTreeLearner {
+    pub max_depth: usize,
+    pub min_samples_split: usize,
+    pub min_samples_leaf: usize,
+}
+
+impl ArenaDecisionTreeLearner {
+    pub fn new(max_depth: usize) -> Self {
+        ArenaDecisionTreeLearner {
+            max_depth,
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+        }
+    }
+
+    /// Create an arena tree learner matching Python's default settings
+    pub fn default_sklearn() -> Self {
+        ArenaDecisionTreeLearner {
+            max_depth: 3,
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+        }
+    }
+
+    pub fn with_params(
+        max_depth: usize,
+        min_samples_split: usize,
+        min_samples_leaf: usize,
+    ) -> Self {
+        ArenaDecisionTreeLearner {
+            max_depth,
+            min_samples_split,
+            min_samples_leaf,
+        }
+    }
+}
+
+impl BaseLearner for ArenaDecisionTreeLearner {
+    fn fit_with_weights(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+    ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
+        if x.nrows() == 0 {
+            return Err("Cannot fit to empty dataset");
+        }
+
+        let indices: Vec<usize> = (0..x.nrows()).collect();
+
+        // Pre-allocate nodes vector based on max possible tree size
+        // A complete binary tree of depth d has 2^(d+1) - 1 nodes
+        let max_nodes = (1usize << (self.max_depth + 1)).saturating_sub(1);
+        let mut nodes = Vec::with_capacity(max_nodes.min(indices.len() * 2));
+        // Pre-allocate sort buffer once — reused across all recursive calls
+        let mut sort_buf: Vec<(f64, usize)> = Vec::with_capacity(x.nrows());
+
+        build_arena_tree_node(
+            &mut nodes,
+            x,
+            y,
+            sample_weight,
+            &indices,
+            0,
+            self.max_depth,
+            self.min_samples_split,
+            self.min_samples_leaf,
+            &mut sort_buf,
+        );
+
+        Ok(Box::new(ArenaDecisionTree {
+            nodes,
+            n_features: x.ncols(),
+        }))
+    }
+}
+
+/// Build arena tree node recursively, returning the index of the created node
+fn build_arena_tree_node(
+    nodes: &mut Vec<ArenaTreeNode>,
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    sample_weight: Option<&Array1<f64>>,
+    indices: &[usize],
+    depth: usize,
+    max_depth: usize,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+    sort_buf: &mut Vec<(f64, usize)>,
+) -> u32 {
+    // Calculate parent_sum and parent_weight once — used for both node_value and split finding
+    let (parent_sum, parent_weight) = if let Some(weights) = sample_weight {
+        let mut sum = 0.0;
+        let mut weight = 0.0;
+        for &i in indices {
+            sum += y[i] * weights[i];
+            weight += weights[i];
+        }
+        (sum, weight)
+    } else {
+        let sum: f64 = indices.iter().map(|&i| y[i]).sum();
+        (sum, indices.len() as f64)
+    };
+
+    let node_value = if parent_weight > 0.0 {
+        parent_sum / parent_weight
+    } else {
+        0.0
+    };
+
+    // Check stopping conditions
+    if depth >= max_depth || indices.len() < min_samples_split {
+        let idx = nodes.len() as u32;
+        nodes.push(ArenaTreeNode::new_leaf(node_value));
+        return idx;
+    }
+
+    // Find the best split using Friedman MSE improvement — pass pre-computed parent stats
+    let (best_feature, best_threshold, best_improvement) = find_best_split_friedman(
+        x,
+        y,
+        sample_weight,
+        indices,
+        min_samples_leaf,
+        parent_sum,
+        parent_weight,
+        sort_buf,
+    );
+
+    // If no valid split found, return a leaf
+    if best_improvement <= 0.0 || best_threshold.is_nan() {
+        let idx = nodes.len() as u32;
+        nodes.push(ArenaTreeNode::new_leaf(node_value));
+        return idx;
+    }
+
+    // Partition the data - pre-allocate with estimated capacity
+    let estimated_size = indices.len() / 2;
+    let mut left_indices = Vec::with_capacity(estimated_size);
+    let mut right_indices = Vec::with_capacity(estimated_size);
+    for &i in indices {
+        if x[[i, best_feature]] < best_threshold {
+            left_indices.push(i);
+        } else {
+            right_indices.push(i);
+        }
+    }
+
+    // Check min_samples_leaf constraint
+    if left_indices.len() < min_samples_leaf || right_indices.len() < min_samples_leaf {
+        let idx = nodes.len() as u32;
+        nodes.push(ArenaTreeNode::new_leaf(node_value));
+        return idx;
+    }
+
+    // Reserve space for this node (will update with child indices later)
+    let node_idx = nodes.len() as u32;
+    nodes.push(ArenaTreeNode::new_leaf(0.0)); // placeholder
+
+    // Recursively build children
+    let left_idx = build_arena_tree_node(
+        nodes,
+        x,
+        y,
+        sample_weight,
+        &left_indices,
+        depth + 1,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+        sort_buf,
+    );
+    let right_idx = build_arena_tree_node(
+        nodes,
+        x,
+        y,
+        sample_weight,
+        &right_indices,
+        depth + 1,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+        sort_buf,
+    );
+
+    // Update the placeholder with actual split info
+    nodes[node_idx as usize] =
+        ArenaTreeNode::new_split(best_feature, best_threshold, left_idx, right_idx);
+
+    node_idx
+}
+
+/// Returns the default arena tree learner - faster alternative to default_tree_learner
+pub fn arena_tree_learner() -> ArenaDecisionTreeLearner {
+    ArenaDecisionTreeLearner::default_sklearn()
+}
+
+/// Legacy trained decision tree (kept for backward compatibility)
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TrainedDecisionTree {
     pub root: TreeNode,
@@ -1112,12 +1504,11 @@ pub struct TrainedDecisionTree {
 }
 
 impl TrainedBaseLearner for TrainedDecisionTree {
+    #[inline]
     fn predict(&self, x: &Array2<f64>) -> Array1<f64> {
         let mut predictions = Array1::zeros(x.nrows());
-        for (i, row) in x.rows().into_iter().enumerate() {
-            // Use to_vec() to handle non-contiguous rows
-            let row_vec: Vec<f64> = row.iter().cloned().collect();
-            predictions[i] = self.root.predict_single(&row_vec);
+        for i in 0..x.nrows() {
+            predictions[i] = self.root.predict_row(x, i);
         }
         predictions
     }
@@ -1162,23 +1553,26 @@ fn build_tree_node(
     max_depth: usize,
     min_samples_split: usize,
     min_samples_leaf: usize,
+    sort_buf: &mut Vec<(f64, usize)>,
 ) -> TreeNode {
-    // Calculate the weighted mean for this node
-    let node_value = if let Some(weights) = sample_weight {
+    // Calculate parent_sum and parent_weight once — used for both node_value and split finding
+    let (parent_sum, parent_weight) = if let Some(weights) = sample_weight {
         let mut sum = 0.0;
-        let mut weight_sum = 0.0;
+        let mut weight = 0.0;
         for &i in indices {
             sum += y[i] * weights[i];
-            weight_sum += weights[i];
+            weight += weights[i];
         }
-        if weight_sum > 0.0 {
-            sum / weight_sum
-        } else {
-            0.0
-        }
+        (sum, weight)
     } else {
         let sum: f64 = indices.iter().map(|&i| y[i]).sum();
-        sum / indices.len() as f64
+        (sum, indices.len() as f64)
+    };
+
+    let node_value = if parent_weight > 0.0 {
+        parent_sum / parent_weight
+    } else {
+        0.0
     };
 
     // Check stopping conditions
@@ -1186,18 +1580,27 @@ fn build_tree_node(
         return TreeNode::Leaf { value: node_value };
     }
 
-    // Find the best split using Friedman MSE improvement
-    let (best_feature, best_threshold, best_improvement) =
-        find_best_split_friedman(x, y, sample_weight, indices, min_samples_leaf);
+    // Find the best split using Friedman MSE improvement — pass pre-computed parent stats
+    let (best_feature, best_threshold, best_improvement) = find_best_split_friedman(
+        x,
+        y,
+        sample_weight,
+        indices,
+        min_samples_leaf,
+        parent_sum,
+        parent_weight,
+        sort_buf,
+    );
 
     // If no valid split found, return a leaf
     if best_improvement <= 0.0 || best_threshold.is_nan() {
         return TreeNode::Leaf { value: node_value };
     }
 
-    // Partition the data
-    let mut left_indices = Vec::new();
-    let mut right_indices = Vec::new();
+    // Partition the data - pre-allocate with estimated capacity
+    let estimated_size = indices.len() / 2;
+    let mut left_indices = Vec::with_capacity(estimated_size);
+    let mut right_indices = Vec::with_capacity(estimated_size);
     for &i in indices {
         if x[[i, best_feature]] < best_threshold {
             left_indices.push(i);
@@ -1221,6 +1624,7 @@ fn build_tree_node(
         max_depth,
         min_samples_split,
         min_samples_leaf,
+        sort_buf,
     );
     let right_child = build_tree_node(
         x,
@@ -1231,6 +1635,7 @@ fn build_tree_node(
         max_depth,
         min_samples_split,
         min_samples_leaf,
+        sort_buf,
     );
 
     TreeNode::Split {
@@ -1241,72 +1646,51 @@ fn build_tree_node(
     }
 }
 
-/// Find the best split using Friedman MSE criterion (variance reduction weighted by sample counts)
-/// This matches sklearn's "friedman_mse" criterion
-fn find_best_split_friedman(
+/// Evaluate a single feature for the best split using Friedman MSE criterion.
+/// Returns (threshold, improvement) for this feature.
+#[inline]
+fn evaluate_feature_split(
     x: &Array2<f64>,
     y: &Array1<f64>,
     sample_weight: Option<&Array1<f64>>,
     indices: &[usize],
+    feature_index: usize,
     min_samples_leaf: usize,
-) -> (usize, f64, f64) {
-    let n_features = x.ncols();
-    let mut best_feature = 0;
+    parent_sum: f64,
+    parent_weight: f64,
+    sort_buf: &mut Vec<(f64, usize)>,
+) -> (f64, f64) {
+    let feature_col = x.column(feature_index);
+
+    // Build (feature_value, index) pairs — sort comparisons then access values
+    // directly instead of doing indirect lookups through feature_col[idx]
+    sort_buf.clear();
+    sort_buf.extend(indices.iter().map(|&i| (feature_col[i], i)));
+    sort_buf.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
     let mut best_threshold = f64::NAN;
     let mut best_improvement = 0.0;
+    let mut left_sum = 0.0;
+    let mut left_weight = 0.0;
+    let n = indices.len();
 
-    // Calculate parent statistics
-    let (parent_sum, parent_weight) = if let Some(weights) = sample_weight {
-        let mut sum = 0.0;
-        let mut weight = 0.0;
-        for &i in indices {
-            sum += y[i] * weights[i];
-            weight += weights[i];
-        }
-        (sum, weight)
-    } else {
-        let sum: f64 = indices.iter().map(|&i| y[i]).sum();
-        (sum, indices.len() as f64)
-    };
-
-    if parent_weight == 0.0 {
-        return (best_feature, best_threshold, best_improvement);
-    }
-
-    for feature_index in 0..n_features {
-        // Sort indices by feature value
-        let mut sorted_indices: Vec<usize> = indices.to_vec();
-        sorted_indices.sort_by(|&a, &b| {
-            x[[a, feature_index]]
-                .partial_cmp(&x[[b, feature_index]])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Use cumulative sums for efficient split evaluation
-        let mut left_sum = 0.0;
-        let mut left_weight = 0.0;
-
-        for (pos, &i) in sorted_indices.iter().enumerate() {
-            let y_val = y[i];
-            let w = sample_weight.map_or(1.0, |weights| weights[i]);
-
-            left_sum += y_val * w;
+    // Split into weighted vs unweighted paths to avoid per-element branch
+    if let Some(weights) = sample_weight {
+        for pos in 0..n {
+            let (feat_i, i) = sort_buf[pos];
+            let w = weights[i];
+            left_sum += y[i] * w;
             left_weight += w;
 
             let left_count = pos + 1;
-            let right_count = indices.len() - left_count;
+            let right_count = n - left_count;
 
-            // Check min_samples_leaf
             if left_count < min_samples_leaf || right_count < min_samples_leaf {
                 continue;
             }
 
-            // Skip if next sample has the same feature value (no split point here)
-            if pos + 1 < sorted_indices.len() {
-                let next_i = sorted_indices[pos + 1];
-                if (x[[i, feature_index]] - x[[next_i, feature_index]]).abs() < 1e-10 {
-                    continue;
-                }
+            if pos + 1 < n && (feat_i - sort_buf[pos + 1].0).abs() < 1e-10 {
+                continue;
             }
 
             let right_sum = parent_sum - left_sum;
@@ -1318,27 +1702,143 @@ fn find_best_split_friedman(
 
             let left_mean = left_sum / left_weight;
             let right_mean = right_sum / right_weight;
-
-            // Friedman MSE improvement: weighted variance reduction
-            // improvement = (n_left * n_right / n_total) * (mean_left - mean_right)^2
-            // This exactly matches sklearn's friedman_mse criterion
-            let improvement =
-                (left_weight * right_weight / parent_weight) * (left_mean - right_mean).powi(2);
-
-            // Add small epsilon to avoid numerical issues with identical means
-            let improvement = improvement + 1e-10;
+            let diff = left_mean - right_mean;
+            let improvement = (left_weight * right_weight / parent_weight) * diff * diff + 1e-10;
 
             if improvement > best_improvement {
                 best_improvement = improvement;
-                best_feature = feature_index;
-                // Threshold is midpoint between current and next value
-                if pos + 1 < sorted_indices.len() {
-                    let next_i = sorted_indices[pos + 1];
-                    best_threshold = (x[[i, feature_index]] + x[[next_i, feature_index]]) / 2.0;
+                best_threshold = if pos + 1 < n {
+                    (feat_i + sort_buf[pos + 1].0) * 0.5
                 } else {
-                    best_threshold = x[[i, feature_index]];
-                }
+                    feat_i
+                };
             }
+        }
+    } else {
+        // Unweighted path — no per-element weight lookup
+        for pos in 0..n {
+            let (feat_i, i) = sort_buf[pos];
+            left_sum += y[i];
+            left_weight += 1.0;
+
+            let left_count = pos + 1;
+            let right_count = n - left_count;
+
+            if left_count < min_samples_leaf || right_count < min_samples_leaf {
+                continue;
+            }
+
+            if pos + 1 < n && (feat_i - sort_buf[pos + 1].0).abs() < 1e-10 {
+                continue;
+            }
+
+            let right_sum = parent_sum - left_sum;
+            let right_weight = parent_weight - left_weight;
+
+            if right_weight <= 0.0 {
+                continue;
+            }
+
+            let left_mean = left_sum / left_weight;
+            let right_mean = right_sum / right_weight;
+            let diff = left_mean - right_mean;
+            let improvement = (left_weight * right_weight / parent_weight) * diff * diff + 1e-10;
+
+            if improvement > best_improvement {
+                best_improvement = improvement;
+                best_threshold = if pos + 1 < n {
+                    (feat_i + sort_buf[pos + 1].0) * 0.5
+                } else {
+                    feat_i
+                };
+            }
+        }
+    }
+
+    (best_threshold, best_improvement)
+}
+
+/// Find the best split using Friedman MSE criterion (variance reduction weighted by sample counts)
+/// This matches sklearn's "friedman_mse" criterion.
+/// `sort_buf` is a reusable scratch buffer to avoid per-feature allocations.
+/// Uses parallel feature evaluation when the workload is large enough.
+fn find_best_split_friedman(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    sample_weight: Option<&Array1<f64>>,
+    indices: &[usize],
+    min_samples_leaf: usize,
+    parent_sum: f64,
+    parent_weight: f64,
+    sort_buf: &mut Vec<(f64, usize)>,
+) -> (usize, f64, f64) {
+    let n_features = x.ncols();
+
+    if parent_weight == 0.0 {
+        return (0, f64::NAN, 0.0);
+    }
+
+    // Parallel path: when the total work (n_features * n_samples * log(n_samples)) is large
+    // enough to justify rayon overhead. Rayon has ~5-10µs per task overhead, so we need each
+    // feature's work to be substantial. With 10 features and 500 samples, each feature sort
+    // takes ~10µs which is too small. We need at least ~50µs per feature to see benefit.
+    // n_samples >= 1000 with 10+ features gives ~30µs/feature sort — marginal.
+    // Only parallelize for genuinely large workloads.
+    if n_features >= 10 && indices.len() >= 5000 {
+        use rayon::prelude::*;
+
+        let results: Vec<(f64, f64)> = (0..n_features)
+            .into_par_iter()
+            .map(|feature_index| {
+                let mut local_sort_buf: Vec<(f64, usize)> = Vec::with_capacity(indices.len());
+                evaluate_feature_split(
+                    x,
+                    y,
+                    sample_weight,
+                    indices,
+                    feature_index,
+                    min_samples_leaf,
+                    parent_sum,
+                    parent_weight,
+                    &mut local_sort_buf,
+                )
+            })
+            .collect();
+
+        let mut best_feature = 0;
+        let mut best_threshold = f64::NAN;
+        let mut best_improvement = 0.0;
+        for (feature_index, &(threshold, improvement)) in results.iter().enumerate() {
+            if improvement > best_improvement {
+                best_improvement = improvement;
+                best_feature = feature_index;
+                best_threshold = threshold;
+            }
+        }
+        return (best_feature, best_threshold, best_improvement);
+    }
+
+    // Sequential path: reuse sort buffer for small workloads
+    let mut best_feature = 0;
+    let mut best_threshold = f64::NAN;
+    let mut best_improvement = 0.0;
+
+    for feature_index in 0..n_features {
+        let (threshold, improvement) = evaluate_feature_split(
+            x,
+            y,
+            sample_weight,
+            indices,
+            feature_index,
+            min_samples_leaf,
+            parent_sum,
+            parent_weight,
+            sort_buf,
+        );
+        if improvement > best_improvement {
+            best_improvement = improvement;
+            best_feature = feature_index;
+            best_threshold = threshold;
         }
     }
 
@@ -1357,90 +1857,100 @@ pub fn stump_learner() -> StumpLearner {
 }
 
 /// Calculate weighted mean
+/// Computes weighted mean using ndarray's dot product (SIMD-enabled).
+#[inline]
 fn weighted_mean(y: &Array1<f64>, weights: &Array1<f64>) -> f64 {
-    let weighted_sum: f64 = y
-        .iter()
-        .zip(weights.iter())
-        .map(|(&y_i, &w_i)| y_i * w_i)
-        .sum();
-    let total_weight: f64 = weights.sum();
+    let total_weight = weights.sum();
     if total_weight > 0.0 {
-        weighted_sum / total_weight
+        y.dot(weights) / total_weight
     } else {
         y.mean().unwrap_or(0.0)
     }
 }
 
-/// Find best split with weighted samples
+/// Find best split with weighted samples using Friedman MSE criterion.
+/// Optimized to O(n log n) per feature using cumulative sums instead of O(n²).
 fn find_best_split_weighted(
     x: &Array2<f64>,
     y: &Array1<f64>,
     weights: &Array1<f64>,
 ) -> (usize, f64, f64) {
     let n_features = x.shape()[1];
+    let n_samples = y.len();
     let mut best_feature = 0;
     let mut best_threshold = f64::NAN;
-    let mut best_mse = f64::INFINITY;
+    let mut best_improvement = 0.0;
+
+    // Pre-compute total weighted sum
+    let total_weight: f64 = weights.sum();
+    let total_sum: f64 = y.iter().zip(weights.iter()).map(|(&yi, &wi)| yi * wi).sum();
+
+    if total_weight == 0.0 {
+        return (best_feature, best_threshold, f64::INFINITY);
+    }
+
+    // Reusable buffer for sorted indices
+    let mut sorted_indices: Vec<usize> = (0..n_samples).collect();
 
     for feature_index in 0..n_features {
-        let feature_values = x.column(feature_index);
-        let mut unique_values = feature_values.to_vec();
-        unique_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        unique_values.dedup();
+        // Sort indices by feature value
+        sorted_indices.clear();
+        sorted_indices.extend(0..n_samples);
+        sorted_indices.sort_by(|&a, &b| {
+            x[[a, feature_index]]
+                .partial_cmp(&x[[b, feature_index]])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        for &threshold in &unique_values {
-            let mut left_y = Vec::new();
-            let mut left_weights = Vec::new();
-            let mut right_y = Vec::new();
-            let mut right_weights = Vec::new();
+        // Scan through sorted samples, maintaining cumulative sums
+        let mut left_weight = 0.0;
+        let mut left_sum = 0.0;
 
-            for i in 0..y.len() {
-                if feature_values[i] < threshold {
-                    left_y.push(y[i]);
-                    left_weights.push(weights[i]);
-                } else {
-                    right_y.push(y[i]);
-                    right_weights.push(weights[i]);
-                }
-            }
+        for pos in 0..(n_samples - 1) {
+            let i = sorted_indices[pos];
+            let yi = y[i];
+            let wi = weights[i];
 
-            if left_y.is_empty() || right_y.is_empty() {
+            left_weight += wi;
+            left_sum += yi * wi;
+
+            let right_weight = total_weight - left_weight;
+            let right_sum = total_sum - left_sum;
+
+            // Skip if either side has zero weight
+            if left_weight <= 0.0 || right_weight <= 0.0 {
                 continue;
             }
 
-            let left_y_arr = Array1::from(left_y);
-            let right_y_arr = Array1::from(right_y);
-            let left_weights_arr = Array1::from(left_weights);
-            let right_weights_arr = Array1::from(right_weights);
+            // Skip if next sample has the same feature value (no valid split point)
+            let next_i = sorted_indices[pos + 1];
+            if (x[[i, feature_index]] - x[[next_i, feature_index]]).abs() < 1e-10 {
+                continue;
+            }
 
-            let mean_left = weighted_mean(&left_y_arr, &left_weights_arr);
-            let mean_right = weighted_mean(&right_y_arr, &right_weights_arr);
+            let left_mean = left_sum / left_weight;
+            let right_mean = right_sum / right_weight;
 
-            let mse_left = left_y_arr
-                .iter()
-                .zip(left_weights_arr.iter())
-                .map(|(&v, &w)| w * (v - mean_left).powi(2))
-                .sum::<f64>()
-                / left_weights_arr.sum();
-            let mse_right = right_y_arr
-                .iter()
-                .zip(right_weights_arr.iter())
-                .map(|(&v, &w)| w * (v - mean_right).powi(2))
-                .sum::<f64>()
-                / right_weights_arr.sum();
+            // Friedman MSE improvement: weighted variance reduction
+            let improvement =
+                (left_weight * right_weight / total_weight) * (left_mean - right_mean).powi(2);
 
-            let n_left = left_weights_arr.sum();
-            let n_right = right_weights_arr.sum();
-            let n_total = weights.sum();
-
-            let mse = (n_left / n_total) * mse_left + (n_right / n_total) * mse_right;
-
-            if mse < best_mse {
-                best_mse = mse;
+            if improvement > best_improvement {
+                best_improvement = improvement;
                 best_feature = feature_index;
-                best_threshold = threshold;
+                // Threshold is midpoint between current and next value
+                best_threshold = (x[[i, feature_index]] + x[[next_i, feature_index]]) / 2.0;
             }
         }
     }
+
+    // Convert improvement back to MSE for compatibility (lower is better)
+    // Note: The actual MSE value isn't used by the caller, only the threshold matters
+    let best_mse = if best_improvement > 0.0 {
+        1.0 / best_improvement
+    } else {
+        f64::INFINITY
+    };
+
     (best_feature, best_threshold, best_mse)
 }

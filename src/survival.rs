@@ -7,9 +7,9 @@ use crate::dist::exponential::Exponential;
 use crate::dist::lognormal::LogNormal;
 use crate::dist::weibull::Weibull;
 use crate::dist::{Distribution, RegressionDistn};
-use crate::learners::{default_tree_learner, BaseLearner, DecisionTreeLearner, TrainedBaseLearner};
+use crate::learners::{BaseLearner, DecisionTreeLearner, TrainedBaseLearner, default_tree_learner};
 use crate::scores::{CRPScoreCensored, CensoredScorable, LogScoreCensored, Score, SurvivalData};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ShapeBuilder};
 use rand::prelude::*;
 use rand::rng;
 use std::marker::PhantomData;
@@ -250,7 +250,7 @@ where
             .for_each(|mut row| row.assign(init_params));
 
         // Prepare validation data if provided
-        let val_data = if let (Some(xv), Some(tv), Some(ev)) = (x_val, time_val, event_val) {
+        let mut val_data = if let (Some(xv), Some(tv), Some(ev)) = (x_val, time_val, event_val) {
             if xv.nrows() != tv.len() || xv.nrows() != ev.len() {
                 return Err("Validation data dimensions must match");
             }
@@ -296,7 +296,12 @@ where
             let predictions = to_2d_array(predictions_cols);
 
             // Line search to find optimal step size
-            let scale = self.line_search(&predictions, &params_sampled, &y_sampled);
+            let scale = self.line_search(
+                &predictions,
+                &params_sampled,
+                &y_sampled,
+                weights_sampled.as_ref(),
+            );
             self.scalings.push(scale);
             self.base_models.push(fitted_learners);
 
@@ -320,7 +325,7 @@ where
             params -= &(self.learning_rate * scale * &full_predictions);
 
             // Handle validation and early stopping
-            if let Some((ref xv, ref yv, ref mut vp)) = val_data.clone() {
+            if let Some((ref xv, ref yv, ref mut vp)) = val_data {
                 // Apply column subsampling to match training
                 let fitted_learners = self.base_models.last().unwrap();
                 let val_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == xv.ncols() {
@@ -412,7 +417,7 @@ where
         let col_size = if self.col_sample >= 1.0 {
             n_features
         } else if self.col_sample > 0.0 {
-            ((n_features as f64) * self.col_sample) as usize
+            (((n_features as f64) * self.col_sample) as usize).max(1)
         } else {
             n_features
         };
@@ -449,9 +454,16 @@ where
         )
     }
 
-    fn line_search(&self, resids: &Array2<f64>, start: &Array2<f64>, y: &SurvivalData) -> f64 {
+    fn line_search(
+        &self,
+        resids: &Array2<f64>,
+        start: &Array2<f64>,
+        y: &SurvivalData,
+        sample_weight: Option<&Array1<f64>>,
+    ) -> f64 {
         let mut scale = 1.0;
-        let initial_score = CensoredScorable::total_censored_score(&D::from_params(start), y, None);
+        let initial_score =
+            CensoredScorable::total_censored_score(&D::from_params(start), y, sample_weight);
 
         // Scale up phase
         loop {
@@ -460,8 +472,11 @@ where
             }
             let scaled_resids = resids * (scale * 2.0);
             let next_params = start - &scaled_resids;
-            let score =
-                CensoredScorable::total_censored_score(&D::from_params(&next_params), y, None);
+            let score = CensoredScorable::total_censored_score(
+                &D::from_params(&next_params),
+                y,
+                sample_weight,
+            );
             if score >= initial_score || !score.is_finite() {
                 break;
             }
@@ -482,8 +497,11 @@ where
             }
 
             let next_params = start - &scaled_resids;
-            let score =
-                CensoredScorable::total_censored_score(&D::from_params(&next_params), y, None);
+            let score = CensoredScorable::total_censored_score(
+                &D::from_params(&next_params),
+                y,
+                sample_weight,
+            );
             if score < initial_score && score.is_finite() {
                 break;
             }
@@ -598,11 +616,14 @@ fn to_2d_array(cols: Vec<Array1<f64>>) -> Array2<f64> {
     }
     let nrows = cols[0].len();
     let ncols = cols.len();
-    let mut arr = Array2::zeros((nrows, ncols));
-    for (j, col) in cols.iter().enumerate() {
-        arr.column_mut(j).assign(col);
+    // Build in column-major (Fortran) order for contiguous column writes
+    let mut data = Vec::with_capacity(nrows * ncols);
+    for col in &cols {
+        data.extend(col.iter());
     }
-    arr
+    let result = Array2::from_shape_vec((nrows, ncols).f(), data).unwrap();
+    // Convert to standard (row-major) layout for downstream compatibility
+    result.as_standard_layout().into_owned()
 }
 
 // ============================================================================

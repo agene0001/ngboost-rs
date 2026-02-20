@@ -13,7 +13,7 @@ pub mod weibull;
 
 // Re-export all distributions for convenience
 pub use categorical::{
-    Bernoulli, Categorical, Categorical10, Categorical3, Categorical4, Categorical5,
+    Bernoulli, Categorical, Categorical3, Categorical4, Categorical5, Categorical10,
 };
 pub use cauchy::{Cauchy, CauchyFixedVar};
 pub use exponential::Exponential;
@@ -48,7 +48,7 @@ pub trait Distribution: Sized + Clone + Debug {
     fn predict(&self) -> Array1<f64>;
 
     /// Returns the parameters of the distribution.
-    fn params(&self) -> &Array2<f64>;
+    fn params(&self) -> Array2<f64>;
 
     /// Calculates the gradient of the score with respect to the distribution's parameters.
     fn grad<S: Score>(&self, y: &Array1<f64>, _score: S, natural: bool) -> Array2<f64>

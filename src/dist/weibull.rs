@@ -3,9 +3,9 @@ use crate::scores::{
     CRPScore, CRPScoreCensored, CensoredScorable, LogScore, LogScoreCensored, Scorable,
     SurvivalData,
 };
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, array};
 use rand::prelude::*;
-use statrs::distribution::{Continuous, ContinuousCDF, Weibull as WeibullDist};
+use statrs::distribution::{Continuous, ContinuousCDF, Gamma as GammaDist, Weibull as WeibullDist};
 use statrs::function::gamma::{digamma, gamma};
 
 /// The Weibull distribution.
@@ -15,41 +15,71 @@ pub struct Weibull {
     pub shape: Array1<f64>,
     /// The scale parameter (lambda).
     pub scale: Array1<f64>,
-    /// The parameters of the distribution, stored as a 2D array.
-    _params: Array2<f64>,
 }
 
 impl Distribution for Weibull {
     fn from_params(params: &Array2<f64>) -> Self {
         let shape = params.column(0).mapv(f64::exp);
         let scale = params.column(1).mapv(f64::exp);
-        Weibull {
-            shape,
-            scale,
-            _params: params.clone(),
-        }
+        Weibull { shape, scale }
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
-        // Simple method of moments estimation for Weibull
-        // This is approximate; proper MLE requires numerical optimization
+        // MLE for Weibull with fixed loc=0, matching scipy.stats.weibull_min.fit(Y, floc=0).
+        // Uses Newton's method on the profile log-likelihood.
         let n = y.len();
         if n == 0 {
             return array![0.0, 0.0];
         }
+        let nf = n as f64;
 
+        // Filter out non-positive values for log computations
+        let log_y: Vec<f64> = y.iter().map(|&v| v.max(1e-300).ln()).collect();
+
+        // Initial estimate using method of moments
         let mean = y.mean().unwrap_or(1.0);
         let var = y.var(0.0);
+        let cv = (var.sqrt() / mean.max(1e-300)).clamp(0.1, 10.0);
+        let mut shape = (1.2 / cv).max(0.1);
 
-        // Coefficient of variation
-        let cv = (var.sqrt() / mean).clamp(0.1, 10.0);
+        // Newton iterations on the MLE equation for shape:
+        // n/k + sum(log(y)) - n * sum(y^k * log(y)) / sum(y^k) = 0
+        for _ in 0..100 {
+            let mut sum_yk: f64 = 0.0;
+            let mut sum_yk_logy: f64 = 0.0;
+            let mut sum_yk_logy2: f64 = 0.0;
+            for i in 0..n {
+                let yi = y[i].max(1e-300);
+                let logy = log_y[i];
+                let yk = yi.powf(shape);
+                sum_yk += yk;
+                sum_yk_logy += yk * logy;
+                sum_yk_logy2 += yk * logy * logy;
+            }
+            let sum_logy: f64 = log_y.iter().sum();
 
-        // Approximate shape from CV (using approximation k ≈ 1.2 / CV)
-        let shape = (1.2 / cv).max(0.1);
+            if sum_yk.abs() < 1e-300 {
+                break;
+            }
 
-        // Scale from mean: mean = scale * Gamma(1 + 1/shape)
-        let gamma_val = gamma(1.0 + 1.0 / shape);
-        let scale = (mean / gamma_val).max(1e-6);
+            let f = nf / shape + sum_logy - nf * sum_yk_logy / sum_yk;
+            let f_prime = -nf / (shape * shape)
+                - nf * (sum_yk_logy2 * sum_yk - sum_yk_logy * sum_yk_logy) / (sum_yk * sum_yk);
+
+            if f_prime.abs() < 1e-15 {
+                break;
+            }
+            let step = f / f_prime;
+            shape -= step;
+            shape = shape.max(1e-10);
+            if step.abs() < 1e-10 {
+                break;
+            }
+        }
+
+        // MLE scale given shape: scale = (sum(y^k) / n)^(1/k)
+        let sum_yk: f64 = y.iter().map(|&v| v.max(1e-300).powf(shape)).sum();
+        let scale = (sum_yk / nf).powf(1.0 / shape).max(1e-300);
 
         array![shape.ln(), scale.ln()]
     }
@@ -68,12 +98,45 @@ impl Distribution for Weibull {
         means
     }
 
-    fn params(&self) -> &Array2<f64> {
-        &self._params
+    fn params(&self) -> Array2<f64> {
+        let n = self.shape.len();
+        let mut p = Array2::zeros((n, 2));
+        p.column_mut(0).assign(&self.shape.mapv(f64::ln));
+        p.column_mut(1).assign(&self.scale.mapv(f64::ln));
+        p
     }
 }
 
 impl RegressionDistn for Weibull {}
+
+impl Weibull {
+    /// Compute CRPS for a single observation with given Weibull parameters.
+    /// Uses the correct formula from scoringRules R package:
+    /// CRPS = y*(2*F(y) - 1) - 2*λ*Γ(1+1/k)*P(1+1/k, (y/λ)^k) + λ*Γ(1+1/k)*(1 - 2^{-1/k})
+    fn crps_single_static(y: f64, k: f64, lam: f64) -> f64 {
+        let z = y / lam;
+        let z_k = z.powf(k);
+
+        // CDF at y: F(y) = 1 - exp(-(y/λ)^k)
+        let f_y = 1.0 - (-z_k).exp();
+
+        // Γ(1 + 1/k)
+        let gamma_term = gamma(1.0 + 1.0 / k);
+
+        // P(1+1/k, (y/λ)^k) = regularized lower incomplete gamma
+        // = CDF of Gamma(shape=1+1/k, rate=1) at (y/λ)^k
+        let p_term = if let Ok(g) = GammaDist::new(1.0 + 1.0 / k, 1.0) {
+            g.cdf(z_k)
+        } else {
+            0.5
+        };
+
+        // 2^{-1/k}
+        let two_pow = 2.0_f64.powf(-1.0 / k);
+
+        y * (2.0 * f_y - 1.0) - 2.0 * lam * gamma_term * p_term + lam * gamma_term * (1.0 - two_pow)
+    }
+}
 
 impl DistributionMethods for Weibull {
     fn mean(&self) -> Array1<f64> {
@@ -187,12 +250,18 @@ impl DistributionMethods for Weibull {
 
 impl Scorable<LogScore> for Weibull {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
+        // Inlined Weibull log-PDF: ln(f) = ln(k) - ln(λ) + (k-1)*ln(y/λ) - (y/λ)^k
+        // score = -ln(f)
         let mut scores = Array1::zeros(y.len());
-        for (i, &y_i) in y.iter().enumerate() {
-            // statrs Weibull uses (shape, scale) parameterization
-            let d = WeibullDist::new(self.shape[i], self.scale[i]).unwrap();
-            scores[i] = -d.ln_pdf(y_i);
-        }
+        ndarray::Zip::from(&mut scores)
+            .and(y)
+            .and(&self.shape)
+            .and(&self.scale)
+            .for_each(|s, &y_i, &k, &lam| {
+                let ratio = y_i / lam;
+                let log_pdf = k.ln() - lam.ln() + (k - 1.0) * ratio.ln() - ratio.powf(k);
+                *s = -log_pdf;
+            });
         scores
     }
 
@@ -200,49 +269,38 @@ impl Scorable<LogScore> for Weibull {
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 2));
 
-        for i in 0..n_obs {
-            let k = self.shape[i];
-            let lam = self.scale[i];
-            let y_i = y[i];
+        ndarray::Zip::from(d_params.rows_mut())
+            .and(y)
+            .and(&self.shape)
+            .and(&self.scale)
+            .for_each(|mut row, &y_i, &k, &lam| {
+                let ratio = y_i / lam;
+                let ratio_k = ratio.powf(k);
+                let shared_term = k * (ratio_k - 1.0);
 
-            // Ratio y/scale
-            let ratio = y_i / lam;
-            let ratio_k = ratio.powf(k);
-
-            // shared_term = k * ((y/scale)^k - 1)
-            let shared_term = k * (ratio_k - 1.0);
-
-            // d/d(log(shape)) = shape * [shared_term * log(y/scale) - 1]
-            // But we parameterize as log(shape), so multiply by shape
-            d_params[[i, 0]] = shared_term * ratio.ln() - 1.0;
-
-            // d/d(log(scale)) = -shared_term
-            d_params[[i, 1]] = -shared_term;
-        }
+                row[0] = shared_term * ratio.ln() - 1.0;
+                row[1] = -shared_term;
+            });
 
         d_params
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Fisher Information Matrix for Weibull (from Python implementation)
-        // Uses Euler's constant gamma ≈ 0.5772156649
-        let euler_gamma = 0.5772156649;
+        // Fisher Information Matrix for Weibull
+        // Pre-compute constants outside the loop
+        const EULER_GAMMA: f64 = 0.5772156649;
+        const PI: f64 = std::f64::consts::PI;
+        const FI_00: f64 = (PI * PI / 6.0) + (1.0 - EULER_GAMMA) * (1.0 - EULER_GAMMA);
+        const ONE_MINUS_GAMMA: f64 = 1.0 - EULER_GAMMA;
+
         let n_obs = self.shape.len();
         let mut fi = Array3::zeros((n_obs, 2, 2));
 
         for i in 0..n_obs {
             let k = self.shape[i];
-
-            // FI[0, 0] = (pi^2 / 6) + (1 - gamma)^2
-            let pi = std::f64::consts::PI;
-            let one_minus_gamma = 1.0 - euler_gamma;
-            fi[[i, 0, 0]] = (pi * pi / 6.0) + (one_minus_gamma * one_minus_gamma);
-
-            // FI[1, 0] = FI[0, 1] = -k * (1 - gamma)
-            fi[[i, 0, 1]] = -k * (1.0 - euler_gamma);
+            fi[[i, 0, 0]] = FI_00;
+            fi[[i, 0, 1]] = -k * ONE_MINUS_GAMMA;
             fi[[i, 1, 0]] = fi[[i, 0, 1]];
-
-            // FI[1, 1] = k^2
             fi[[i, 1, 1]] = k * k;
         }
 
@@ -256,113 +314,92 @@ impl Scorable<LogScore> for Weibull {
 
 impl Scorable<CRPScore> for Weibull {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
-        // CRPS for Weibull distribution
-        // Reference: Gneiting, T., & Raftery, A. E. (2007). Strictly proper scoring rules,
-        // prediction, and estimation. JASA, 102(477), 359-378.
-        //
-        // CRPS = y * (2*F(y) - 1) - λ * Γ(1+1/k) * (2*(1-F(y)) - 1 + 2^(-1/k))
+        // CRPS for Weibull distribution (Jordan et al. 2019, scoringRules R package):
+        // CRPS = y*(2*F(y) - 1) - 2*λ*Γ(1+1/k)*P(1+1/k, (y/λ)^k) + λ*Γ(1+1/k)*(1 - 2^{-1/k})
+        // where P(a, x) = regularized lower incomplete gamma = CDF of Gamma(shape=a, rate=1) at x
         let mut scores = Array1::zeros(y.len());
 
         for i in 0..y.len() {
             let k = self.shape[i];
             let lam = self.scale[i];
-            let y_i = y[i].max(1e-10); // Avoid issues with zero
+            let y_i = y[i].max(1e-10);
 
-            let z = y_i / lam;
-            let z_k = z.powf(k);
-
-            // CDF at y: F(y) = 1 - exp(-(y/λ)^k)
-            let f_y = 1.0 - (-z_k).exp();
-
-            // Gamma(1 + 1/k)
-            let gamma_term = gamma(1.0 + 1.0 / k);
-
-            // 2^(-1/k)
-            let two_pow = 2.0_f64.powf(-1.0 / k);
-
-            // CRPS formula
-            scores[i] =
-                y_i * (2.0 * f_y - 1.0) - lam * gamma_term * (2.0 * (1.0 - f_y) - 1.0 + two_pow);
+            scores[i] = Self::crps_single_static(y_i, k, lam);
         }
         scores
     }
 
     fn d_score(&self, y: &Array1<f64>) -> Array2<f64> {
-        // Gradient of CRPS with respect to log(shape) and log(scale)
+        // Numerical gradient of CRPS using central differences
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 2));
-        let eps = 1e-10;
+        let eps = 1e-5;
 
         for i in 0..n_obs {
             let k = self.shape[i];
             let lam = self.scale[i];
-            let y_i = y[i].max(eps);
+            let y_i = y[i].max(1e-10);
 
-            let z = y_i / lam;
-            let z_k = z.powf(k);
-            let ln_z = z.ln();
+            // Derivative w.r.t. log(shape) via central finite difference
+            let k_plus = k * (1.0 + eps);
+            let k_minus = k * (1.0 - eps);
+            let score_k_plus = Self::crps_single_static(y_i, k_plus, lam);
+            let score_k_minus = Self::crps_single_static(y_i, k_minus, lam);
+            d_params[[i, 0]] = (score_k_plus - score_k_minus) / (2.0 * eps);
 
-            // F(y) = 1 - exp(-z^k)
-            let s_y = (-z_k).exp(); // Survival function S(y) = 1 - F(y)
-
-            // PDF: f(y) = (k/λ) * z^(k-1) * exp(-z^k)
-            let pdf_y = (k / lam) * z.powf(k - 1.0) * s_y;
-
-            // Gamma terms
-            let gamma_term = gamma(1.0 + 1.0 / k);
-            let dgamma_dk = -gamma_term * digamma(1.0 + 1.0 / k) / (k * k);
-
-            // 2^(-1/k) and its derivative
-            let two_pow = 2.0_f64.powf(-1.0 / k);
-            let dtwo_pow_dk = two_pow * 2.0_f64.ln() / (k * k);
-
-            // dF/dk = f(y) * z^k * ln(z)
-            let df_dk = pdf_y * z_k * ln_z / k;
-
-            // dF/dλ = -f(y) * k * z / λ = -pdf_y * k * z / lam
-            let df_dlam = -pdf_y * k * z / lam;
-
-            // dS/dk = -dF/dk, dS/dlam = -dF/dlam
-            let ds_dk = -df_dk;
-            let ds_dlam = -df_dlam;
-
-            // d(CRPS)/d(log k) = k * d(CRPS)/dk
-            // CRPS = y*(2F - 1) - λ*Γ*(2S - 1 + 2^(-1/k))
-            // d(CRPS)/dk = y*2*dF/dk - λ*dΓ/dk*(2S - 1 + 2^(-1/k)) - λ*Γ*(2*dS/dk + d(2^(-1/k))/dk)
-            let dcrps_dk = y_i * 2.0 * df_dk
-                - lam * dgamma_dk * (2.0 * s_y - 1.0 + two_pow)
-                - lam * gamma_term * (2.0 * ds_dk + dtwo_pow_dk);
-            d_params[[i, 0]] = k * dcrps_dk;
-
-            // d(CRPS)/d(log λ) = λ * d(CRPS)/dλ
-            // d(CRPS)/dλ = y*2*dF/dλ - Γ*(2S - 1 + 2^(-1/k)) - λ*Γ*2*dS/dλ
-            let dcrps_dlam = y_i * 2.0 * df_dlam
-                - gamma_term * (2.0 * s_y - 1.0 + two_pow)
-                - lam * gamma_term * 2.0 * ds_dlam;
-            d_params[[i, 1]] = lam * dcrps_dlam;
+            // Derivative w.r.t. log(scale) via central finite difference
+            let lam_plus = lam * (1.0 + eps);
+            let lam_minus = lam * (1.0 - eps);
+            let score_lam_plus = Self::crps_single_static(y_i, k, lam_plus);
+            let score_lam_minus = Self::crps_single_static(y_i, k, lam_minus);
+            d_params[[i, 1]] = (score_lam_plus - score_lam_minus) / (2.0 * eps);
         }
         d_params
     }
 
     fn metric(&self) -> Array3<f64> {
-        // CRPS metric for Weibull
-        // Use an approximation based on the structure from Python
+        // Deterministic quadrature for E[g * g^T].
+        // Uses probability integral transform: u = F(y), y = F^{-1}(u)
+        // so E[h(Y)] = ∫_0^1 h(F^{-1}(u)) du, computed via midpoint rule.
         let n_obs = self.shape.len();
-        let mut fi = Array3::zeros((n_obs, 2, 2));
-        let eps = 1e-10;
-        let sqrt_pi = std::f64::consts::PI.sqrt();
+        let n_params = 2;
+        let n_points = 200;
+        let eps = 1e-5;
+
+        let mut fi = Array3::zeros((n_obs, n_params, n_params));
 
         for i in 0..n_obs {
             let k = self.shape[i];
             let lam = self.scale[i];
-            let gamma_term = gamma(1.0 + 1.0 / k);
 
-            // Approximate metric based on CRPS second moments (from Python)
-            fi[[i, 0, 0]] = (lam * lam * gamma_term * gamma_term / (k * k)) / (2.0 * sqrt_pi) + eps;
-            fi[[i, 1, 1]] = (lam * lam * gamma_term * gamma_term) / (2.0 * sqrt_pi) + eps;
-            fi[[i, 0, 1]] = 0.0;
-            fi[[i, 1, 0]] = 0.0;
+            for j in 0..n_points {
+                let u = (j as f64 + 0.5) / n_points as f64;
+                // Weibull inverse CDF: y = lam * (-ln(1-u))^(1/k)
+                let y_i = lam * (-(1.0 - u).ln()).powf(1.0 / k);
+
+                // Gradient via finite differences
+                let k_plus = k * (1.0 + eps);
+                let k_minus = k * (1.0 - eps);
+                let g0 = (Self::crps_single_static(y_i, k_plus, lam)
+                    - Self::crps_single_static(y_i, k_minus, lam))
+                    / (2.0 * eps);
+
+                let lam_plus = lam * (1.0 + eps);
+                let lam_minus = lam * (1.0 - eps);
+                let g1 = (Self::crps_single_static(y_i, k, lam_plus)
+                    - Self::crps_single_static(y_i, k, lam_minus))
+                    / (2.0 * eps);
+
+                let grads = [g0, g1];
+                for a in 0..n_params {
+                    for b in 0..n_params {
+                        fi[[i, a, b]] += grads[a] * grads[b];
+                    }
+                }
+            }
         }
+
+        fi.mapv_inplace(|x| x / n_points as f64);
         fi
     }
 }
@@ -469,7 +506,7 @@ impl CensoredScorable<CRPScoreCensored> for Weibull {
 
             if e {
                 // Uncensored CRPS (same as regular CRPS)
-                scores[i] = t * (2.0 * f_t - 1.0) - lam * gamma_term * (2.0 * s_t - 1.0 + two_pow);
+                scores[i] = Self::crps_single_static(t, k, lam);
             } else {
                 // Censored CRPS (adapted for right-censoring)
                 // From Python: crps_cens = t*F^2 + 2*λ*Γ*S*F - λ*Γ*2^(-1/k)*(1 - S^2)/2
@@ -508,24 +545,30 @@ impl CensoredScorable<CRPScoreCensored> for Weibull {
             let dtwo_pow_dk = two_pow * 2.0_f64.ln() / (k * k);
 
             // dF/dk and dS/dk
-            let df_dk = pdf_t * z_k * ln_z / k;
+            // dF/dk = S(t) * z^k * ln(z) = pdf_t * t * ln(z) / k
+            let df_dk = pdf_t * t * ln_z / k;
             let ds_dk = -df_dk;
 
             // dF/dλ and dS/dλ
-            let df_dlam = -pdf_t * k * z / lam;
+            // dF/dλ = -S(t) * k * z^k / λ = -pdf_t * z
+            let df_dlam = -pdf_t * z;
             let ds_dlam = -df_dlam;
 
             if e {
-                // Uncensored derivatives (same as CRPScore)
-                let dcrps_dk = t * 2.0 * df_dk
-                    - lam * dgamma_dk * (2.0 * s_t - 1.0 + two_pow)
-                    - lam * gamma_term * (2.0 * ds_dk + dtwo_pow_dk);
-                d_params[[i, 0]] = k * dcrps_dk;
+                // Uncensored derivatives via central finite differences on correct CRPS
+                let eps = 1e-5;
 
-                let dcrps_dlam = t * 2.0 * df_dlam
-                    - gamma_term * (2.0 * s_t - 1.0 + two_pow)
-                    - lam * gamma_term * 2.0 * ds_dlam;
-                d_params[[i, 1]] = lam * dcrps_dlam;
+                let k_plus = k * (1.0 + eps);
+                let k_minus = k * (1.0 - eps);
+                d_params[[i, 0]] = (Self::crps_single_static(t, k_plus, lam)
+                    - Self::crps_single_static(t, k_minus, lam))
+                    / (2.0 * eps);
+
+                let lam_plus = lam * (1.0 + eps);
+                let lam_minus = lam * (1.0 - eps);
+                d_params[[i, 1]] = (Self::crps_single_static(t, k, lam_plus)
+                    - Self::crps_single_static(t, k, lam_minus))
+                    / (2.0 * eps);
             } else {
                 // Censored derivatives
                 // crps_cens = t*F^2 + 2*λ*Γ*S*F - λ*Γ*2^(-1/k)*(1 - S^2)/2

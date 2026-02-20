@@ -4,10 +4,10 @@ extern crate accelerate_src;
 // Tests for scoring rules including numerical gradient verification.
 // This mirrors Python's test_score.py to ensure gradient implementations are correct.
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2, Array3};
 use ngboost_rs::dist::{
-    exponential::Exponential, gamma::Gamma, halfnormal::HalfNormal, laplace::Laplace,
-    normal::Normal, poisson::Poisson, weibull::Weibull, Distribution,
+    Distribution, exponential::Exponential, gamma::Gamma, halfnormal::HalfNormal, laplace::Laplace,
+    normal::Normal, poisson::Poisson, weibull::Weibull,
 };
 use ngboost_rs::scores::{CRPScore, LogScore, Scorable};
 
@@ -330,6 +330,136 @@ fn test_natural_gradient_computation() {
              Got: {:?}",
             grad.row(0),
             reconstructed
+        );
+    }
+}
+
+/// Verify that the diagonal fast path (element-wise division) produces
+/// the same results as the full LU solve for distributions with diagonal metrics.
+/// This is a critical correctness test for the optimization in scores/mod.rs.
+#[test]
+fn test_diagonal_fast_path_matches_lu_solve() {
+    use ngboost_rs::scores::natural_gradient_regularized;
+
+    // Helper: for a given grad and diagonal metric, compare diagonal division vs LU solve
+    fn verify_diagonal_matches_lu(name: &str, grad: &Array2<f64>, metric: &Array3<f64>) {
+        // Method 1: Full LU solve (the reference, always correct)
+        let lu_result = natural_gradient_regularized(grad, metric, 0.0);
+
+        // Method 2: Diagonal element-wise division (the fast path)
+        let n_params = grad.ncols();
+        let mut diag_result = Array2::zeros(grad.raw_dim());
+        for j in 0..n_params {
+            for i in 0..grad.nrows() {
+                diag_result[[i, j]] = grad[[i, j]] / metric[[i, j, j]];
+            }
+        }
+
+        // Compare
+        for i in 0..grad.nrows() {
+            for j in 0..n_params {
+                let diff = (lu_result[[i, j]] - diag_result[[i, j]]).abs();
+                let scale = lu_result[[i, j]].abs().max(1.0);
+                assert!(
+                    diff / scale < 1e-10,
+                    "{}: mismatch at [{},{}]: LU={}, diag={}, diff={}",
+                    name,
+                    i,
+                    j,
+                    lu_result[[i, j]],
+                    diag_result[[i, j]],
+                    diff
+                );
+            }
+        }
+    }
+
+    // Test Normal LogScore (2-param, diagonal FI = diag(1/var, 2))
+    {
+        let params = Array2::from_shape_vec(
+            (5, 2),
+            vec![0.0, 0.0, 1.0, 0.5, -1.0, 1.0, 2.0, -0.5, 0.5, 0.3],
+        )
+        .unwrap();
+        let dist = Normal::from_params(&params);
+        let y = Array1::from_vec(vec![0.5, 1.5, -0.5, 2.5, 0.0]);
+        let grad = Scorable::<LogScore>::d_score(&dist, &y);
+        let metric = Scorable::<LogScore>::metric(&dist);
+        assert!(Scorable::<LogScore>::is_diagonal_metric(&dist));
+        verify_diagonal_matches_lu("Normal/LogScore", &grad, &metric);
+    }
+
+    // Test Normal CRPScore
+    {
+        let params = Array2::from_shape_vec((3, 2), vec![0.0, 0.0, 1.0, 0.5, -1.0, 1.0]).unwrap();
+        let dist = Normal::from_params(&params);
+        let y = Array1::from_vec(vec![0.5, 1.5, -0.5]);
+        let grad = Scorable::<CRPScore>::d_score(&dist, &y);
+        let metric = Scorable::<CRPScore>::metric(&dist);
+        assert!(Scorable::<CRPScore>::is_diagonal_metric(&dist));
+        verify_diagonal_matches_lu("Normal/CRPScore", &grad, &metric);
+    }
+
+    // Test Laplace LogScore (2-param, diagonal FI = diag(1/scale^2, 1))
+    {
+        let params = Array2::from_shape_vec((3, 2), vec![0.0, 0.0, 1.0, 0.5, -1.0, 1.0]).unwrap();
+        let dist = Laplace::from_params(&params);
+        let y = Array1::from_vec(vec![0.5, 1.5, -0.5]);
+        let grad = Scorable::<LogScore>::d_score(&dist, &y);
+        let metric = Scorable::<LogScore>::metric(&dist);
+        assert!(Scorable::<LogScore>::is_diagonal_metric(&dist));
+        verify_diagonal_matches_lu("Laplace/LogScore", &grad, &metric);
+    }
+
+    // Test Exponential LogScore (1-param, FI = [[1]])
+    {
+        let params = Array2::from_shape_vec((3, 1), vec![0.0, 0.5, 1.0]).unwrap();
+        let dist = Exponential::from_params(&params);
+        let y = Array1::from_vec(vec![0.5, 1.5, 2.5]);
+        let grad = Scorable::<LogScore>::d_score(&dist, &y);
+        let metric = Scorable::<LogScore>::metric(&dist);
+        assert!(Scorable::<LogScore>::is_diagonal_metric(&dist));
+        verify_diagonal_matches_lu("Exponential/LogScore", &grad, &metric);
+    }
+
+    // Test Poisson LogScore (1-param, FI = [[rate]])
+    {
+        let params =
+            Array2::from_shape_vec((3, 1), vec![1.0_f64.ln(), 3.0_f64.ln(), 5.0_f64.ln()]).unwrap();
+        let dist = Poisson::from_params(&params);
+        let y = Array1::from_vec(vec![1.0, 3.0, 5.0]);
+        let grad = Scorable::<LogScore>::d_score(&dist, &y);
+        let metric = Scorable::<LogScore>::metric(&dist);
+        assert!(Scorable::<LogScore>::is_diagonal_metric(&dist));
+        verify_diagonal_matches_lu("Poisson/LogScore", &grad, &metric);
+    }
+
+    // Test HalfNormal LogScore (1-param, FI = [[2]])
+    {
+        let params = Array2::from_shape_vec((3, 1), vec![0.0, 0.5, 1.0]).unwrap();
+        let dist = HalfNormal::from_params(&params);
+        let y = Array1::from_vec(vec![0.5, 1.5, 2.5]);
+        let grad = Scorable::<LogScore>::d_score(&dist, &y);
+        let metric = Scorable::<LogScore>::metric(&dist);
+        assert!(Scorable::<LogScore>::is_diagonal_metric(&dist));
+        verify_diagonal_matches_lu("HalfNormal/LogScore", &grad, &metric);
+    }
+
+    // Verify non-diagonal distributions correctly return false
+    {
+        let params = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+        let dist = Gamma::from_params(&params);
+        assert!(
+            !Scorable::<LogScore>::is_diagonal_metric(&dist),
+            "Gamma should NOT be diagonal"
+        );
+    }
+    {
+        let params = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+        let dist = Weibull::from_params(&params);
+        assert!(
+            !Scorable::<LogScore>::is_diagonal_metric(&dist),
+            "Weibull should NOT be diagonal"
         );
     }
 }

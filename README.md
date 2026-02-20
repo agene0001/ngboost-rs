@@ -24,31 +24,36 @@ This library relies on a BLAS/LAPACK backend for matrix operations. To ensure cr
 Choose the configuration that matches your operating system and hardware.
 
 #### macOS (Accelerate - Recommended)
-Uses Apple's native Accelerate framework.
+Uses Apple's native Accelerate framework. No additional setup required.
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["accelerate"] }
-ndarray = "0.15"
 ```
 
 #### Linux (OpenBLAS)
-First, install OpenBLAS via your package manager (e.g., `apt install libopenblas-dev`).
+Install OpenBLAS via your package manager:
+```bash
+# Ubuntu/Debian
+sudo apt install libopenblas-dev
+
+# Fedora
+sudo dnf install openblas-devel
+
+# Arch
+sudo pacman -S openblas
+```
+
 Then in `Cargo.toml`:
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["openblas"] }
-ndarray = "0.15"
 ```
 
 #### Windows
 
-On Windows, you have two main options:
-
----
-
 **Option 1: Intel MKL (Recommended)**
 
-Intel MKL is the easiest option for Windows - it downloads pre-built binaries automatically and works on both Intel and AMD processors.
+Intel MKL is the easiest option for Windows. It downloads pre-built binaries automatically and works on both Intel and AMD processors.
 ```toml
 [dependencies]
 ngboost-rs = { version = "0.1", features = ["intel-mkl"] }
@@ -56,13 +61,13 @@ ngboost-rs = { version = "0.1", features = ["intel-mkl"] }
 
 That's it! No additional setup required.
 
-> **Note for AMD users**: Intel MKL works fine on AMD processors. Intel removed the artificial slowdown years ago, so performance is good on modern AMD CPUs.
+> **Note for AMD users**: Intel MKL works fine on AMD processors. Intel removed artificial performance limitations years ago, so performance is good on modern AMD CPUs.
 
 ---
 
 **Option 2: OpenBLAS via vcpkg**
 
-If you prefer OpenBLAS, you'll need to install both OpenBLAS and LAPACK via vcpkg. This requires more setup but avoids the Intel dependency.
+If you prefer OpenBLAS, you'll need to install it via vcpkg. This requires more setup but avoids the Intel dependency.
 
 ##### Step 1: Install vcpkg
 
@@ -75,21 +80,16 @@ cd C:\vcpkg
 # Bootstrap vcpkg
 .\bootstrap-vcpkg.bat
 
-# Integrate with your system (enables automatic library detection)
+# Integrate with your system
 .\vcpkg integrate install
 ```
 
-##### Step 2: Install OpenBLAS and LAPACK
+##### Step 2: Install LAPACK (includes BLAS)
 ```powershell
-# Install OpenBLAS (provides BLAS functions)
-vcpkg install openblas:x64-windows
-
-# Install LAPACK (provides linear algebra functions like matrix decomposition)
-# This is required - OpenBLAS alone doesn't include LAPACK on Windows
 vcpkg install lapack-reference:x64-windows
 ```
 
-> **Note**: The `lapack-reference` package may take 20-40 minutes to build as it compiles Fortran code from source.
+> **Note**: This may take 20-40 minutes to build as it compiles Fortran code from source.
 
 ##### Step 3: Set Environment Variables
 ```powershell
@@ -120,21 +120,19 @@ ngboost-rs = { version = "0.1", features = ["openblas"] }
 
 If you get linker errors like `unresolved external symbol cblas_dgemm` or `unresolved external symbol sgetrf_`:
 
-1. **Missing LAPACK**: Make sure you installed `lapack-reference:x64-windows`, not just `openblas:x64-windows`
-
-2. **Verify installation**:
+1. **Verify installation**:
 ```powershell
    dir C:\vcpkg\installed\x64-windows\lib\*.lib
 ```
-You should see both `openblas.lib` and `lapack.lib` (or similar)
+You should see `blas.lib` and `lapack.lib` (or similar).
 
-3. **Check environment variables**:
+2. **Check environment variables**:
 ```powershell
    echo $env:OPENBLAS_PATH
    echo $env:OPENBLAS_LIB_DIR
 ```
 
-4. **Clean rebuild**:
+3. **Clean rebuild**:
 ```powershell
    cargo clean
    cargo build
@@ -267,16 +265,17 @@ for i in 0..n_samples {
 Run the examples to see NGBoost in action:
 ```bash
 # Basic regression
-cargo run --example regression
+cargo run --example regression --features accelerate  # macOS
+cargo run --example regression --features intel-mkl   # Windows
 
 # Binary classification
-cargo run --example classification
+cargo run --example classification --features intel-mkl
 
 # Comparing different distributions
-cargo run --example distributions
+cargo run --example distributions --features intel-mkl
 
 # Uncertainty quantification
-cargo run --example uncertainty
+cargo run --example uncertainty --features intel-mkl
 ```
 
 ## API Reference
@@ -329,14 +328,14 @@ pub trait Distribution: Sized + Clone + Debug {
 2. **Number of Estimators**: More is usually better, but watch for overfitting
 3. **Distribution Choice**: Match the distribution to your data characteristics
 4. **Natural Gradient**: Enabled by default, provides faster convergence
-5. **Release Mode**: Always use `cargo build --release` for production - it's significantly faster
+5. **Release Mode**: Always use `cargo build --release` for production - significantly faster
 
 ### Building for Performance
 
-For best performance, always compile in release mode:
+Always compile in release mode for best performance:
 ```bash
 cargo build --release
-cargo run --release --example regression --features accelerate
+cargo run --release --example regression --features intel-mkl
 ```
 
 The release profile includes:
@@ -351,14 +350,14 @@ This Rust implementation aims to be compatible with the [Python NGBoost library]
 
 | Feature | Python | Rust |
 |---------|--------|------|
-| Core Algorithm | Yes | Yes |
-| Natural Gradient | Yes | Yes |
-| LogScore | Yes | Yes |
-| CRPScore | Yes | Yes (Normal, Laplace) |
+| Core Algorithm | ✅ | ✅ |
+| Natural Gradient | ✅ | ✅ |
+| LogScore | ✅ | ✅ |
+| CRPScore | ✅ | ✅ (Normal, Laplace) |
 | Regression Distributions | 16 | 16 |
-| Classification | Yes | Yes |
-| Survival/Censoring | Yes | Not yet |
-| Scikit-learn Integration | Yes | N/A |
+| Classification | ✅ | ✅ |
+| Survival/Censoring | ✅ | Not yet |
+| Scikit-learn Integration | ✅ | N/A |
 
 ### Distribution Parity
 
