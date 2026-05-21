@@ -1,6 +1,7 @@
 pub mod api;
 pub mod dist;
 pub mod evaluation;
+pub mod hyper_opt;
 pub mod learners;
 pub mod ngboost;
 pub mod scores;
