@@ -516,6 +516,10 @@ const CV_EARLY_STOPPING_ROUNDS: u32 = 50;
 /// it against the held-out fold, and returns `(mean_score, was_pruned,
 /// per_fold_scores)`. Pruning is consulted after every fold against the
 /// running mean.
+///
+/// `n_folds <= 1` runs a single 80/20 holdout instead — train on the first
+/// 80%, score on the last 20% — a single fit with no cross-fold pruning. Much
+/// cheaper than k-fold and equivalent to a plain train/val split for HPO.
 fn cv_with_pruning<D, S, B, F>(
     features: &Array2<f64>,
     labels: &Array1<f64>,
@@ -534,16 +538,21 @@ where
     F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B>,
 {
     let n_samples = features.nrows();
-    let fold_size = n_samples / n_folds.max(1);
-    let mut fold_scores = Vec::with_capacity(n_folds);
+    // `n_folds <= 1` ⇒ single 80/20 holdout (one iteration); otherwise k-fold.
+    let single_holdout = n_folds <= 1;
+    let n_iters = if single_holdout { 1 } else { n_folds };
+    let fold_size = n_samples / n_iters;
+    let mut fold_scores = Vec::with_capacity(n_iters);
     let mut pruned = false;
 
-    for i in 0..n_folds {
-        let test_start = i * fold_size;
-        let test_end = if i == n_folds - 1 {
-            n_samples
+    for i in 0..n_iters {
+        let (test_start, test_end) = if single_holdout {
+            // Last 20% is the held-out validation/scoring fold.
+            (((n_samples as f64) * 0.8) as usize, n_samples)
+        } else if i == n_iters - 1 {
+            (i * fold_size, n_samples)
         } else {
-            (i + 1) * fold_size
+            (i * fold_size, (i + 1) * fold_size)
         };
 
         let test_features = features.slice(s![test_start..test_end, ..]).to_owned();
@@ -604,11 +613,16 @@ where
 
         fold_scores.push(score);
 
-        let running_mean =
-            fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
-        if pruner_state.should_prune(pruning_strategy, i, running_mean, n_completed_trials) {
-            pruned = true;
-            break;
+        // Pruning is meaningless with a single holdout — there are no further
+        // folds to skip.
+        if !single_holdout {
+            let running_mean =
+                fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+            if pruner_state.should_prune(pruning_strategy, i, running_mean, n_completed_trials)
+            {
+                pruned = true;
+                break;
+            }
         }
     }
 
