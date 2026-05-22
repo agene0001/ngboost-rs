@@ -507,6 +507,11 @@ where
 // Cross-validation
 // ============================================================================
 
+/// Early-stopping patience used for CV fold fits when the builder didn't set
+/// one. A fold model that stops improving for this many rounds halts instead of
+/// grinding through every sampled `n_estimators` — the dominant CV speedup.
+const CV_EARLY_STOPPING_ROUNDS: u32 = 50;
+
 /// Sequentially fits a fresh `NGBoost` on each (k-1)/k slice of the data, scores
 /// it against the held-out fold, and returns `(mean_score, was_pruned,
 /// per_fold_scores)`. Pruning is consulted after every fold against the
@@ -571,7 +576,26 @@ where
         // trial indices still get distinct fold-level randomness.
         model.set_random_state(trial_seed.wrapping_add(i as u64));
 
-        let score = if model.fit(&train_features, &train_labels).is_err() {
+        // Early stopping during CV: monitor the held-out fold so a trial whose
+        // model converges well before its sampled `n_estimators` stops there
+        // instead of running every boosting round. Respect a builder-set value
+        // if one was provided. Using the same fold for both early-stopping and
+        // scoring makes each trial's score mildly optimistic, but consistently
+        // so across trials — TPE ranking (the only thing that matters here) is
+        // unaffected.
+        if model.early_stopping_rounds.is_none() {
+            model.early_stopping_rounds = Some(CV_EARLY_STOPPING_ROUNDS);
+        }
+
+        let fit_result = model.fit_with_validation(
+            &train_features,
+            &train_labels,
+            Some(&test_features),
+            Some(&test_labels),
+            None,
+            None,
+        );
+        let score = if fit_result.is_err() {
             f64::INFINITY
         } else {
             let s = model.score(&test_features, &test_labels);
