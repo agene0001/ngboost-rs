@@ -1006,6 +1006,25 @@ where
             }
         }
 
+        // When early stopping is enabled, the final `early_stopping_rounds` trees
+        // were added past the best validation iteration (the patience window).
+        // Trim every per-iteration buffer back to the best iteration so
+        // `predict` / `pred_dist` — and the serialized model used at inference —
+        // reflect the best model rather than the over-fit tail. No-op without
+        // early stopping or validation data (where `best_val_loss_itr` is unset),
+        // or when the best iteration is the last one trained.
+        if self.early_stopping_rounds.is_some() {
+            if let Some(best) = self.best_val_loss_itr {
+                let keep = best + 1;
+                if keep < self.base_models.len() {
+                    self.base_models.truncate(keep);
+                    self.scalings.truncate(keep);
+                    self.effective_learning_rates.truncate(keep);
+                    self.col_idxs.truncate(keep);
+                }
+            }
+        }
+
         Ok(())
     }
 
