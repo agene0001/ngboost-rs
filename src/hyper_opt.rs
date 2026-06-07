@@ -249,6 +249,19 @@ impl PrunerState {
 // Config
 // ============================================================================
 
+/// How cross-validation folds are partitioned during the search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CvScheme {
+    /// Standard k-fold: each fold trains on all other rows. Assumes rows are
+    /// exchangeable (IID) — the correct default for general tabular data.
+    #[default]
+    KFold,
+    /// Forward-chaining (expanding window) for time-ordered data: fold `i` trains
+    /// only on rows strictly before its test segment, so no future row informs a
+    /// prediction of the past. Use when row order encodes time (e.g. time series).
+    TimeSeries,
+}
+
 /// Configuration for `hyper_opt_with_config`.
 #[derive(Debug, Clone)]
 pub struct HyperOptConfig {
@@ -256,6 +269,9 @@ pub struct HyperOptConfig {
     pub n_trials: u32,
     /// Number of cross-validation folds per trial.
     pub n_folds: usize,
+    /// How CV folds are partitioned (`KFold` default; `TimeSeries` for forward
+    /// chaining on time-ordered rows).
+    pub cv_scheme: CvScheme,
     /// Random seed used for CV-fold assignment and for `Trial.seed = seed + i`.
     pub seed: u64,
     /// Separate seed for the TPE samplers; defaults to `seed` if `None`.
@@ -273,6 +289,7 @@ impl Default for HyperOptConfig {
         Self {
             n_trials: 100,
             n_folds: 5,
+            cv_scheme: CvScheme::KFold,
             seed: 42,
             hp_seed: None,
             pruning: PruningStrategy::None,
@@ -408,6 +425,7 @@ where
             features,
             labels,
             config.n_folds,
+            config.cv_scheme,
             &trial_params,
             &builder,
             &config.pruning,
@@ -524,6 +542,7 @@ fn cv_with_pruning<D, S, B, F>(
     features: &Array2<f64>,
     labels: &Array1<f64>,
     n_folds: usize,
+    cv_scheme: CvScheme,
     trial_params: &HashMap<String, Value>,
     builder: &F,
     pruning_strategy: &PruningStrategy,
@@ -542,43 +561,67 @@ where
     let single_holdout = n_folds <= 1;
     let n_iters = if single_holdout { 1 } else { n_folds };
     let fold_size = n_samples / n_iters;
+    // Forward-chaining splits into `n_folds + 1` time segments; disabled when there
+    // are too few rows to segment (falls back to k-fold/holdout behavior).
+    let ts_seg = n_samples / (n_folds + 1);
+    let time_series =
+        matches!(cv_scheme, CvScheme::TimeSeries) && !single_holdout && ts_seg > 0;
     let mut fold_scores = Vec::with_capacity(n_iters);
     let mut pruned = false;
 
     for i in 0..n_iters {
-        let (test_start, test_end) = if single_holdout {
-            // Last 20% is the held-out validation/scoring fold.
-            (((n_samples as f64) * 0.8) as usize, n_samples)
-        } else if i == n_iters - 1 {
-            (i * fold_size, n_samples)
+        // Partition fold `i` into (train, test). `TimeSeries` trains only on rows
+        // strictly before the test segment (no future leakage); `KFold`/holdout
+        // trains on all other rows.
+        let (train_features, train_labels, test_features, test_labels) = if time_series {
+            let train_end = (i + 1) * ts_seg;
+            let test_end = if i == n_iters - 1 {
+                n_samples
+            } else {
+                train_end + ts_seg
+            };
+            (
+                features.slice(s![..train_end, ..]).to_owned(),
+                labels.slice(s![..train_end]).to_owned(),
+                features.slice(s![train_end..test_end, ..]).to_owned(),
+                labels.slice(s![train_end..test_end]).to_owned(),
+            )
         } else {
-            (i * fold_size, (i + 1) * fold_size)
+            let (test_start, test_end) = if single_holdout {
+                // Last 20% is the held-out validation/scoring fold.
+                (((n_samples as f64) * 0.8) as usize, n_samples)
+            } else if i == n_iters - 1 {
+                (i * fold_size, n_samples)
+            } else {
+                (i * fold_size, (i + 1) * fold_size)
+            };
+
+            let test_features = features.slice(s![test_start..test_end, ..]).to_owned();
+            let test_labels = labels.slice(s![test_start..test_end]).to_owned();
+
+            let train_features_1 = features.slice(s![..test_start, ..]);
+            let train_features_2 = features.slice(s![test_end.., ..]);
+            let train_labels_1 = labels.slice(s![..test_start]);
+            let train_labels_2 = labels.slice(s![test_end..]);
+
+            let train_features =
+                match ndarray::concatenate(Axis(0), &[train_features_1, train_features_2]) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        fold_scores.push(f64::INFINITY);
+                        continue;
+                    }
+                };
+            let train_labels =
+                match ndarray::concatenate(Axis(0), &[train_labels_1, train_labels_2]) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        fold_scores.push(f64::INFINITY);
+                        continue;
+                    }
+                };
+            (train_features, train_labels, test_features, test_labels)
         };
-
-        let test_features = features.slice(s![test_start..test_end, ..]).to_owned();
-        let test_labels = labels.slice(s![test_start..test_end]).to_owned();
-
-        let train_features_1 = features.slice(s![..test_start, ..]);
-        let train_features_2 = features.slice(s![test_end.., ..]);
-        let train_labels_1 = labels.slice(s![..test_start]);
-        let train_labels_2 = labels.slice(s![test_end..]);
-
-        let train_features =
-            match ndarray::concatenate(Axis(0), &[train_features_1, train_features_2]) {
-                Ok(f) => f,
-                Err(_) => {
-                    fold_scores.push(f64::INFINITY);
-                    continue;
-                }
-            };
-        let train_labels =
-            match ndarray::concatenate(Axis(0), &[train_labels_1, train_labels_2]) {
-                Ok(l) => l,
-                Err(_) => {
-                    fold_scores.push(f64::INFINITY);
-                    continue;
-                }
-            };
 
         let mut model = builder(trial_params);
         // Override the model's RNG so identical trial_params on different
