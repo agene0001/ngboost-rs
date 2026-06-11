@@ -54,10 +54,13 @@ openblas = ["openblas-src", "ndarray-linalg/openblas-system"]
 # Enable parallel training of base learners
 parallel = ["rayon"]
 # Portable SIMD exp via the `wide` crate for non-macOS hot paths (macOS with
-# `accelerate` always prefers vForce). OPT-IN: benchmark on YOUR machine first
-# with `cargo run --release --example bench_wide` — on Apple Silicon this is
-# ~2.5x SLOWER than scalar libm; on x86-64/AVX2 (Windows/Linux) it is expected
-# to win, but measure before enabling.
+# `accelerate` always prefers vForce). OPT-IN, and on x86-64 it REQUIRES
+# building with `RUSTFLAGS="-C target-cpu=native"` (or +avx2): the default
+# baseline target is SSE2-only, where f64x4 lowers to 2x128-bit and exp runs
+# 0.6-0.8x SLOWER than libm. Measured with AVX2 on x86-64 Windows: exp
+# 1.7-1.9x, ln 3.0-3.5x, max 1 ulp from libm. On Apple Silicon leave this off
+# (NEON is 128-bit; ~0.4x) — vForce covers macOS anyway. Verify on a new
+# machine with `cargo run --release --example bench_wide`.
 simd-math = ["dep:wide"]
 
 [[example]]

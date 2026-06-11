@@ -5,6 +5,11 @@
 //! On macOS:   cargo run --release --features accelerate,simd-math --example bench_wide
 //! On Windows: cargo run --release --features intel-mkl,simd-math --example bench_wide
 //! Enable the `simd-math` feature for real builds ONLY if this reports >1x.
+//!
+//! IMPORTANT (x86-64): set `RUSTFLAGS="-C target-cpu=native"` first, for this
+//! benchmark AND for any real build using simd-math. The default target is
+//! SSE2-only, where f64x4 lowers to 2x128-bit halves and exp measures
+//! 0.6-0.8x (slower than libm); with AVX2 it measures 1.7-1.9x.
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
