@@ -32,6 +32,7 @@ serde_json = "1.0"
 accelerate-src = { version = "0.3.2", optional = true }
 intel-mkl-src = { version = "0.8.1", optional = true }
 openblas-src = { version = "0.10.14", optional = true, features = ["cblas", "lapacke"] }
+wide = { version = "1.5.0", optional = true }
 
 [dev-dependencies]
 ndarray-rand = "0.16.0"
@@ -52,6 +53,12 @@ intel-mkl = ["intel-mkl-src", "ndarray-linalg/intel-mkl-static"]
 openblas = ["openblas-src", "ndarray-linalg/openblas-system"]
 # Enable parallel training of base learners
 parallel = ["rayon"]
+# Portable SIMD exp via the `wide` crate for non-macOS hot paths (macOS with
+# `accelerate` always prefers vForce). OPT-IN: benchmark on YOUR machine first
+# with `cargo run --release --example bench_wide` — on Apple Silicon this is
+# ~2.5x SLOWER than scalar libm; on x86-64/AVX2 (Windows/Linux) it is expected
+# to win, but measure before enabling.
+simd-math = ["dep:wide"]
 
 [[example]]
 name = "regression"
@@ -80,6 +87,11 @@ path = "examples/multiclass.rs"
 [[example]]
 name = "advanced_options"
 path = "examples/advanced_options.rs"
+
+[[example]]
+name = "bench_wide"
+path = "examples/bench_wide.rs"
+required-features = ["simd-math"]
 
 [package.metadata.docs.rs]
 features = ["openblas"]

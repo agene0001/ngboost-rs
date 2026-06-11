@@ -1,10 +1,14 @@
 //! Vectorized transcendental helpers.
 //!
-//! On macOS with the `accelerate` feature, exp over contiguous slices goes
-//! through vForce's `vvexp` (~2× faster than scalar libm at n≥500). vForce is
-//! within 1 ulp of libm `exp` with identical edge-case behavior (overflow at
-//! ±745, denormals, ±inf, NaN) — measured in examples/bench_vforce.rs.
-//! Everywhere else this falls back to scalar libm.
+//! Dispatch priority for exp over contiguous slices:
+//! 1. macOS + `accelerate`: vForce `vvexp` (~2× faster than Apple libm at
+//!    n≥500; within 1 ulp, identical edge cases — examples/bench_vforce.rs).
+//! 2. `simd-math` feature (any platform): the `wide` crate's `f64x4::exp`
+//!    (within 1 ulp in the normal range; exp(x) for x ≲ −745.2 flushes to 0.0
+//!    instead of a denormal — examples/bench_wide.rs). OPT-IN because the win
+//!    is platform-dependent: ~2.5× SLOWER than libm on Apple Silicon, expected
+//!    faster on x86-64/AVX2 (Windows/Linux). Measure with bench_wide first.
+//! 3. Otherwise: scalar libm.
 
 use ndarray::Array1;
 
@@ -22,13 +26,55 @@ mod accel {
     }
 }
 
+#[cfg(feature = "simd-math")]
+mod wide_math {
+    use wide::f64x4;
+
+    /// SIMD exp over a slice via 4-lane chunks, scalar tail.
+    pub fn exp_slice(x: &[f64], out: &mut [f64]) {
+        debug_assert_eq!(x.len(), out.len());
+        let chunks = x.len() / 4 * 4;
+        for i in (0..chunks).step_by(4) {
+            let v = f64x4::from([x[i], x[i + 1], x[i + 2], x[i + 3]]);
+            let e: [f64; 4] = v.exp().into();
+            out[i..i + 4].copy_from_slice(&e);
+        }
+        for i in chunks..x.len() {
+            out[i] = x[i].exp();
+        }
+    }
+}
+
+/// Run the fastest available vectorized exp on a contiguous slice.
+/// Returns false when no vectorized backend is compiled in (caller should
+/// fall back to scalar libm).
+#[inline]
+#[allow(unused_variables)]
+fn exp_slice_fast(x: &[f64], out: &mut [f64]) -> bool {
+    #[cfg(all(feature = "accelerate", target_os = "macos"))]
+    {
+        accel::exp_slice(x, out);
+        return true;
+    }
+    #[cfg(all(
+        feature = "simd-math",
+        not(all(feature = "accelerate", target_os = "macos"))
+    ))]
+    {
+        wide_math::exp_slice(x, out);
+        return true;
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
 /// Elementwise exp of a contiguous array.
 pub(crate) fn exp_array(x: &Array1<f64>) -> Array1<f64> {
-    #[cfg(all(feature = "accelerate", target_os = "macos"))]
     if let Some(xs) = x.as_slice() {
         let mut out = vec![0.0; xs.len()];
-        accel::exp_slice(xs, &mut out);
-        return Array1::from_vec(out);
+        if exp_slice_fast(xs, &mut out) {
+            return Array1::from_vec(out);
+        }
     }
     x.mapv(f64::exp)
 }
@@ -37,18 +83,16 @@ pub(crate) fn exp_array(x: &Array1<f64>) -> Array1<f64> {
 /// params matrix. Gathers to a contiguous buffer first when needed — the copy
 /// is still cheaper than scalar exp.
 pub(crate) fn exp_column(x: &ndarray::ArrayView1<f64>) -> Array1<f64> {
-    #[cfg(all(feature = "accelerate", target_os = "macos"))]
-    {
-        let mut out = vec![0.0; x.len()];
-        if let Some(s) = x.as_slice() {
-            accel::exp_slice(s, &mut out);
-        } else {
-            let xs: Vec<f64> = x.iter().copied().collect();
-            accel::exp_slice(&xs, &mut out);
-        }
+    let mut out = vec![0.0; x.len()];
+    let handled = if let Some(s) = x.as_slice() {
+        exp_slice_fast(s, &mut out)
+    } else {
+        let xs: Vec<f64> = x.iter().copied().collect();
+        exp_slice_fast(&xs, &mut out)
+    };
+    if handled {
         return Array1::from_vec(out);
     }
-    #[allow(unreachable_code)]
     x.mapv(f64::exp)
 }
 
@@ -56,13 +100,7 @@ pub(crate) fn exp_column(x: &ndarray::ArrayView1<f64>) -> Array1<f64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn exp_array_matches_libm_within_1ulp() {
-        let xs = Array1::from_vec(vec![
-            -745.0, -709.0, -10.0, -1.0, -1e-12, 0.0, 1e-12, 0.5, 1.0, 10.0, 709.0, 745.0,
-            f64::NEG_INFINITY, f64::INFINITY,
-        ]);
-        let fast = exp_array(&xs);
+    fn assert_within_1ulp_of_libm(xs: &Array1<f64>, fast: &Array1<f64>) {
         for (&x, &f) in xs.iter().zip(fast.iter()) {
             let s = x.exp();
             if s == f {
@@ -75,5 +113,30 @@ mod tests {
             let ulp = (s.to_bits() as i64).abs_diff(f.to_bits() as i64);
             assert!(ulp <= 1, "exp({x}): {ulp} ulp from libm");
         }
+    }
+
+    fn test_points() -> Array1<f64> {
+        Array1::from_vec(vec![
+            -745.0, -709.0, -10.0, -1.0, -1e-12, 0.0, 1e-12, 0.5, 1.0, 10.0, 709.0, 745.0,
+            f64::NEG_INFINITY, f64::INFINITY,
+        ])
+    }
+
+    #[test]
+    fn exp_array_matches_libm_within_1ulp() {
+        let xs = test_points();
+        assert_within_1ulp_of_libm(&xs, &exp_array(&xs));
+    }
+
+    /// Exercise the `wide` backend directly even on macOS, where the dispatch
+    /// in exp_array would otherwise always pick vForce.
+    #[cfg(feature = "simd-math")]
+    #[test]
+    fn wide_exp_matches_libm_within_1ulp() {
+        let xs = test_points();
+        let v = xs.as_slice().unwrap();
+        let mut out = vec![0.0; v.len()];
+        wide_math::exp_slice(v, &mut out);
+        assert_within_1ulp_of_libm(&xs, &Array1::from_vec(out));
     }
 }
