@@ -188,6 +188,65 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
 
         fi
     }
+
+    /// Closed-form natural gradient via Sherman-Morrison: the Fisher matrix is
+    /// F = D − p̃p̃ᵀ with D = diag(p̃ + reg), p̃ = (p_1..p_{K−1}), so
+    /// (F + reg·I)⁻¹ g = D⁻¹g + u·(p̃ᵀD⁻¹g)/(1 − p̃ᵀu) with u = D⁻¹p̃.
+    /// For reg = 0 this reduces to g/p̃ + 1·(Σg)/p_0. O(K) per row instead of an
+    /// O(K³) LAPACK solve, and never materializes the (n, K−1, K−1) metric.
+    fn dense_natural_grad(&self, y: &Array1<f64>, reg: f64) -> Array2<f64> {
+        let mut grad = Scorable::<LogScore>::d_score(self, y);
+        let n_params = K - 1;
+
+        for i in 0..self.n_obs {
+            // u = D⁻¹p̃, s_ug = p̃ᵀD⁻¹g, s_up = p̃ᵀu
+            let mut s_ug = 0.0;
+            let mut s_up = 0.0;
+            let mut singular = false;
+            for j in 0..n_params {
+                let p_j = self.probs[[j + 1, i]];
+                let d_j = p_j + reg;
+                if d_j == 0.0 {
+                    singular = true;
+                    break;
+                }
+                s_ug += p_j * grad[[i, j]] / d_j;
+                s_up += p_j * p_j / d_j;
+            }
+            let denom = 1.0 - s_up;
+
+            if singular || denom == 0.0 {
+                // Exactly singular (a class probability underflowed to 0):
+                // mirror the generic path, which routes through solve/pinv.
+                let mut fi = Array2::zeros((n_params, n_params));
+                for j in 0..n_params {
+                    let p_j = self.probs[[j + 1, i]];
+                    for k in 0..n_params {
+                        let p_k = self.probs[[k + 1, i]];
+                        fi[[j, k]] = if j == k { p_j * (1.0 - p_j) } else { -p_j * p_k };
+                    }
+                }
+                let g_row = grad.row(i).to_owned();
+                let ng = crate::scores::compute_natural_gradient_single(
+                    &g_row.view(),
+                    &fi.view(),
+                    reg,
+                    n_params,
+                );
+                grad.row_mut(i).assign(&ng);
+                continue;
+            }
+
+            let corr = s_ug / denom;
+            for j in 0..n_params {
+                let p_j = self.probs[[j + 1, i]];
+                let d_j = p_j + reg;
+                grad[[i, j]] = grad[[i, j]] / d_j + (p_j / d_j) * corr;
+            }
+        }
+
+        grad
+    }
 }
 
 impl<const K: usize> Scorable<CRPScore> for Categorical<K> {
@@ -420,5 +479,149 @@ mod tests {
 
         // -log(0.5) ≈ 0.693
         assert_relative_eq!(score[0], 0.5_f64.ln().abs(), epsilon = 1e-6);
+    }
+
+    /// Central finite differences of score w.r.t. each internal parameter (logit).
+    fn finite_diff_d_score<const K: usize, S: crate::scores::Score>(
+        params: &Array2<f64>,
+        y: &Array1<f64>,
+    ) -> Array2<f64>
+    where
+        Categorical<K>: Scorable<S>,
+    {
+        let h = 1e-6;
+        let n_obs = params.nrows();
+        let n_params = params.ncols();
+        let mut fd = Array2::zeros((n_obs, n_params));
+        for j in 0..n_params {
+            let mut plus = params.clone();
+            let mut minus = params.clone();
+            plus.column_mut(j).mapv_inplace(|v| v + h);
+            minus.column_mut(j).mapv_inplace(|v| v - h);
+            let s_plus = Scorable::<S>::score(&Categorical::<K>::from_params(&plus), y);
+            let s_minus = Scorable::<S>::score(&Categorical::<K>::from_params(&minus), y);
+            for i in 0..n_obs {
+                fd[[i, j]] = (s_plus[i] - s_minus[i]) / (2.0 * h);
+            }
+        }
+        fd
+    }
+
+    #[test]
+    fn test_categorical_crps_d_score_matches_finite_diff() {
+        // Asymmetric 3-class logits across several observations, covering each true class
+        let params =
+            Array2::from_shape_vec((3, 2), vec![0.7, -1.2, -0.3, 0.9, 1.5, 0.4]).unwrap();
+        let y = Array1::from_vec(vec![0.0, 1.0, 2.0]);
+        let dist = Categorical::<3>::from_params(&params);
+
+        let analytic = Scorable::<CRPScore>::d_score(&dist, &y);
+        let numeric = finite_diff_d_score::<3, CRPScore>(&params, &y);
+
+        for i in 0..3 {
+            for j in 0..2 {
+                assert_relative_eq!(analytic[[i, j]], numeric[[i, j]], epsilon = 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_categorical_logscore_d_score_matches_finite_diff() {
+        let params =
+            Array2::from_shape_vec((3, 2), vec![0.7, -1.2, -0.3, 0.9, 1.5, 0.4]).unwrap();
+        let y = Array1::from_vec(vec![0.0, 1.0, 2.0]);
+        let dist = Categorical::<3>::from_params(&params);
+
+        let analytic = Scorable::<LogScore>::d_score(&dist, &y);
+        let numeric = finite_diff_d_score::<3, LogScore>(&params, &y);
+
+        for i in 0..3 {
+            for j in 0..2 {
+                assert_relative_eq!(analytic[[i, j]], numeric[[i, j]], epsilon = 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_categorical_sherman_morrison_natural_grad_matches_lapack() {
+        // The closed-form Sherman-Morrison natural gradient must agree with the
+        // generic dense metric + LAPACK solve, including with Tikhonov reg.
+        let params = Array2::from_shape_vec(
+            (4, 4),
+            vec![
+                0.7, -1.2, 0.3, 2.1, //
+                -0.5, 0.9, -2.0, 0.0, //
+                1.5, 0.4, 0.8, -0.9, //
+                0.0, 0.0, 0.0, 0.0,
+            ],
+        )
+        .unwrap();
+        let y = Array1::from_vec(vec![0.0, 2.0, 4.0, 1.0]);
+        let dist = Categorical::<5>::from_params(&params);
+
+        for &reg in &[0.0, 0.1] {
+            let fast = Scorable::<LogScore>::dense_natural_grad(&dist, &y, reg);
+
+            let grad = Scorable::<LogScore>::d_score(&dist, &y);
+            let metric = Scorable::<LogScore>::metric(&dist);
+            let reference = crate::scores::natural_gradient_regularized(&grad, &metric, reg);
+
+            for i in 0..4 {
+                for j in 0..4 {
+                    assert_relative_eq!(
+                        fast[[i, j]],
+                        reference[[i, j]],
+                        epsilon = 1e-9,
+                        max_relative = 1e-9
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_categorical_natural_grad_underflowed_prob() {
+        // A logit of 800 underflows the other classes' probabilities to exactly 0,
+        // making the Fisher matrix singular; the closed form must fall back to the
+        // generic solve/pinv path rather than produce NaN/Inf.
+        let params = Array2::from_shape_vec((1, 2), vec![800.0, 0.0]).unwrap();
+        let y = Array1::from_vec(vec![1.0]);
+        let dist = Categorical::<3>::from_params(&params);
+
+        let fast = Scorable::<LogScore>::dense_natural_grad(&dist, &y, 0.0);
+
+        let grad = Scorable::<LogScore>::d_score(&dist, &y);
+        let metric = Scorable::<LogScore>::metric(&dist);
+        let reference = crate::scores::natural_gradient_regularized(&grad, &metric, 0.0);
+
+        for j in 0..2 {
+            assert_eq!(fast[[0, j]].to_bits(), reference[[0, j]].to_bits());
+        }
+    }
+
+    #[test]
+    fn test_categorical_crps_metric_is_expected_outer_product() {
+        // metric() must equal E_{Y~p}[g(Y) g(Y)^T] with g from the public d_score
+        let params = Array2::from_shape_vec((1, 2), vec![0.7, -1.2]).unwrap();
+        let dist = Categorical::<3>::from_params(&params);
+        let metric = Scorable::<CRPScore>::metric(&dist);
+
+        let mut expected = ndarray::Array2::<f64>::zeros((2, 2));
+        for c in 0..3 {
+            let y = Array1::from_vec(vec![c as f64]);
+            let g = Scorable::<CRPScore>::d_score(&dist, &y);
+            let p_c = dist.probs[[c, 0]];
+            for j in 0..2 {
+                for l in 0..2 {
+                    expected[[j, l]] += p_c * g[[0, j]] * g[[0, l]];
+                }
+            }
+        }
+
+        for j in 0..2 {
+            for l in 0..2 {
+                assert_relative_eq!(metric[[0, j, l]], expected[[j, l]], epsilon = 1e-12);
+            }
+        }
     }
 }

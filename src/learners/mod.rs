@@ -1,6 +1,15 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
+/// Opaque, learner-specific preprocessing of X that can be reused across many
+/// fits on the same X with different targets — exactly the access pattern of
+/// gradient boosting, where every iteration refits trees on the same features.
+/// Built via [`BaseLearner::build_fit_cache`]; consumed by
+/// [`BaseLearner::fit_with_weights_cached`].
+pub trait FitCache: Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 pub trait BaseLearner: Send + Sync {
     fn fit(
         &self,
@@ -16,10 +25,59 @@ pub trait BaseLearner: Send + Sync {
         y: &Array1<f64>,
         sample_weight: Option<&Array1<f64>>,
     ) -> Result<Box<dyn TrainedBaseLearner>, &'static str>;
+
+    /// Build a reusable preprocessing cache for fitting repeatedly on the same
+    /// `x` (e.g. bin edges + binned matrix for histogram trees). Learners that
+    /// don't benefit return `None` (the default), which costs nothing.
+    fn build_fit_cache(&self, _x: &Array2<f64>) -> Option<std::sync::Arc<dyn FitCache>> {
+        None
+    }
+
+    /// Fit using a cache previously built by [`BaseLearner::build_fit_cache`]
+    /// **on the same `x`**. The default ignores the cache and fits normally.
+    fn fit_with_weights_cached(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        _cache: &dyn FitCache,
+    ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
+        self.fit_with_weights(x, y, sample_weight)
+    }
 }
 
 pub trait TrainedBaseLearner: Send + Sync {
     fn predict(&self, x: &Array2<f64>) -> Array1<f64>;
+
+    /// Predict a block of rows given as one contiguous row-major slice
+    /// (`out.len()` rows × `n_cols` columns). When `col_idxs` is given, the
+    /// learner was fit on that column subset: its internal feature index `f`
+    /// refers to full-matrix column `col_idxs[f]`.
+    ///
+    /// Default implementation materializes the (sub)matrix and delegates to
+    /// `predict`; tree learners override this with an allocation-free walk.
+    fn predict_rows(&self, xs: &[f64], n_cols: usize, col_idxs: Option<&[usize]>, out: &mut [f64]) {
+        let n_rows = out.len();
+        let preds = match col_idxs {
+            None => {
+                let x = ndarray::ArrayView2::from_shape((n_rows, n_cols), xs)
+                    .expect("predict_rows: shape mismatch")
+                    .to_owned();
+                self.predict(&x)
+            }
+            Some(idxs) => {
+                let mut sub = Array2::zeros((n_rows, idxs.len()));
+                for r in 0..n_rows {
+                    let row = &xs[r * n_cols..(r + 1) * n_cols];
+                    for (j, &c) in idxs.iter().enumerate() {
+                        sub[[r, j]] = row[c];
+                    }
+                }
+                self.predict(&sub)
+            }
+        };
+        out.copy_from_slice(preds.as_slice().expect("predict output not contiguous"));
+    }
 
     /// Returns feature importances if the learner supports it.
     /// Returns None for learners that don't support feature importances.
@@ -571,43 +629,342 @@ impl BaseLearner for HistogramLearner {
         if x.nrows() == 0 {
             return Err("Cannot fit to empty dataset");
         }
+        let cache = build_histogram_cache(x, self.max_bins);
+        self.fit_from_cache(&cache, y, sample_weight)
+    }
 
-        let n_features = x.ncols();
-        let n_samples = x.nrows();
+    fn build_fit_cache(&self, x: &Array2<f64>) -> Option<std::sync::Arc<dyn FitCache>> {
+        if x.nrows() == 0 {
+            return None;
+        }
+        Some(std::sync::Arc::new(build_histogram_cache(x, self.max_bins)))
+    }
 
-        // Build bin edges for each feature
-        let bin_edges: Vec<Vec<f64>> = (0..n_features)
-            .map(|f| {
-                let col_vec: Vec<f64> = x.column(f).to_vec();
-                compute_bin_edges(&col_vec, self.max_bins)
-            })
-            .collect();
+    fn fit_with_weights_cached(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        cache: &dyn FitCache,
+    ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
+        match cache.as_any().downcast_ref::<HistogramFitCache>() {
+            Some(c) if c.n_rows == x.nrows() && c.n_features == x.ncols() => {
+                self.fit_from_cache(c, y, sample_weight)
+            }
+            // Wrong cache type or stale dims — fall back to the uncached path
+            _ => self.fit_with_weights(x, y, sample_weight),
+        }
+    }
+}
 
-        // Bin the data (convert continuous to discrete bin indices)
-        let binned_x: Vec<Vec<u8>> = (0..n_features)
-            .map(|f| {
-                let col = x.column(f);
-                let edges = &bin_edges[f];
-                col.iter().map(|&v| find_bin(v, edges)).collect()
-            })
-            .collect();
+impl HistogramLearner {
+    fn fit_from_cache(
+        &self,
+        cache: &HistogramFitCache,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+    ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
+        if y.len() != cache.n_rows {
+            return Err("y length does not match cached X");
+        }
 
-        // Build the tree using histograms
-        let indices: Vec<usize> = (0..n_samples).collect();
+        let indices: Vec<u32> = (0..cache.n_rows as u32).collect();
+        let root_hists = FeatureHists::build(cache, &indices, y, sample_weight);
         let root = build_histogram_tree_node(
-            &binned_x,
-            &bin_edges,
+            cache,
             y,
             sample_weight,
-            &indices,
+            indices,
+            root_hists,
             0,
             self.max_depth,
             self.min_samples_split,
             self.min_samples_leaf,
-            self.max_bins,
         );
 
-        Ok(Box::new(TrainedHistogramTree { root, n_features }))
+        Ok(Box::new(TrainedHistogramTree::new(root, cache.n_features)))
+    }
+}
+
+/// Precomputed binning of X for histogram tree fitting: bin edges per feature
+/// plus the row-major binned matrix. Building this is the expensive part
+/// (a sort per feature); reusing it across boosting iterations makes each
+/// subsequent fit O(n·p) instead of O(n·p·log n).
+pub struct HistogramFitCache {
+    bin_edges: Vec<Vec<f64>>,
+    /// Bin of sample i, feature f at `binned[i * n_features + f]` (row-major)
+    binned: Vec<u8>,
+    n_rows: usize,
+    n_features: usize,
+}
+
+impl FitCache for HistogramFitCache {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Compute bin edges and the row-major binned matrix for X.
+fn build_histogram_cache(x: &Array2<f64>, max_bins: usize) -> HistogramFitCache {
+    let n_rows = x.nrows();
+    let n_features = x.ncols();
+
+    let make_edges = |f: usize| {
+        let col_vec: Vec<f64> = x.column(f).to_vec();
+        compute_bin_edges(&col_vec, max_bins)
+    };
+
+    // The per-feature edge computation sorts the column — parallelize for
+    // large workloads, mirroring the presorted exact-tree root sort.
+    let bin_edges: Vec<Vec<f64>> = if n_features >= 4 && n_rows >= 2000 {
+        use rayon::prelude::*;
+        (0..n_features).into_par_iter().map(make_edges).collect()
+    } else {
+        (0..n_features).map(make_edges).collect()
+    };
+
+    // Row-major binned matrix: one cache-friendly row per sample
+    let mut binned = vec![0u8; n_rows * n_features];
+    for i in 0..n_rows {
+        let row = &mut binned[i * n_features..(i + 1) * n_features];
+        for (f, b) in row.iter_mut().enumerate() {
+            *b = find_bin(x[[i, f]], &bin_edges[f]);
+        }
+    }
+
+    HistogramFitCache {
+        bin_edges,
+        binned,
+        n_rows,
+        n_features,
+    }
+}
+
+/// Per-feature histograms for one tree node: weighted count and y-sum per bin,
+/// stored flat as `[feature * n_bins + bin]`.
+struct FeatureHists {
+    count: Vec<f64>,
+    sum: Vec<f64>,
+    n_bins: usize,
+}
+
+impl FeatureHists {
+    /// Build histograms for all features in a single pass over the node's rows
+    /// (row-major binned matrix keeps the inner loop sequential in memory).
+    fn build(
+        cache: &HistogramFitCache,
+        indices: &[u32],
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+    ) -> Self {
+        let p = cache.n_features;
+        // Per-feature bin counts differ; use the max so the flat layout is uniform
+        let n_bins = cache
+            .bin_edges
+            .iter()
+            .map(|e| e.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let mut count = vec![0.0; p * n_bins];
+        let mut sum = vec![0.0; p * n_bins];
+
+        if let Some(weights) = sample_weight {
+            for &i in indices {
+                let i = i as usize;
+                let w = weights[i];
+                let yw = y[i] * w;
+                let row = &cache.binned[i * p..(i + 1) * p];
+                for (f, &b) in row.iter().enumerate() {
+                    let slot = f * n_bins + b as usize;
+                    count[slot] += w;
+                    sum[slot] += yw;
+                }
+            }
+        } else {
+            for &i in indices {
+                let i = i as usize;
+                let yi = y[i];
+                let row = &cache.binned[i * p..(i + 1) * p];
+                for (f, &b) in row.iter().enumerate() {
+                    let slot = f * n_bins + b as usize;
+                    count[slot] += 1.0;
+                    sum[slot] += yi;
+                }
+            }
+        }
+
+        FeatureHists { count, sum, n_bins }
+    }
+
+    /// Sibling-subtraction trick: this node's histograms minus a child's give
+    /// the other child's, without a second data pass.
+    fn subtract(&self, child: &FeatureHists) -> FeatureHists {
+        let count = self
+            .count
+            .iter()
+            .zip(child.count.iter())
+            .map(|(a, b)| (a - b).max(0.0))
+            .collect();
+        let sum = self
+            .sum
+            .iter()
+            .zip(child.sum.iter())
+            .map(|(a, b)| a - b)
+            .collect();
+        FeatureHists {
+            count,
+            sum,
+            n_bins: self.n_bins,
+        }
+    }
+
+    /// Total (count, sum) over all bins of one feature.
+    fn totals(&self, feature: usize) -> (f64, f64) {
+        let base = feature * self.n_bins;
+        let mut c = 0.0;
+        let mut s = 0.0;
+        for b in 0..self.n_bins {
+            c += self.count[base + b];
+            s += self.sum[base + b];
+        }
+        (c, s)
+    }
+}
+
+/// Build a histogram tree node recursively. `hists` are this node's
+/// per-feature histograms; children reuse them via the subtraction trick
+/// (scan only the smaller child, derive the larger by subtraction).
+#[allow(clippy::too_many_arguments)]
+fn build_histogram_tree_node(
+    cache: &HistogramFitCache,
+    y: &Array1<f64>,
+    sample_weight: Option<&Array1<f64>>,
+    indices: Vec<u32>,
+    hists: FeatureHists,
+    depth: usize,
+    max_depth: usize,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+) -> HistTreeNode {
+    let (parent_count, parent_sum) = hists.totals(0);
+    let node_value = if parent_count > 0.0 {
+        parent_sum / parent_count
+    } else {
+        0.0
+    };
+
+    // Check stopping conditions
+    if depth >= max_depth || indices.len() < min_samples_split || parent_count <= 0.0 {
+        return HistTreeNode::Leaf { value: node_value };
+    }
+
+    // Find the best Friedman-MSE split by scanning bin prefix sums per feature
+    let mut best_feature = 0;
+    let mut best_bin: u8 = 0;
+    let mut best_improvement = 0.0;
+    let mut best_threshold_value = 0.0;
+
+    for f in 0..cache.n_features {
+        let n_edges = cache.bin_edges[f].len();
+        if n_edges < 2 {
+            continue; // constant feature — no split possible
+        }
+        let base = f * hists.n_bins;
+        let mut left_count = 0.0;
+        let mut left_sum = 0.0;
+
+        // Candidate split after each bin except the last occupied one
+        for bin in 0..(n_edges - 1) {
+            left_count += hists.count[base + bin];
+            left_sum += hists.sum[base + bin];
+
+            let right_count = parent_count - left_count;
+            let right_sum = parent_sum - left_sum;
+
+            if left_count < min_samples_leaf as f64 || right_count < min_samples_leaf as f64 {
+                continue;
+            }
+            if left_count <= 0.0 || right_count <= 0.0 {
+                continue;
+            }
+
+            let left_mean = left_sum / left_count;
+            let right_mean = right_sum / right_count;
+            let diff = left_mean - right_mean;
+            let improvement = (left_count * right_count / parent_count) * diff * diff;
+
+            if improvement > best_improvement {
+                best_improvement = improvement;
+                best_feature = f;
+                best_bin = (bin + 1) as u8; // split point is just after this bin
+                best_threshold_value = cache.bin_edges[f][bin + 1];
+            }
+        }
+    }
+
+    // If no valid split found
+    if best_improvement <= 0.0 {
+        return HistTreeNode::Leaf { value: node_value };
+    }
+
+    // Partition row ids by bin
+    let p = cache.n_features;
+    let estimated = indices.len() / 2;
+    let mut left_indices = Vec::with_capacity(estimated);
+    let mut right_indices = Vec::with_capacity(estimated);
+    for &i in &indices {
+        if cache.binned[i as usize * p + best_feature] < best_bin {
+            left_indices.push(i);
+        } else {
+            right_indices.push(i);
+        }
+    }
+
+    if left_indices.len() < min_samples_leaf || right_indices.len() < min_samples_leaf {
+        return HistTreeNode::Leaf { value: node_value };
+    }
+
+    // Histogram subtraction: scan the smaller child, derive the larger
+    let (left_hists, right_hists) = if left_indices.len() <= right_indices.len() {
+        let lh = FeatureHists::build(cache, &left_indices, y, sample_weight);
+        let rh = hists.subtract(&lh);
+        (lh, rh)
+    } else {
+        let rh = FeatureHists::build(cache, &right_indices, y, sample_weight);
+        let lh = hists.subtract(&rh);
+        (lh, rh)
+    };
+
+    let left_child = build_histogram_tree_node(
+        cache,
+        y,
+        sample_weight,
+        left_indices,
+        left_hists,
+        depth + 1,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+    );
+    let right_child = build_histogram_tree_node(
+        cache,
+        y,
+        sample_weight,
+        right_indices,
+        right_hists,
+        depth + 1,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+    );
+
+    HistTreeNode::Split {
+        feature_index: best_feature,
+        bin_threshold: best_bin,
+        threshold_value: best_threshold_value,
+        left: Box::new(left_child),
+        right: Box::new(right_child),
     }
 }
 
@@ -651,42 +1008,6 @@ fn find_bin(value: f64, edges: &[f64]) -> u8 {
     match edges.binary_search_by(|e| e.partial_cmp(&value).unwrap()) {
         Ok(i) => i.min(254) as u8,
         Err(i) => (i.saturating_sub(1)).min(254) as u8,
-    }
-}
-
-/// Histogram structure for efficient split finding
-struct Histogram {
-    count: Vec<f64>,  // Count (or sum of weights) per bin
-    sum: Vec<f64>,    // Sum of targets per bin
-    sum_sq: Vec<f64>, // Sum of squared targets per bin (for variance)
-}
-
-impl Histogram {
-    fn new(n_bins: usize) -> Self {
-        Histogram {
-            count: vec![0.0; n_bins],
-            sum: vec![0.0; n_bins],
-            sum_sq: vec![0.0; n_bins],
-        }
-    }
-
-    fn add(&mut self, bin: u8, y: f64, weight: f64) {
-        let b = bin as usize;
-        if b < self.count.len() {
-            self.count[b] += weight;
-            self.sum[b] += y * weight;
-            self.sum_sq[b] += y * y * weight;
-        }
-    }
-
-    #[allow(dead_code)]
-    fn total_count(&self) -> f64 {
-        self.count.iter().sum()
-    }
-
-    #[allow(dead_code)]
-    fn total_sum(&self) -> f64 {
-        self.sum.iter().sum()
     }
 }
 
@@ -745,20 +1066,136 @@ impl HistTreeNode {
     }
 }
 
+/// One node of the flattened prediction tree. Leaves are marked with
+/// `feature == u32::MAX` and carry the leaf value in `threshold_or_value`.
+#[derive(Clone, Copy)]
+struct FlatHistNode {
+    threshold_or_value: f64,
+    feature: u32,
+    left: u32,
+    right: u32,
+}
+
+/// Flatten the boxed tree into a contiguous array (depth-first). A depth-3
+/// tree is ≤15 nodes ≈ 360 bytes, so traversal stays in L1 instead of
+/// pointer-chasing heap-allocated `Box`es per row.
+fn flatten_hist_tree(root: &HistTreeNode) -> Vec<FlatHistNode> {
+    fn push(nodes: &mut Vec<FlatHistNode>, n: &HistTreeNode) -> u32 {
+        let idx = nodes.len() as u32;
+        match n {
+            HistTreeNode::Leaf { value } => {
+                nodes.push(FlatHistNode {
+                    threshold_or_value: *value,
+                    feature: u32::MAX,
+                    left: 0,
+                    right: 0,
+                });
+            }
+            HistTreeNode::Split {
+                feature_index,
+                threshold_value,
+                left,
+                right,
+                ..
+            } => {
+                nodes.push(FlatHistNode {
+                    threshold_or_value: *threshold_value,
+                    feature: *feature_index as u32,
+                    left: 0,
+                    right: 0,
+                });
+                let l = push(nodes, left);
+                let r = push(nodes, right);
+                nodes[idx as usize].left = l;
+                nodes[idx as usize].right = r;
+            }
+        }
+        idx
+    }
+    let mut nodes = Vec::new();
+    push(&mut nodes, root);
+    nodes
+}
+
+#[inline]
+fn predict_row_flat(nodes: &[FlatHistNode], row: &[f64]) -> f64 {
+    let mut idx = 0usize;
+    loop {
+        let n = nodes[idx];
+        if n.feature == u32::MAX {
+            return n.threshold_or_value;
+        }
+        idx = if row[n.feature as usize] < n.threshold_or_value {
+            n.left as usize
+        } else {
+            n.right as usize
+        };
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TrainedHistogramTree {
     pub root: HistTreeNode,
     pub n_features: usize,
+    /// Flattened copy of `root` for fast prediction. Built lazily so models
+    /// serialized before this field existed still deserialize and predict.
+    #[serde(skip)]
+    flat: std::sync::OnceLock<Vec<FlatHistNode>>,
+}
+
+impl TrainedHistogramTree {
+    pub fn new(root: HistTreeNode, n_features: usize) -> Self {
+        TrainedHistogramTree {
+            root,
+            n_features,
+            flat: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 impl TrainedBaseLearner for TrainedHistogramTree {
     #[inline]
     fn predict(&self, x: &Array2<f64>) -> Array1<f64> {
-        let mut predictions = Array1::zeros(x.nrows());
-        for i in 0..x.nrows() {
-            predictions[i] = self.root.predict_row(x, i);
+        let nodes = self.flat.get_or_init(|| flatten_hist_tree(&self.root));
+        let p = x.ncols();
+        if let Some(xs) = x.as_slice() {
+            // Row-major contiguous: traverse each row as a plain slice
+            Array1::from_iter(xs.chunks_exact(p).map(|row| predict_row_flat(nodes, row)))
+        } else {
+            let mut predictions = Array1::zeros(x.nrows());
+            for i in 0..x.nrows() {
+                predictions[i] = self.root.predict_row(x, i);
+            }
+            predictions
         }
-        predictions
+    }
+
+    fn predict_rows(&self, xs: &[f64], n_cols: usize, col_idxs: Option<&[usize]>, out: &mut [f64]) {
+        let nodes = self.flat.get_or_init(|| flatten_hist_tree(&self.root));
+        match col_idxs {
+            None => {
+                for (o, row) in out.iter_mut().zip(xs.chunks_exact(n_cols)) {
+                    *o = predict_row_flat(nodes, row);
+                }
+            }
+            Some(idxs) => {
+                for (o, row) in out.iter_mut().zip(xs.chunks_exact(n_cols)) {
+                    // Walk with the feature index remapped through col_idxs
+                    let mut idx = 0usize;
+                    *o = loop {
+                        let n = nodes[idx];
+                        if n.feature == u32::MAX {
+                            break n.threshold_or_value;
+                        }
+                        idx = if row[idxs[n.feature as usize]] < n.threshold_or_value {
+                            n.left as usize
+                        } else {
+                            n.right as usize
+                        };
+                    };
+                }
+            }
+        }
     }
 
     fn split_features(&self) -> Option<Vec<usize>> {
@@ -789,214 +1226,6 @@ impl TrainedBaseLearner for TrainedHistogramTree {
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
         Some(SerializableTrainedLearner::HistogramTree(self.clone()))
     }
-}
-
-/// Build histogram tree node recursively
-fn build_histogram_tree_node(
-    binned_x: &[Vec<u8>],
-    bin_edges: &[Vec<f64>],
-    y: &Array1<f64>,
-    sample_weight: Option<&Array1<f64>>,
-    indices: &[usize],
-    depth: usize,
-    max_depth: usize,
-    min_samples_split: usize,
-    min_samples_leaf: usize,
-    max_bins: usize,
-) -> HistTreeNode {
-    // Calculate weighted mean for this node
-    let node_value = if let Some(weights) = sample_weight {
-        let mut sum = 0.0;
-        let mut weight_sum = 0.0;
-        for &i in indices {
-            sum += y[i] * weights[i];
-            weight_sum += weights[i];
-        }
-        if weight_sum > 0.0 {
-            sum / weight_sum
-        } else {
-            0.0
-        }
-    } else {
-        let sum: f64 = indices.iter().map(|&i| y[i]).sum();
-        sum / indices.len() as f64
-    };
-
-    // Check stopping conditions
-    if depth >= max_depth || indices.len() < min_samples_split {
-        return HistTreeNode::Leaf { value: node_value };
-    }
-
-    // Find best split using histograms
-    let (best_feature, best_bin, best_improvement, best_threshold_value) =
-        find_best_histogram_split(
-            binned_x,
-            bin_edges,
-            y,
-            sample_weight,
-            indices,
-            min_samples_leaf,
-            max_bins,
-        );
-
-    // If no valid split found
-    if best_improvement <= 0.0 {
-        return HistTreeNode::Leaf { value: node_value };
-    }
-
-    // Partition indices - pre-allocate with estimated capacity
-    let estimated_size = indices.len() / 2;
-    let mut left_indices = Vec::with_capacity(estimated_size);
-    let mut right_indices = Vec::with_capacity(estimated_size);
-    for &i in indices {
-        if binned_x[best_feature][i] < best_bin {
-            left_indices.push(i);
-        } else {
-            right_indices.push(i);
-        }
-    }
-
-    // Check min_samples_leaf
-    if left_indices.len() < min_samples_leaf || right_indices.len() < min_samples_leaf {
-        return HistTreeNode::Leaf { value: node_value };
-    }
-
-    // Recursively build children
-    let left_child = build_histogram_tree_node(
-        binned_x,
-        bin_edges,
-        y,
-        sample_weight,
-        &left_indices,
-        depth + 1,
-        max_depth,
-        min_samples_split,
-        min_samples_leaf,
-        max_bins,
-    );
-    let right_child = build_histogram_tree_node(
-        binned_x,
-        bin_edges,
-        y,
-        sample_weight,
-        &right_indices,
-        depth + 1,
-        max_depth,
-        min_samples_split,
-        min_samples_leaf,
-        max_bins,
-    );
-
-    HistTreeNode::Split {
-        feature_index: best_feature,
-        bin_threshold: best_bin,
-        threshold_value: best_threshold_value,
-        left: Box::new(left_child),
-        right: Box::new(right_child),
-    }
-}
-
-/// Find best split using histogram-based approach
-fn find_best_histogram_split(
-    binned_x: &[Vec<u8>],
-    bin_edges: &[Vec<f64>],
-    y: &Array1<f64>,
-    sample_weight: Option<&Array1<f64>>,
-    indices: &[usize],
-    min_samples_leaf: usize,
-    max_bins: usize,
-) -> (usize, u8, f64, f64) {
-    let n_features = binned_x.len();
-    let mut best_feature = 0;
-    let mut best_bin: u8 = 0;
-    let mut best_improvement = 0.0;
-    let mut best_threshold_value = 0.0;
-
-    // Calculate parent statistics
-    let (parent_sum, parent_count) = if let Some(weights) = sample_weight {
-        let mut sum = 0.0;
-        let mut count = 0.0;
-        for &i in indices {
-            sum += y[i] * weights[i];
-            count += weights[i];
-        }
-        (sum, count)
-    } else {
-        let sum: f64 = indices.iter().map(|&i| y[i]).sum();
-        (sum, indices.len() as f64)
-    };
-
-    if parent_count == 0.0 {
-        return (
-            best_feature,
-            best_bin,
-            best_improvement,
-            best_threshold_value,
-        );
-    }
-
-    let _parent_mean = parent_sum / parent_count;
-
-    for feature_index in 0..n_features {
-        // Build histogram for this feature
-        let mut hist = Histogram::new(max_bins);
-        for &i in indices {
-            let bin = binned_x[feature_index][i];
-            let weight = sample_weight.map_or(1.0, |w| w[i]);
-            hist.add(bin, y[i], weight);
-        }
-
-        // Scan through bins to find best split
-        let mut left_count = 0.0;
-        let mut left_sum = 0.0;
-
-        for bin in 0..(max_bins - 1) as u8 {
-            left_count += hist.count[bin as usize];
-            left_sum += hist.sum[bin as usize];
-
-            let right_count = parent_count - left_count;
-            let right_sum = parent_sum - left_sum;
-
-            // Check min_samples_leaf (approximate with counts)
-            if left_count < min_samples_leaf as f64 || right_count < min_samples_leaf as f64 {
-                continue;
-            }
-
-            if left_count <= 0.0 || right_count <= 0.0 {
-                continue;
-            }
-
-            let left_mean = left_sum / left_count;
-            let right_mean = right_sum / right_count;
-
-            // Friedman MSE improvement
-            let improvement =
-                (left_count * right_count / parent_count) * (left_mean - right_mean).powi(2);
-
-            if improvement > best_improvement {
-                best_improvement = improvement;
-                best_feature = feature_index;
-                best_bin = bin + 1; // Split point is just after this bin
-
-                // Get actual threshold value from bin edges
-                let edges = &bin_edges[feature_index];
-                best_threshold_value = if (best_bin as usize) < edges.len() {
-                    edges[best_bin as usize]
-                } else if !edges.is_empty() {
-                    edges[edges.len() - 1]
-                } else {
-                    0.0
-                };
-            }
-        }
-    }
-
-    (
-        best_feature,
-        best_bin,
-        best_improvement,
-        best_threshold_value,
-    )
 }
 
 /// Returns the default histogram learner (faster alternative to DecisionTreeLearner)
@@ -1059,25 +1288,190 @@ impl BaseLearner for DecisionTreeLearner {
             return Err("Cannot fit to empty dataset");
         }
 
-        let indices: Vec<usize> = (0..x.nrows()).collect();
-        // Pre-allocate sort buffer once — reused across all recursive calls
-        let mut sort_buf: Vec<(f64, usize)> = Vec::with_capacity(x.nrows());
-        let root = build_tree_node(
-            x,
-            y,
+        // Presort each feature once at the root; child nodes inherit sorted
+        // order via stable partition instead of re-sorting (sklearn-style).
+        let sorted_features = build_presorted_features(x, y);
+        let mut goes_left = vec![false; x.nrows()];
+        let root = build_tree_node_presorted(
             sample_weight,
-            &indices,
+            sorted_features,
             0,
             self.max_depth,
             self.min_samples_split,
             self.min_samples_leaf,
-            &mut sort_buf,
+            &mut goes_left,
         );
 
         Ok(Box::new(TrainedDecisionTree {
             root,
             n_features: x.ncols(),
         }))
+    }
+}
+
+/// One row's entry in a feature's presorted list.
+///
+/// The response `y` is stored inline so split scans stream this array
+/// sequentially instead of gathering `y[row]` from random memory — the gather
+/// is a full cache-line fetch per element once y falls out of cache, and it
+/// blocks vectorization of the scan. The feature value is f32 (sklearn
+/// quantization, halves value bytes); `row` is kept for partitioning and
+/// sample-weight lookups. 16 bytes, 8-aligned.
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct SortedEntry {
+    pub y: f64,
+    pub val: f32,
+    pub row: u32,
+}
+
+/// Build per-feature entry lists sorted ascending by feature value.
+/// Sorting happens once here; `build_tree_node_presorted` partitions the
+/// lists down the tree, preserving sorted order, so nodes never re-sort.
+fn build_presorted_features(x: &Array2<f64>, y: &Array1<f64>) -> Vec<Vec<SortedEntry>> {
+    let n = x.nrows();
+    let n_features = x.ncols();
+
+    let sort_one = |f: usize| {
+        let col = x.column(f);
+        let mut entries: Vec<SortedEntry> = (0..n)
+            .map(|i| SortedEntry {
+                y: y[i],
+                val: col[i] as f32,
+                row: i as u32,
+            })
+            .collect();
+        entries
+            .sort_unstable_by(|a, b| a.val.partial_cmp(&b.val).unwrap_or(std::cmp::Ordering::Equal));
+        entries
+    };
+
+    // Parallel root sort for large workloads (sorting dominates tree fitting);
+    // small workloads stay sequential to avoid rayon task overhead.
+    if n_features >= 4 && n >= 2000 {
+        use rayon::prelude::*;
+        (0..n_features).into_par_iter().map(sort_one).collect()
+    } else {
+        (0..n_features).map(sort_one).collect()
+    }
+}
+
+/// Recursively build a tree from presorted per-feature pair lists.
+/// Equivalent to `build_tree_node` but O(n·p) per split instead of
+/// O(n·log n·p): the sorted order is inherited by stable partition.
+/// `goes_left` is a scratch buffer indexed by row id; each node writes the
+/// rows it owns before reading them, so a single shared buffer is safe.
+#[allow(clippy::too_many_arguments)]
+fn build_tree_node_presorted(
+    sample_weight: Option<&Array1<f64>>,
+    sorted_features: Vec<Vec<SortedEntry>>,
+    depth: usize,
+    max_depth: usize,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+    goes_left: &mut Vec<bool>,
+) -> TreeNode {
+    let n = sorted_features[0].len();
+
+    // Parent stats over this node's rows (any feature list holds the same rows)
+    let (parent_sum, parent_weight) = if let Some(weights) = sample_weight {
+        let mut sum = 0.0;
+        let mut weight = 0.0;
+        for e in &sorted_features[0] {
+            let w = weights[e.row as usize];
+            sum += e.y * w;
+            weight += w;
+        }
+        (sum, weight)
+    } else {
+        let sum: f64 = sorted_features[0].iter().map(|e| e.y).sum();
+        (sum, n as f64)
+    };
+
+    let node_value = if parent_weight > 0.0 {
+        parent_sum / parent_weight
+    } else {
+        0.0
+    };
+
+    // Check stopping conditions
+    if depth >= max_depth || n < min_samples_split || parent_weight == 0.0 {
+        return TreeNode::Leaf { value: node_value };
+    }
+
+    // Scan every feature's presorted pairs for the best Friedman split.
+    // Parallelized across features only for large nodes (see gate constants).
+    let (best_feature, best_threshold, best_improvement) = find_best_presorted_split(
+        &sorted_features,
+        sample_weight,
+        min_samples_leaf,
+        parent_sum,
+        parent_weight,
+    );
+
+    // If no valid split found, return a leaf
+    if best_improvement <= 0.0 || best_threshold.is_nan() {
+        return TreeNode::Leaf { value: node_value };
+    }
+
+    // Mark which rows go left using the winning feature's own values
+    // (same comparison as `x[[i, best_feature]] < best_threshold`)
+    let mut n_left = 0usize;
+    for e in &sorted_features[best_feature] {
+        let left = (e.val as f64) < best_threshold;
+        goes_left[e.row as usize] = left;
+        n_left += left as usize;
+    }
+    let n_right = n - n_left;
+
+    // Check min_samples_leaf constraint
+    if n_left < min_samples_leaf || n_right < min_samples_leaf {
+        return TreeNode::Leaf { value: node_value };
+    }
+
+    // Stable-partition every feature's sorted pairs into left/right children
+    let n_features = sorted_features.len();
+    let mut left_sorted = Vec::with_capacity(n_features);
+    let mut right_sorted = Vec::with_capacity(n_features);
+    for entries in sorted_features {
+        let mut left_entries = Vec::with_capacity(n_left);
+        let mut right_entries = Vec::with_capacity(n_right);
+        for e in entries {
+            if goes_left[e.row as usize] {
+                left_entries.push(e);
+            } else {
+                right_entries.push(e);
+            }
+        }
+        left_sorted.push(left_entries);
+        right_sorted.push(right_entries);
+    }
+
+    // Recursively build children
+    let left_child = build_tree_node_presorted(
+        sample_weight,
+        left_sorted,
+        depth + 1,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+        goes_left,
+    );
+    let right_child = build_tree_node_presorted(
+        sample_weight,
+        right_sorted,
+        depth + 1,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+        goes_left,
+    );
+
+    TreeNode::Split {
+        feature_index: best_feature,
+        threshold: best_threshold,
+        left: Box::new(left_child),
+        right: Box::new(right_child),
     }
 }
 
@@ -1354,7 +1748,7 @@ impl BaseLearner for ArenaDecisionTreeLearner {
         let max_nodes = (1usize << (self.max_depth + 1)).saturating_sub(1);
         let mut nodes = Vec::with_capacity(max_nodes.min(indices.len() * 2));
         // Pre-allocate sort buffer once — reused across all recursive calls
-        let mut sort_buf: Vec<(f64, usize)> = Vec::with_capacity(x.nrows());
+        let mut sort_buf: Vec<SortedEntry> = Vec::with_capacity(x.nrows());
 
         build_arena_tree_node(
             &mut nodes,
@@ -1387,7 +1781,7 @@ fn build_arena_tree_node(
     max_depth: usize,
     min_samples_split: usize,
     min_samples_leaf: usize,
-    sort_buf: &mut Vec<(f64, usize)>,
+    sort_buf: &mut Vec<SortedEntry>,
 ) -> u32 {
     // Calculate parent_sum and parent_weight once — used for both node_value and split finding
     let (parent_sum, parent_weight) = if let Some(weights) = sample_weight {
@@ -1440,7 +1834,9 @@ fn build_arena_tree_node(
     let mut left_indices = Vec::with_capacity(estimated_size);
     let mut right_indices = Vec::with_capacity(estimated_size);
     for &i in indices {
-        if x[[i, best_feature]] < best_threshold {
+        // Compare via the f32-cast value, matching the sorted-pair view used
+        // by split scanning (and the presorted builder's partition)
+        if (x[[i, best_feature]] as f32 as f64) < best_threshold {
             left_indices.push(i);
         } else {
             right_indices.push(i);
@@ -1544,6 +1940,10 @@ impl TrainedBaseLearner for TrainedDecisionTree {
 }
 
 /// Build a tree node recursively
+/// Per-node-sorting tree builder. Superseded by `build_tree_node_presorted`
+/// for `DecisionTreeLearner`; kept as the reference implementation for the
+/// presorted-equivalence tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_tree_node(
     x: &Array2<f64>,
     y: &Array1<f64>,
@@ -1553,7 +1953,7 @@ fn build_tree_node(
     max_depth: usize,
     min_samples_split: usize,
     min_samples_leaf: usize,
-    sort_buf: &mut Vec<(f64, usize)>,
+    sort_buf: &mut Vec<SortedEntry>,
 ) -> TreeNode {
     // Calculate parent_sum and parent_weight once — used for both node_value and split finding
     let (parent_sum, parent_weight) = if let Some(weights) = sample_weight {
@@ -1602,7 +2002,9 @@ fn build_tree_node(
     let mut left_indices = Vec::with_capacity(estimated_size);
     let mut right_indices = Vec::with_capacity(estimated_size);
     for &i in indices {
-        if x[[i, best_feature]] < best_threshold {
+        // Compare via the f32-cast value, matching the sorted-pair view used
+        // by split scanning (and the presorted builder's partition)
+        if (x[[i, best_feature]] as f32 as f64) < best_threshold {
             left_indices.push(i);
         } else {
             right_indices.push(i);
@@ -1646,40 +2048,34 @@ fn build_tree_node(
     }
 }
 
-/// Evaluate a single feature for the best split using Friedman MSE criterion.
-/// Returns (threshold, improvement) for this feature.
+/// Scan entries already sorted ascending by feature value and return the best
+/// (threshold, improvement) under the Friedman MSE criterion.
+/// Shared by the per-node-sorting path and the presorted path.
+///
+/// Feature values are f32 (sklearn quantization); the response is inline in
+/// each entry so the unweighted scan is a pure sequential stream with no
+/// random gathers. All accumulation (left_sum, means, improvement) and the
+/// returned threshold stay f64, so there is no error accumulation.
 #[inline]
-fn evaluate_feature_split(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
+fn scan_sorted_entries(
+    entries: &[SortedEntry],
     sample_weight: Option<&Array1<f64>>,
-    indices: &[usize],
-    feature_index: usize,
     min_samples_leaf: usize,
     parent_sum: f64,
     parent_weight: f64,
-    sort_buf: &mut Vec<(f64, usize)>,
 ) -> (f64, f64) {
-    let feature_col = x.column(feature_index);
-
-    // Build (feature_value, index) pairs — sort comparisons then access values
-    // directly instead of doing indirect lookups through feature_col[idx]
-    sort_buf.clear();
-    sort_buf.extend(indices.iter().map(|&i| (feature_col[i], i)));
-    sort_buf.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
     let mut best_threshold = f64::NAN;
     let mut best_improvement = 0.0;
     let mut left_sum = 0.0;
     let mut left_weight = 0.0;
-    let n = indices.len();
+    let n = entries.len();
 
     // Split into weighted vs unweighted paths to avoid per-element branch
     if let Some(weights) = sample_weight {
         for pos in 0..n {
-            let (feat_i, i) = sort_buf[pos];
-            let w = weights[i];
-            left_sum += y[i] * w;
+            let e = entries[pos];
+            let w = weights[e.row as usize];
+            left_sum += e.y * w;
             left_weight += w;
 
             let left_count = pos + 1;
@@ -1689,7 +2085,7 @@ fn evaluate_feature_split(
                 continue;
             }
 
-            if pos + 1 < n && (feat_i - sort_buf[pos + 1].0).abs() < 1e-10 {
+            if pos + 1 < n && (e.val as f64 - entries[pos + 1].val as f64).abs() < 1e-10 {
                 continue;
             }
 
@@ -1708,17 +2104,17 @@ fn evaluate_feature_split(
             if improvement > best_improvement {
                 best_improvement = improvement;
                 best_threshold = if pos + 1 < n {
-                    (feat_i + sort_buf[pos + 1].0) * 0.5
+                    (e.val as f64 + entries[pos + 1].val as f64) * 0.5
                 } else {
-                    feat_i
+                    e.val as f64
                 };
             }
         }
     } else {
-        // Unweighted path — no per-element weight lookup
+        // Unweighted path — sequential stream, no per-element weight or y gather
         for pos in 0..n {
-            let (feat_i, i) = sort_buf[pos];
-            left_sum += y[i];
+            let e = entries[pos];
+            left_sum += e.y;
             left_weight += 1.0;
 
             let left_count = pos + 1;
@@ -1728,7 +2124,7 @@ fn evaluate_feature_split(
                 continue;
             }
 
-            if pos + 1 < n && (feat_i - sort_buf[pos + 1].0).abs() < 1e-10 {
+            if pos + 1 < n && (e.val as f64 - entries[pos + 1].val as f64).abs() < 1e-10 {
                 continue;
             }
 
@@ -1747,15 +2143,182 @@ fn evaluate_feature_split(
             if improvement > best_improvement {
                 best_improvement = improvement;
                 best_threshold = if pos + 1 < n {
-                    (feat_i + sort_buf[pos + 1].0) * 0.5
+                    (e.val as f64 + entries[pos + 1].val as f64) * 0.5
                 } else {
-                    feat_i
+                    e.val as f64
                 };
             }
         }
     }
 
     (best_threshold, best_improvement)
+}
+
+// ----------------------------------------------------------------------------
+// Best-split search over presorted features (used by `build_tree_node_presorted`).
+//
+// The per-feature scans are independent, so they can run in parallel. But after
+// the presort rewrite each scan is a cheap, memory-bound linear pass, so rayon's
+// per-task overhead only pays off for large nodes. The gate below is a function
+// of total work (node rows × features), not rows alone — the `presort_scan`
+// benchmark showed the seq/par crossover tracks n×p almost exactly. With f32
+// pair storage (8 bytes/pair) the measured crossover is:
+//
+//   n×p elements    seq       par      winner
+//   ~25k            ~47µs     ~58µs    sequential (rayon overhead dominates)
+//   ~50k            ~94µs     ~59-95µs tie at p=5, parallel ~1.6× at p=10
+//   ~500k           ~1.03ms   ~0.40ms  parallel  (~2.6×)
+//   ~1M             ~2.08ms   ~0.63ms  parallel  (~3.3×)
+//
+// Speedups cap around 2–3× (not core-count) because the scans are memory-
+// bandwidth bound, not CPU bound. Gate set at 50k: nothing loses there and
+// higher feature counts already win ~1.6×.
+// `presort_par_matches_seq` guarantees both variants produce identical splits.
+// ----------------------------------------------------------------------------
+
+/// Minimum total work (node rows × features) before parallelizing the
+/// per-feature split scan. Below this, rayon's per-batch overhead exceeds the
+/// savings from these cheap, memory-bound scans.
+const PRESORT_PAR_MIN_WORK: usize = 50_000;
+/// Need at least 2 features (tasks) for parallelism to do anything.
+const PRESORT_PAR_MIN_FEATURES: usize = 2;
+
+/// Sequentially scan all presorted features and return the best
+/// (feature, threshold, improvement) under the Friedman MSE criterion.
+/// Ties in improvement are broken toward the lowest feature index.
+#[doc(hidden)]
+pub fn find_best_presorted_split_seq(
+    sorted_features: &[Vec<SortedEntry>],
+    sample_weight: Option<&Array1<f64>>,
+    min_samples_leaf: usize,
+    parent_sum: f64,
+    parent_weight: f64,
+) -> (usize, f64, f64) {
+    let mut best_feature = 0;
+    let mut best_threshold = f64::NAN;
+    let mut best_improvement = 0.0;
+    for (feature_index, entries) in sorted_features.iter().enumerate() {
+        let (threshold, improvement) = scan_sorted_entries(
+            entries,
+            sample_weight,
+            min_samples_leaf,
+            parent_sum,
+            parent_weight,
+        );
+        if improvement > best_improvement {
+            best_improvement = improvement;
+            best_feature = feature_index;
+            best_threshold = threshold;
+        }
+    }
+    (best_feature, best_threshold, best_improvement)
+}
+
+/// Parallel (rayon) version of [`find_best_presorted_split_seq`].
+/// Each feature is scanned on its own task; results are collected in feature
+/// order and reduced with the identical argmax, so the output is bit-for-bit
+/// the same as the sequential version (including tie-breaking).
+#[doc(hidden)]
+pub fn find_best_presorted_split_par(
+    sorted_features: &[Vec<SortedEntry>],
+    sample_weight: Option<&Array1<f64>>,
+    min_samples_leaf: usize,
+    parent_sum: f64,
+    parent_weight: f64,
+) -> (usize, f64, f64) {
+    use rayon::prelude::*;
+
+    let results: Vec<(f64, f64)> = sorted_features
+        .par_iter()
+        .map(|entries| {
+            scan_sorted_entries(
+                entries,
+                sample_weight,
+                min_samples_leaf,
+                parent_sum,
+                parent_weight,
+            )
+        })
+        .collect();
+
+    let mut best_feature = 0;
+    let mut best_threshold = f64::NAN;
+    let mut best_improvement = 0.0;
+    for (feature_index, &(threshold, improvement)) in results.iter().enumerate() {
+        if improvement > best_improvement {
+            best_improvement = improvement;
+            best_feature = feature_index;
+            best_threshold = threshold;
+        }
+    }
+    (best_feature, best_threshold, best_improvement)
+}
+
+/// Gated dispatch: parallel scan only for large nodes, sequential otherwise.
+#[inline]
+fn find_best_presorted_split(
+    sorted_features: &[Vec<SortedEntry>],
+    sample_weight: Option<&Array1<f64>>,
+    min_samples_leaf: usize,
+    parent_sum: f64,
+    parent_weight: f64,
+) -> (usize, f64, f64) {
+    let n_features = sorted_features.len();
+    let n_rows = sorted_features.first().map_or(0, |f| f.len());
+    if n_features >= PRESORT_PAR_MIN_FEATURES
+        && n_rows.saturating_mul(n_features) >= PRESORT_PAR_MIN_WORK
+    {
+        find_best_presorted_split_par(
+            sorted_features,
+            sample_weight,
+            min_samples_leaf,
+            parent_sum,
+            parent_weight,
+        )
+    } else {
+        find_best_presorted_split_seq(
+            sorted_features,
+            sample_weight,
+            min_samples_leaf,
+            parent_sum,
+            parent_weight,
+        )
+    }
+}
+
+/// Evaluate a single feature for the best split using Friedman MSE criterion.
+/// Returns (threshold, improvement) for this feature.
+#[inline]
+fn evaluate_feature_split(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    sample_weight: Option<&Array1<f64>>,
+    indices: &[usize],
+    feature_index: usize,
+    min_samples_leaf: usize,
+    parent_sum: f64,
+    parent_weight: f64,
+    sort_buf: &mut Vec<SortedEntry>,
+) -> (f64, f64) {
+    let feature_col = x.column(feature_index);
+
+    // Build entries (y inline) — the scan then streams sequentially with no
+    // indirect lookups through feature_col[idx] or y[idx]
+    sort_buf.clear();
+    sort_buf.extend(indices.iter().map(|&i| SortedEntry {
+        y: y[i],
+        val: feature_col[i] as f32,
+        row: i as u32,
+    }));
+    sort_buf.sort_unstable_by(|a, b| a.val.partial_cmp(&b.val).unwrap_or(std::cmp::Ordering::Equal));
+
+    scan_sorted_entries(
+        sort_buf,
+        sample_weight,
+        min_samples_leaf,
+        parent_sum,
+        parent_weight,
+    )
 }
 
 /// Find the best split using Friedman MSE criterion (variance reduction weighted by sample counts)
@@ -1770,7 +2333,7 @@ fn find_best_split_friedman(
     min_samples_leaf: usize,
     parent_sum: f64,
     parent_weight: f64,
-    sort_buf: &mut Vec<(f64, usize)>,
+    sort_buf: &mut Vec<SortedEntry>,
 ) -> (usize, f64, f64) {
     let n_features = x.ncols();
 
@@ -1790,7 +2353,7 @@ fn find_best_split_friedman(
         let results: Vec<(f64, f64)> = (0..n_features)
             .into_par_iter()
             .map(|feature_index| {
-                let mut local_sort_buf: Vec<(f64, usize)> = Vec::with_capacity(indices.len());
+                let mut local_sort_buf: Vec<SortedEntry> = Vec::with_capacity(indices.len());
                 evaluate_feature_split(
                     x,
                     y,
@@ -1846,9 +2409,24 @@ fn find_best_split_friedman(
 }
 
 /// Returns the default tree learner matching Python's sklearn default:
-/// DecisionTreeRegressor with max_depth=3 and criterion="friedman_mse"
+/// DecisionTreeRegressor with max_depth=3 and criterion="friedman_mse".
+/// This is the *exact* split finder — bit-equivalent to sklearn's trees.
 pub fn default_tree_learner() -> DecisionTreeLearner {
     DecisionTreeLearner::default_sklearn()
+}
+
+/// Returns the default base learner used by the high-level wrappers
+/// (`NGBRegressor`, `NGBClassifier`, `NGBMultiClassifier`): a depth-3
+/// histogram tree (255 bins).
+///
+/// Chosen over the exact tree because it is 2.5–2.7× faster end-to-end at
+/// n ≥ 2000 (binning is cached across boosting iterations) with held-out
+/// accuracy at parity or better across regression, classification, survival,
+/// outlier, discrete-feature, and high-dimensional benchmarks
+/// (see tests/accuracy_parity.rs). For exact sklearn-equivalent trees use
+/// [`default_tree_learner`] with the generic `NGBoost` type.
+pub fn default_base_learner() -> HistogramLearner {
+    HistogramLearner::default_histogram()
 }
 
 /// Returns a stump learner (depth-1 tree) for simpler/faster models
@@ -1953,4 +2531,332 @@ fn find_best_split_weighted(
     };
 
     (best_feature, best_threshold, best_mse)
+}
+
+#[cfg(test)]
+mod presort_tests {
+    use super::*;
+
+    /// Deterministic pseudo-random data (no external rand dependency needed)
+    fn synth(n: usize, p: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
+        let mut s = seed;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (u32::MAX as f64)
+        };
+        let x = Array2::from_shape_fn((n, p), |_| next());
+        let y = Array1::from_shape_fn(n, |i| x[[i, 0]] * 3.0 - x[[i, p - 1]] + next() * 0.1);
+        (x, y)
+    }
+
+    fn build_reference(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        w: Option<&Array1<f64>>,
+        max_depth: usize,
+    ) -> TreeNode {
+        let indices: Vec<usize> = (0..x.nrows()).collect();
+        let mut sort_buf: Vec<SortedEntry> = Vec::with_capacity(x.nrows());
+        build_tree_node(x, y, w, &indices, 0, max_depth, 2, 1, &mut sort_buf)
+    }
+
+    fn build_presorted(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        w: Option<&Array1<f64>>,
+        max_depth: usize,
+    ) -> TreeNode {
+        let sorted = build_presorted_features(x, y);
+        let mut goes_left = vec![false; x.nrows()];
+        build_tree_node_presorted(w, sorted, 0, max_depth, 2, 1, &mut goes_left)
+    }
+
+    fn assert_trees_equal(a: &TreeNode, b: &TreeNode) {
+        match (a, b) {
+            (TreeNode::Leaf { value: va }, TreeNode::Leaf { value: vb }) => {
+                assert!(
+                    (va - vb).abs() <= 1e-12 * va.abs().max(1.0),
+                    "leaf mismatch: {va} vs {vb}"
+                );
+            }
+            (
+                TreeNode::Split {
+                    feature_index: fa,
+                    threshold: ta,
+                    left: la,
+                    right: ra,
+                },
+                TreeNode::Split {
+                    feature_index: fb,
+                    threshold: tb,
+                    left: lb,
+                    right: rb,
+                },
+            ) => {
+                assert_eq!(fa, fb, "split feature mismatch");
+                assert!((ta - tb).abs() <= 1e-12, "threshold mismatch: {ta} vs {tb}");
+                assert_trees_equal(la, lb);
+                assert_trees_equal(ra, rb);
+            }
+            _ => panic!("tree structure mismatch (leaf vs split)"),
+        }
+    }
+
+    #[test]
+    fn presorted_matches_reference_unweighted() {
+        for (n, p, depth) in [(50, 3, 3), (500, 7, 3), (1200, 5, 4), (30, 2, 6)] {
+            let (x, y) = synth(n, p, 42 + n as u64);
+            let reference = build_reference(&x, &y, None, depth);
+            let presorted = build_presorted(&x, &y, None, depth);
+            assert_trees_equal(&reference, &presorted);
+        }
+    }
+
+    #[test]
+    fn presorted_matches_reference_weighted() {
+        for (n, p, depth) in [(80, 4, 3), (600, 6, 4)] {
+            let (x, y) = synth(n, p, 7 + n as u64);
+            let mut s = 99u64;
+            let w = Array1::from_shape_fn(n, |_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                0.1 + ((s >> 33) as f64) / (u32::MAX as f64)
+            });
+            let reference = build_reference(&x, &y, Some(&w), depth);
+            let presorted = build_presorted(&x, &y, Some(&w), depth);
+            assert_trees_equal(&reference, &presorted);
+        }
+    }
+
+    #[test]
+    fn presorted_handles_tied_feature_values() {
+        // Heavy ties (quantized features): split decisions must agree; leaf
+        // values may differ in the last ulp due to summation order within
+        // tie runs, so compare predictions loosely.
+        let (mut x, y) = synth(400, 4, 1234);
+        x.mapv_inplace(|v| (v * 8.0).floor() / 8.0);
+
+        let reference = build_reference(&x, &y, None, 3);
+        let presorted = build_presorted(&x, &y, None, 3);
+
+        let ref_tree = TrainedDecisionTree {
+            root: reference,
+            n_features: x.ncols(),
+        };
+        let new_tree = TrainedDecisionTree {
+            root: presorted,
+            n_features: x.ncols(),
+        };
+        let pa = ref_tree.predict(&x);
+        let pb = new_tree.predict(&x);
+        for i in 0..x.nrows() {
+            assert!(
+                (pa[i] - pb[i]).abs() <= 1e-9 * pa[i].abs().max(1.0),
+                "prediction mismatch at {i}: {} vs {}",
+                pa[i],
+                pb[i]
+            );
+        }
+    }
+
+    #[test]
+    fn presorted_constant_feature_yields_leaf() {
+        // All-constant X → no valid split → single leaf with the mean
+        let x = Array2::from_elem((20, 3), 1.0);
+        let y = Array1::from_shape_fn(20, |i| i as f64);
+        let tree = build_presorted(&x, &y, None, 3);
+        match tree {
+            TreeNode::Leaf { value } => assert!((value - 9.5).abs() < 1e-12),
+            _ => panic!("expected a single leaf for constant features"),
+        }
+    }
+
+    /// Build sorted feature lists + parent stats for a synthetic root node.
+    fn presorted_root(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        w: Option<&Array1<f64>>,
+    ) -> (Vec<Vec<SortedEntry>>, f64, f64) {
+        let sorted = build_presorted_features(x, y);
+        let (parent_sum, parent_weight) = match w {
+            Some(weights) => {
+                let mut s = 0.0;
+                let mut wt = 0.0;
+                for i in 0..y.len() {
+                    s += y[i] * weights[i];
+                    wt += weights[i];
+                }
+                (s, wt)
+            }
+            None => (y.sum(), y.len() as f64),
+        };
+        (sorted, parent_sum, parent_weight)
+    }
+
+    /// The parallel split scan must return exactly the same (feature, threshold,
+    /// improvement) as the sequential one — including tie-breaking — across a
+    /// range of sizes and feature counts, weighted and unweighted.
+    #[test]
+    fn presorted_par_matches_seq() {
+        for (n, p) in [(500usize, 5usize), (5000, 10), (20000, 4), (3000, 30)] {
+            let (x, y) = synth(n, p, 2025 + (n + p) as u64);
+
+            // Unweighted
+            let (sorted, ps, pw) = presorted_root(&x, &y, None);
+            let seq = find_best_presorted_split_seq(&sorted, None, 1, ps, pw);
+            let par = find_best_presorted_split_par(&sorted, None, 1, ps, pw);
+            assert_eq!(seq.0, par.0, "feature mismatch (n={n}, p={p})");
+            assert_eq!(
+                seq.1.to_bits(),
+                par.1.to_bits(),
+                "threshold bits mismatch (n={n}, p={p})"
+            );
+            assert_eq!(
+                seq.2.to_bits(),
+                par.2.to_bits(),
+                "improvement bits mismatch (n={n}, p={p})"
+            );
+
+            // Weighted
+            let mut s = 13u64;
+            let w = Array1::from_shape_fn(n, |_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                0.1 + ((s >> 33) as f64) / (u32::MAX as f64)
+            });
+            let (sorted, ps, pw) = presorted_root(&x, &y, Some(&w));
+            let seq = find_best_presorted_split_seq(&sorted, Some(&w), 1, ps, pw);
+            let par = find_best_presorted_split_par(&sorted, Some(&w), 1, ps, pw);
+            assert_eq!(seq.0, par.0, "weighted feature mismatch (n={n}, p={p})");
+            assert_eq!(seq.1.to_bits(), par.1.to_bits(), "weighted threshold mismatch");
+            assert_eq!(seq.2.to_bits(), par.2.to_bits(), "weighted improvement mismatch");
+        }
+    }
+
+    /// A node large enough to cross the parallel gate must build a tree
+    /// identical to the per-node-sorting reference (exercises the par path).
+    #[test]
+    fn presorted_large_node_matches_reference() {
+        // n×p = 60_000×3 = 180k ≥ PRESORT_PAR_MIN_WORK, so the root + shallow
+        // nodes take the parallel scan path.
+        let (x, y) = synth(60_000, 3, 777);
+        let reference = build_reference(&x, &y, None, 3);
+        let presorted = build_presorted(&x, &y, None, 3);
+        assert_trees_equal(&reference, &presorted);
+    }
+}
+
+#[cfg(test)]
+mod histogram_tests {
+    use super::*;
+
+    fn synth(n: usize, p: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
+        let mut s = seed;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (u32::MAX as f64)
+        };
+        let x = Array2::from_shape_fn((n, p), |_| next());
+        let y = Array1::from_shape_fn(n, |i| x[[i, 0]] * 3.0 - x[[i, p - 1]] + next() * 0.1);
+        (x, y)
+    }
+
+    /// fit_with_weights (which builds its own cache) and fit_with_weights_cached
+    /// (with an externally built cache on the same X) must produce identical trees.
+    #[test]
+    fn cached_fit_matches_uncached() {
+        for (n, p) in [(300usize, 4usize), (2000, 8)] {
+            let (x, y) = synth(n, p, 99 + n as u64);
+            let learner = HistogramLearner::new(3);
+
+            let uncached = learner.fit_with_weights(&x, &y, None).unwrap();
+            let cache = learner.build_fit_cache(&x).unwrap();
+            let cached = learner
+                .fit_with_weights_cached(&x, &y, None, cache.as_ref())
+                .unwrap();
+
+            let pu = uncached.predict(&x);
+            let pc = cached.predict(&x);
+            for i in 0..n {
+                assert_eq!(
+                    pu[i].to_bits(),
+                    pc[i].to_bits(),
+                    "prediction mismatch at row {i} (n={n}, p={p})"
+                );
+            }
+        }
+    }
+
+    /// Weighted fits must also agree between cached and uncached paths.
+    #[test]
+    fn cached_fit_matches_uncached_weighted() {
+        let (x, y) = synth(800, 5, 7);
+        let mut s = 5u64;
+        let w = Array1::from_shape_fn(800, |_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            0.1 + ((s >> 33) as f64) / (u32::MAX as f64)
+        });
+        let learner = HistogramLearner::new(3);
+
+        let uncached = learner.fit_with_weights(&x, &y, Some(&w)).unwrap();
+        let cache = learner.build_fit_cache(&x).unwrap();
+        let cached = learner
+            .fit_with_weights_cached(&x, &y, Some(&w), cache.as_ref())
+            .unwrap();
+
+        let pu = uncached.predict(&x);
+        let pc = cached.predict(&x);
+        for i in 0..800 {
+            assert_eq!(pu[i].to_bits(), pc[i].to_bits(), "row {i}");
+        }
+    }
+
+    /// A stale cache (built on different X dims) must fall back gracefully
+    /// rather than producing garbage.
+    #[test]
+    fn stale_cache_falls_back() {
+        let (x_small, _) = synth(100, 3, 1);
+        let (x, y) = synth(400, 3, 2);
+        let learner = HistogramLearner::new(3);
+
+        let stale = learner.build_fit_cache(&x_small).unwrap();
+        let fitted = learner
+            .fit_with_weights_cached(&x, &y, None, stale.as_ref())
+            .unwrap();
+        let direct = learner.fit_with_weights(&x, &y, None).unwrap();
+
+        let pf = fitted.predict(&x);
+        let pd = direct.predict(&x);
+        for i in 0..400 {
+            assert_eq!(pf[i].to_bits(), pd[i].to_bits(), "row {i}");
+        }
+    }
+
+    /// The histogram learner must still split sensibly: tree predictions must
+    /// correlate strongly with a linear signal.
+    #[test]
+    fn histogram_tree_learns_signal() {
+        let (x, y) = synth(1500, 4, 33);
+        let learner = HistogramLearner::new(3);
+        let fitted = learner.fit_with_weights(&x, &y, None).unwrap();
+        let preds = fitted.predict(&x);
+
+        let y_mean = y.mean().unwrap();
+        let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
+        let ss_res: f64 = y
+            .iter()
+            .zip(preds.iter())
+            .map(|(v, p)| (v - p).powi(2))
+            .sum();
+        let r2 = 1.0 - ss_res / ss_tot;
+        assert!(r2 > 0.7, "histogram tree failed to learn: R²={r2}");
+    }
 }

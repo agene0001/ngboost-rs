@@ -6,7 +6,7 @@ use crate::scores::{
 use ndarray::{Array1, Array2, Array3, array};
 use rand::prelude::*;
 use statrs::distribution::{Continuous, ContinuousCDF, Gamma as GammaDist, Weibull as WeibullDist};
-use statrs::function::gamma::{digamma, gamma};
+use statrs::function::gamma::gamma;
 
 /// The Weibull distribution.
 #[derive(Debug, Clone)]
@@ -19,8 +19,8 @@ pub struct Weibull {
 
 impl Distribution for Weibull {
     fn from_params(params: &Array2<f64>) -> Self {
-        let shape = params.column(0).mapv(f64::exp);
-        let scale = params.column(1).mapv(f64::exp);
+        let shape = crate::vmath::exp_column(&params.column(0));
+        let scale = crate::vmath::exp_column(&params.column(1));
         Weibull { shape, scale }
     }
 
@@ -111,11 +111,28 @@ impl RegressionDistn for Weibull {}
 
 impl Weibull {
     /// Compute CRPS for a single observation with given Weibull parameters.
-    /// Uses the correct formula from scoringRules R package:
-    /// CRPS = y*(2*F(y) - 1) - 2*λ*Γ(1+1/k)*P(1+1/k, (y/λ)^k) + λ*Γ(1+1/k)*(1 - 2^{-1/k})
+    /// CRPS = y*(2*F(y) - 1) - 2*λ*Γ(1+1/k)*P(1+1/k, (y/λ)^k) + λ*Γ(1+1/k)*2^{-1/k}
+    /// Derivation: CRPS = E|X-y| - ½E|X-X'| with
+    ///   E|X-y| = y*(2F(y)-1) + μ - 2∫₀^y x dF = y*(2F(y)-1) + λΓ(1+1/k)*(1 - 2P(1+1/k, z^k))
+    ///   E|X-X'| = 2λΓ(1+1/k)*(1 - 2^{-1/k})   (min of two Weibulls is Weibull(k, λ·2^{-1/k}))
+    /// The constant term is +λΓ·2^{-1/k}, NOT +λΓ·(1 - 2^{-1/k}); the two only agree
+    /// at k=1. Verified against numerical integration of ∫(F(x) - 1{x≥y})² dx.
     fn crps_single_static(y: f64, k: f64, lam: f64) -> f64 {
+        // Guard degenerate/overflowed parameters (the line search probes wild
+        // values like exp(±huge)): statrs' incomplete gamma PANICS on NaN
+        // arguments rather than returning NaN, which would abort training.
+        // Returning +inf makes the line search treat the step as bad and back off.
+        if !(y.is_finite() && k.is_finite() && lam.is_finite()) || k <= 0.0 || lam <= 0.0 {
+            return f64::INFINITY;
+        }
+
         let z = y / lam;
         let z_k = z.powf(k);
+        // 1 + 1/k overflows to inf for denormal-tiny k; statrs' Gamma::new
+        // accepts an infinite shape but gamma_lr then panics (AInvalid).
+        if z_k.is_nan() || !(1.0 + 1.0 / k).is_finite() {
+            return f64::INFINITY;
+        }
 
         // CDF at y: F(y) = 1 - exp(-(y/λ)^k)
         let f_y = 1.0 - (-z_k).exp();
@@ -134,7 +151,37 @@ impl Weibull {
         // 2^{-1/k}
         let two_pow = 2.0_f64.powf(-1.0 / k);
 
-        y * (2.0 * f_y - 1.0) - 2.0 * lam * gamma_term * p_term + lam * gamma_term * (1.0 - two_pow)
+        y * (2.0 * f_y - 1.0) - 2.0 * lam * gamma_term * p_term + lam * gamma_term * two_pow
+    }
+
+    /// Right-censored survival CRPS for a censored observation (Avati et al.):
+    /// the truncated integral ∫₀^t F(x)² dx = full CRPS - ∫_t^∞ (1-F(x))² dx,
+    /// where ∫_t^∞ (1-F)² dx = λΓ(1+1/k)·2^{-1/k}·(1 - P(1/k, 2(t/λ)^k)).
+    /// Verified against numerical integration.
+    fn crps_censored_single_static(t: f64, k: f64, lam: f64) -> f64 {
+        // Same degenerate-parameter guard as crps_single_static (statrs'
+        // incomplete gamma panics on NaN arguments instead of returning NaN)
+        if !(t.is_finite() && k.is_finite() && lam.is_finite()) || k <= 0.0 || lam <= 0.0 {
+            return f64::INFINITY;
+        }
+
+        let z_k = (t / lam).powf(k);
+        // Same statrs guard: 1/k must stay finite (see crps_single_static)
+        if z_k.is_nan() || !(1.0 / k).is_finite() {
+            return f64::INFINITY;
+        }
+
+        let gamma_term = gamma(1.0 + 1.0 / k);
+        let two_pow = 2.0_f64.powf(-1.0 / k);
+
+        // P(1/k, 2*(t/λ)^k) = regularized lower incomplete gamma
+        let p_term = if let Ok(g) = GammaDist::new(1.0 / k, 1.0) {
+            g.cdf(2.0 * z_k)
+        } else {
+            0.5
+        };
+
+        Self::crps_single_static(t, k, lam) - lam * gamma_term * two_pow * (1.0 - p_term)
     }
 }
 
@@ -483,9 +530,9 @@ impl CensoredScorable<LogScoreCensored> for Weibull {
 
 impl CensoredScorable<CRPScoreCensored> for Weibull {
     fn censored_score(&self, y: &SurvivalData) -> Array1<f64> {
-        // CRPS for right-censored Weibull data
-        // For uncensored: standard CRPS
-        // For censored: modified CRPS that accounts for right-censoring
+        // CRPS for right-censored Weibull data (Avati et al.):
+        // - Uncensored: standard (full) CRPS
+        // - Censored: truncated integral ∫₀^t F(x)² dx
         let mut scores = Array1::zeros(y.len());
         let eps = 1e-10;
 
@@ -495,101 +542,42 @@ impl CensoredScorable<CRPScoreCensored> for Weibull {
             let k = self.shape[i];
             let lam = self.scale[i];
 
-            let z = t / lam;
-            let z_k = z.powf(k);
-
-            let f_t = 1.0 - (-z_k).exp(); // CDF
-            let s_t = (-z_k).exp(); // Survival function
-
-            let gamma_term = gamma(1.0 + 1.0 / k);
-            let two_pow = 2.0_f64.powf(-1.0 / k);
-
-            if e {
-                // Uncensored CRPS (same as regular CRPS)
-                scores[i] = Self::crps_single_static(t, k, lam);
+            scores[i] = if e {
+                Self::crps_single_static(t, k, lam)
             } else {
-                // Censored CRPS (adapted for right-censoring)
-                // From Python: crps_cens = t*F^2 + 2*λ*Γ*S*F - λ*Γ*2^(-1/k)*(1 - S^2)/2
-                scores[i] = t * f_t * f_t + 2.0 * lam * gamma_term * s_t * f_t
-                    - lam * gamma_term * two_pow * (1.0 - s_t * s_t) / 2.0;
-            }
+                Self::crps_censored_single_static(t, k, lam)
+            };
         }
         scores
     }
 
     fn censored_d_score(&self, y: &SurvivalData) -> Array2<f64> {
+        // Central finite differences w.r.t. log(shape) and log(scale) for both
+        // branches, consistent with the uncensored CRPS d_score.
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 2));
-        let eps = 1e-10;
+        let t_floor = 1e-10;
+        let eps = 1e-5;
 
         for i in 0..n_obs {
-            let t = y.time[i].max(eps);
+            let t = y.time[i].max(t_floor);
             let e = y.event[i];
             let k = self.shape[i];
             let lam = self.scale[i];
 
-            let z = t / lam;
-            let z_k = z.powf(k);
-            let ln_z = z.ln();
-
-            let f_t = 1.0 - (-z_k).exp();
-            let s_t = (-z_k).exp();
-
-            // PDF: f(t) = (k/λ) * z^(k-1) * exp(-z^k)
-            let pdf_t = (k / lam) * z.powf(k - 1.0) * s_t;
-
-            let gamma_term = gamma(1.0 + 1.0 / k);
-            let dgamma_dk = -gamma_term * digamma(1.0 + 1.0 / k) / (k * k);
-
-            let two_pow = 2.0_f64.powf(-1.0 / k);
-            let dtwo_pow_dk = two_pow * 2.0_f64.ln() / (k * k);
-
-            // dF/dk and dS/dk
-            // dF/dk = S(t) * z^k * ln(z) = pdf_t * t * ln(z) / k
-            let df_dk = pdf_t * t * ln_z / k;
-            let ds_dk = -df_dk;
-
-            // dF/dλ and dS/dλ
-            // dF/dλ = -S(t) * k * z^k / λ = -pdf_t * z
-            let df_dlam = -pdf_t * z;
-            let ds_dlam = -df_dlam;
-
-            if e {
-                // Uncensored derivatives via central finite differences on correct CRPS
-                let eps = 1e-5;
-
-                let k_plus = k * (1.0 + eps);
-                let k_minus = k * (1.0 - eps);
-                d_params[[i, 0]] = (Self::crps_single_static(t, k_plus, lam)
-                    - Self::crps_single_static(t, k_minus, lam))
-                    / (2.0 * eps);
-
-                let lam_plus = lam * (1.0 + eps);
-                let lam_minus = lam * (1.0 - eps);
-                d_params[[i, 1]] = (Self::crps_single_static(t, k, lam_plus)
-                    - Self::crps_single_static(t, k, lam_minus))
-                    / (2.0 * eps);
+            let crps = if e {
+                Self::crps_single_static
             } else {
-                // Censored derivatives
-                // crps_cens = t*F^2 + 2*λ*Γ*S*F - λ*Γ*2^(-1/k)*(1 - S^2)/2
+                Self::crps_censored_single_static
+            };
 
-                // d/dk[crps_cens]
-                let dcrps_cens_dk = t * 2.0 * f_t * df_dk
-                    + 2.0 * lam * dgamma_dk * s_t * f_t
-                    + 2.0 * lam * gamma_term * (ds_dk * f_t + s_t * df_dk)
-                    - lam * dgamma_dk * two_pow * (1.0 - s_t * s_t) / 2.0
-                    - lam * gamma_term * dtwo_pow_dk * (1.0 - s_t * s_t) / 2.0
-                    + lam * gamma_term * two_pow * s_t * ds_dk;
-                d_params[[i, 0]] = k * dcrps_cens_dk;
+            let k_plus = k * (1.0 + eps);
+            let k_minus = k * (1.0 - eps);
+            d_params[[i, 0]] = (crps(t, k_plus, lam) - crps(t, k_minus, lam)) / (2.0 * eps);
 
-                // d/dλ[crps_cens]
-                let dcrps_cens_dlam = t * 2.0 * f_t * df_dlam
-                    + 2.0 * gamma_term * s_t * f_t
-                    + 2.0 * lam * gamma_term * (ds_dlam * f_t + s_t * df_dlam)
-                    - gamma_term * two_pow * (1.0 - s_t * s_t) / 2.0
-                    + lam * gamma_term * two_pow * s_t * ds_dlam;
-                d_params[[i, 1]] = lam * dcrps_cens_dlam;
-            }
+            let lam_plus = lam * (1.0 + eps);
+            let lam_minus = lam * (1.0 - eps);
+            d_params[[i, 1]] = (crps(t, k, lam_plus) - crps(t, k, lam_minus)) / (2.0 * eps);
         }
         d_params
     }
@@ -860,5 +848,38 @@ mod tests {
 
         // All gradients should be finite
         assert!(d_scores.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_weibull_crps_matches_numerical_integration() {
+        // Ground truth from numerical integration of ∫(F(x) - 1{x≥y})² dx
+        for (k, lam, y_v, expected) in [
+            (2.0, 1.0, 1.0, 0.133009),
+            (0.8, 2.0, 1.5, 0.475965),
+            (3.5, 0.5, 0.4, 0.040997),
+        ] {
+            assert_relative_eq!(
+                Weibull::crps_single_static(y_v, k, lam),
+                expected,
+                epsilon = 1e-5
+            );
+        }
+    }
+
+    #[test]
+    fn test_weibull_censored_crps_matches_numerical_integration() {
+        // Censored survival CRPS = truncated integral ∫₀^t F(x)² dx
+        // Ground truth from numerical integration.
+        for (k, lam, t, expected) in [
+            (2.0, 1.0, 1.0, 0.104496),
+            (0.8, 2.0, 1.5, 0.206793),
+            (3.5, 0.5, 0.4, 0.007734),
+        ] {
+            assert_relative_eq!(
+                Weibull::crps_censored_single_static(t, k, lam),
+                expected,
+                epsilon = 1e-5
+            );
+        }
     }
 }

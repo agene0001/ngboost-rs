@@ -27,7 +27,7 @@ const CAUCHY_DF: f64 = 1.0;
 impl Distribution for Cauchy {
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
-        let scale = params.column(1).mapv(f64::exp);
+        let scale = crate::vmath::exp_column(&params.column(1));
         let var = &scale * &scale;
         Cauchy { loc, scale, var }
     }

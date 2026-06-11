@@ -19,7 +19,7 @@ pub struct Exponential {
 impl Distribution for Exponential {
     fn from_params(params: &Array2<f64>) -> Self {
         // param = log(scale), scale = exp(param), rate = 1/scale = exp(-param)
-        let scale = params.column(0).mapv(f64::exp);
+        let scale = crate::vmath::exp_column(&params.column(0));
         let rate = 1.0 / &scale;
         Exponential { rate, scale }
     }
@@ -199,15 +199,17 @@ impl Scorable<CRPScore> for Exponential {
 
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         // CRPS for Exponential distribution (uncensored):
-        // CRPS(F, y) = y + 2*scale*exp(-y/scale) - 1.5*scale - 0.5*scale*exp(-2*y/scale)
+        // CRPS(F, y) = y + scale * (2*exp(-y/scale) - 1.5)
+        // Note: the -0.5*scale*exp(-2y/scale) term used by Python belongs to the
+        // right-censored (truncated) integral, not the full CRPS; verified against
+        // numerical integration of ∫(F(x) - 1{x≥y})² dx.
         let mut scores = Array1::zeros(y.len());
         Zip::from(&mut scores)
             .and(y)
             .and(&self.scale)
             .for_each(|s, &y_i, &scale| {
                 let exp_term = (-y_i / scale).exp();
-                let exp_2t = (-2.0 * y_i / scale).exp();
-                *s = y_i + scale * (2.0 * exp_term - 1.5) - 0.5 * scale * exp_2t;
+                *s = y_i + scale * (2.0 * exp_term - 1.5);
             });
         scores
     }
@@ -216,13 +218,13 @@ impl Scorable<CRPScore> for Exponential {
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 1));
 
+        // d/d(log scale) of [y + s*(2*exp(-y/s) - 1.5)] = 2*exp(-y/s)*(y + s) - 1.5*s
         Zip::from(d_params.column_mut(0))
             .and(y)
             .and(&self.scale)
             .for_each(|d, &y_i, &scale| {
                 let exp_term = (-y_i / scale).exp();
-                let exp_2t = (-2.0 * y_i / scale).exp();
-                *d = 2.0 * exp_term * (y_i + scale) - 1.5 * scale - exp_2t * (0.5 * scale + y_i);
+                *d = 2.0 * exp_term * (y_i + scale) - 1.5 * scale;
             });
 
         d_params
@@ -328,6 +330,13 @@ impl CensoredScorable<CRPScoreCensored> for Exponential {
     }
 
     fn censored_score(&self, y: &SurvivalData) -> Array1<f64> {
+        // Right-censored survival CRPS (Avati et al.):
+        // - Uncensored (event observed): full CRPS = ∫₀^t F² + ∫_t^∞ (1-F)²
+        //   = t + s*(2*exp(-t/s) - 1.5)
+        // - Censored: truncated integral ∫₀^t F² (no penalty past the censoring time)
+        //   = t + s*(2*exp(-t/s) - 1.5) - 0.5*s*exp(-2t/s)
+        // Note: Python ngboost applies the subtraction to the *uncensored* branch,
+        // which swaps the two cases; verified against numerical integration.
         let mut scores = Array1::zeros(y.len());
 
         for i in 0..y.len() {
@@ -335,11 +344,11 @@ impl CensoredScorable<CRPScoreCensored> for Exponential {
             let e = y.event[i];
             let exp_term = (-t / self.scale[i]).exp();
 
-            // Base CRPS: t + scale * (2*exp(-t/scale) - 1.5)
+            // Full CRPS: t + scale * (2*exp(-t/scale) - 1.5)
             scores[i] = t + self.scale[i] * (2.0 * exp_term - 1.5);
 
-            if e {
-                // Uncensored: subtract 0.5 * scale * exp(-2*t/scale)
+            if !e {
+                // Censored: subtract the tail term ∫_t^∞ (1-F)² = 0.5*s*exp(-2t/s)
                 let exp_2t = (-2.0 * t / self.scale[i]).exp();
                 scores[i] -= 0.5 * self.scale[i] * exp_2t;
             }
@@ -356,11 +365,11 @@ impl CensoredScorable<CRPScoreCensored> for Exponential {
             let e = y.event[i];
             let exp_term = (-t / self.scale[i]).exp();
 
-            // Base derivative: 2*exp(-t/scale)*(t + scale) - 1.5*scale
+            // Full-CRPS derivative: 2*exp(-t/scale)*(t + scale) - 1.5*scale
             d_params[[i, 0]] = 2.0 * exp_term * (t + self.scale[i]) - 1.5 * self.scale[i];
 
-            if e {
-                // Uncensored: subtract d/d(log_s)[0.5*s*exp(-2t/s)]
+            if !e {
+                // Censored: subtract d/d(log_s)[0.5*s*exp(-2t/s)]
                 // = exp(-2t/s)*(0.5*s + t)
                 let exp_2t = (-2.0 * t / self.scale[i]).exp();
                 d_params[[i, 0]] -= exp_2t * (0.5 * self.scale[i] + t);
@@ -459,5 +468,41 @@ mod tests {
         assert_eq!(params.len(), 1);
         // Mean of y is 1.5, so log(scale) should be log(1.5)
         assert_relative_eq!(params[0], 1.5_f64.ln(), epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_exponential_crps_matches_numerical_integration() {
+        // Ground truth from numerical integration of ∫(F(x) - 1{x≥y})² dx
+        for (scale, y_v, expected) in [
+            (1.0, 0.5, 0.213061),
+            (2.0, 3.0, 0.892521),
+            (0.7, 0.1, 0.263629),
+        ] {
+            let params = Array2::from_shape_vec((1, 1), vec![(scale as f64).ln()]).unwrap();
+            let dist = Exponential::from_params(&params);
+            let y = Array1::from_vec(vec![y_v]);
+            let score = Scorable::<CRPScore>::score(&dist, &y);
+            assert_relative_eq!(score[0], expected, epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_exponential_censored_crps_matches_numerical_integration() {
+        // Uncensored = full CRPS; censored = truncated integral ∫₀^t F(x)² dx
+        // Ground truth from numerical integration.
+        for (scale, t, full, trunc) in [
+            (1.0, 0.5, 0.213061, 0.029122),
+            (2.0, 3.0, 0.892521, 0.842734),
+        ] {
+            let log_s = (scale as f64).ln();
+            let params = Array2::from_shape_vec((2, 1), vec![log_s, log_s]).unwrap();
+            let dist = Exponential::from_params(&params);
+            let time = Array1::from_vec(vec![t, t]);
+            let event = Array1::from_vec(vec![1.0, 0.0]);
+            let y = SurvivalData::from_arrays(&time, &event);
+            let scores = CensoredScorable::<CRPScoreCensored>::censored_score(&dist, &y);
+            assert_relative_eq!(scores[0], full, epsilon = 1e-5);
+            assert_relative_eq!(scores[1], trunc, epsilon = 1e-5);
+        }
     }
 }

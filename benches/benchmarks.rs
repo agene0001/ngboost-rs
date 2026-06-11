@@ -14,7 +14,7 @@ use ndarray_rand::rand_distr::Uniform;
 use ngboost_rs::dist::{Distribution, Normal};
 use ngboost_rs::learners::{
     ArenaDecisionTreeLearner, BaseLearner, DecisionTreeLearner, HistogramLearner, RidgeLearner,
-    StumpLearner,
+    SortedEntry, StumpLearner, find_best_presorted_split_par, find_best_presorted_split_seq,
 };
 use ngboost_rs::ngboost::{LineSearchMethod, NGBRegressor};
 use ngboost_rs::scores::{LogScore, Scorable, natural_gradient_regularized};
@@ -347,6 +347,42 @@ fn bench_training(c: &mut Criterion) {
         group.throughput(Throughput::Elements(*n_samples as u64));
         group.bench_with_input(
             BenchmarkId::new("samples", n_samples),
+            &(&x, &y),
+            |b, (x, y)| {
+                b.iter(|| {
+                    let mut ngb = NGBRegressor::new(50, 0.1);
+                    ngb.fit(black_box(*x), black_box(*y)).unwrap()
+                })
+            },
+        );
+    }
+
+    // Histogram-learner NGBoost training (cached binning) for comparison
+    // against the exact-tree "samples" series above
+    for n_samples in [500, 2000, 10000].iter() {
+        let (x, y) = generate_regression_data(*n_samples, 10);
+
+        group.bench_with_input(
+            BenchmarkId::new("samples_hist", n_samples),
+            &(&x, &y),
+            |b, (x, y)| {
+                b.iter(|| {
+                    let mut ngb = ngboost_rs::NGBoost::<Normal, LogScore, HistogramLearner>::new(
+                        50,
+                        0.1,
+                        HistogramLearner::new(3),
+                    );
+                    ngb.fit(black_box(*x), black_box(*y)).unwrap()
+                })
+            },
+        );
+    }
+
+    // Exact-tree NGBoost at 10k samples for a direct large-n comparison
+    {
+        let (x, y) = generate_regression_data(10000, 10);
+        group.bench_with_input(
+            BenchmarkId::new("samples", &10000),
             &(&x, &y),
             |b, (x, y)| {
                 b.iter(|| {
@@ -1223,11 +1259,136 @@ fn bench_arena_vs_legacy(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Presorted split-scan: sequential vs parallel (find the parallelization gate)
+// ============================================================================
+
+/// Build presorted per-feature (value, row) pair lists for a synthetic node of
+/// `n` rows and `p` features, plus the matching y array and parent stats.
+fn make_presorted_node(
+    n: usize,
+    p: usize,
+) -> (Vec<Vec<SortedEntry>>, Array1<f64>, f64, f64) {
+    let x = Array2::random((n, p), Uniform::new(0.0, 1.0).unwrap());
+    let y = Array1::random(n, Uniform::new(-1.0, 1.0).unwrap());
+
+    let sorted_features: Vec<Vec<SortedEntry>> = (0..p)
+        .map(|f| {
+            let col = x.column(f);
+            let mut entries: Vec<SortedEntry> = (0..n)
+                .map(|i| SortedEntry {
+                    y: y[i],
+                    val: col[i] as f32,
+                    row: i as u32,
+                })
+                .collect();
+            entries.sort_unstable_by(|a, b| a.val.partial_cmp(&b.val).unwrap());
+            entries
+        })
+        .collect();
+
+    let parent_sum: f64 = y.sum();
+    let parent_weight = n as f64;
+    (sorted_features, y, parent_sum, parent_weight)
+}
+
+fn bench_presort_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("presort_scan");
+    group.sample_size(30);
+
+    // Node sizes spanning the expected crossover, × a few feature counts.
+    for &p in &[5usize, 10, 30] {
+        for &n in &[2_000usize, 5_000, 10_000, 25_000, 50_000, 100_000, 200_000] {
+            let (sorted, _y, parent_sum, parent_weight) = make_presorted_node(n, p);
+            group.throughput(Throughput::Elements((n * p) as u64));
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("seq/p{p}"), n),
+                &n,
+                |b, _| {
+                    b.iter(|| {
+                        find_best_presorted_split_seq(
+                            black_box(&sorted),
+                            None,
+                            1,
+                            black_box(parent_sum),
+                            black_box(parent_weight),
+                        )
+                    })
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("par/p{p}"), n),
+                &n,
+                |b, _| {
+                    b.iter(|| {
+                        find_best_presorted_split_par(
+                            black_box(&sorted),
+                            None,
+                            1,
+                            black_box(parent_sum),
+                            black_box(parent_weight),
+                        )
+                    })
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+// ============================================================================
+// Survival training: exact vs histogram base learners (FitCache wired)
+// ============================================================================
+
+fn bench_survival_training(c: &mut Criterion) {
+    use ngboost_rs::dist::LogNormal;
+    use ngboost_rs::scores::LogScoreCensored;
+    use ngboost_rs::survival::NGBSurvival;
+
+    let mut group = c.benchmark_group("survival_training");
+    group.sample_size(10);
+
+    for n in [2000usize, 10000] {
+        let (x, y) = generate_regression_data(n, 10);
+        let time = y.mapv(|v| (v.abs() + 0.2).min(50.0));
+        let event = Array1::from_shape_fn(n, |i| if i % 4 == 0 { 0.0 } else { 1.0 });
+
+        group.bench_with_input(BenchmarkId::new("exact", n), &n, |b, _| {
+            b.iter(|| {
+                let mut m = NGBSurvival::<LogNormal, LogScoreCensored, DecisionTreeLearner>::new(
+                    50,
+                    0.1,
+                    DecisionTreeLearner::default_sklearn(),
+                );
+                m.fit(black_box(&x), black_box(&time), black_box(&event)).unwrap()
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("hist", n), &n, |b, _| {
+            b.iter(|| {
+                let mut m = NGBSurvival::<LogNormal, LogScoreCensored, HistogramLearner>::new(
+                    50,
+                    0.1,
+                    HistogramLearner::new(3),
+                );
+                m.fit(black_box(&x), black_box(&time), black_box(&event)).unwrap()
+            })
+        });
+    }
+
+    group.finish();
+}
+
+// ============================================================================
 // Criterion Configuration
 // ============================================================================
 
 criterion_group!(
     benches,
+    bench_presort_scan,
+    bench_survival_training,
     bench_natural_gradient,
     bench_base_learners,
     bench_distributions,

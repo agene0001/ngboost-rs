@@ -378,3 +378,83 @@ fn test_partial_fit() {
         .sum();
     assert!(diff > 0.0, "Predictions should change after partial_fit");
 }
+
+#[test]
+fn test_parallel_prediction_path_bit_exact() {
+    // get_params_at takes a rayon row-chunk path when nrows >= 512 and a
+    // sequential path below. Predicting 1200 rows at once (parallel) must be
+    // bit-identical to predicting the same rows in sub-512 slices (sequential).
+    let (x, y) = generate_regression_data(1200, 6);
+
+    let mut ngb = NGBRegressor::new(50, 0.1);
+    ngb.fit(&x, &y).expect("fit should succeed");
+
+    let full = ngb.pred_param(&x);
+
+    let mut pieces = Vec::new();
+    for chunk_start in (0..1200).step_by(300) {
+        let xs = x.slice(ndarray::s![chunk_start..chunk_start + 300, ..]).to_owned();
+        pieces.push(ngb.pred_param(&xs));
+    }
+
+    for (i, piece) in pieces.iter().enumerate() {
+        for r in 0..300 {
+            for c in 0..full.ncols() {
+                assert_eq!(
+                    full[[i * 300 + r, c]].to_bits(),
+                    piece[[r, c]].to_bits(),
+                    "params differ at row {} col {}",
+                    i * 300 + r,
+                    c
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_parallel_prediction_path_bit_exact_col_subsample() {
+    // Same as above but with col_sample < 1 so trees were fit on column
+    // subsets, exercising the remapped predict_rows walk.
+    let (x, y) = generate_regression_data(1200, 6);
+
+    use ngboost_rs::learners::HistogramLearner;
+    let mut ngb = ngboost_rs::NGBHistRegressor::with_options_seeded(
+        40,
+        0.1,
+        HistogramLearner::default_histogram(),
+        true,
+        1.0,
+        0.5, // col_sample
+        false,
+        0.0,
+        1e-4,
+        None,
+        0.1,
+        false,
+        Some(7),
+    );
+    ngb.fit(&x, &y).expect("fit should succeed");
+
+    let full = ngb.pred_param(&x);
+
+    let mut pieces = Vec::new();
+    for chunk_start in (0..1200).step_by(300) {
+        let xs = x.slice(ndarray::s![chunk_start..chunk_start + 300, ..]).to_owned();
+        pieces.push(ngb.pred_param(&xs));
+    }
+
+    for (i, piece) in pieces.iter().enumerate() {
+        for r in 0..300 {
+            for c in 0..full.ncols() {
+                assert_eq!(
+                    full[[i * 300 + r, c]].to_bits(),
+                    piece[[r, c]].to_bits(),
+                    "params differ at row {} col {}",
+                    i * 300 + r,
+                    c
+                );
+            }
+        }
+    }
+}

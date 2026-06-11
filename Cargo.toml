@@ -116,3 +116,4 @@ opt-level = 0
 [profile.bench]
 inherits = "release"
 debug = 2  # Full debug info for flamegraphs
+strip = false  # release's strip=true would discard the debug info above

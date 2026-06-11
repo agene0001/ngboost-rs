@@ -15,6 +15,11 @@ pub struct Normal {
     pub loc: Array1<f64>,
     /// The standard deviation of the distribution (scale).
     pub scale: Array1<f64>,
+    /// ln(scale). This is exactly the raw internal parameter, kept so the
+    /// LogScore hot path (score/logpdf, evaluated repeatedly in line search)
+    /// reads it directly instead of recomputing ln(exp(p)) per element —
+    /// faster AND exact (no exp→ln roundtrip error).
+    pub log_scale: Array1<f64>,
 }
 
 impl Normal {
@@ -24,13 +29,28 @@ impl Normal {
     pub fn var(&self) -> Array1<f64> {
         &self.scale * &self.scale
     }
+
+    /// Construct from loc and scale (σ) directly.
+    pub fn new(loc: Array1<f64>, scale: Array1<f64>) -> Self {
+        let log_scale = scale.mapv(f64::ln);
+        Normal {
+            loc,
+            scale,
+            log_scale,
+        }
+    }
 }
 
 impl Distribution for Normal {
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
-        let scale = params.column(1).mapv(f64::exp);
-        Normal { loc, scale }
+        let log_scale = params.column(1).to_owned();
+        let scale = crate::vmath::exp_array(&log_scale);
+        Normal {
+            loc,
+            scale,
+            log_scale,
+        }
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
@@ -58,7 +78,7 @@ impl Distribution for Normal {
         let n = self.loc.len();
         let mut p = Array2::zeros((n, 2));
         p.column_mut(0).assign(&self.loc);
-        p.column_mut(1).assign(&self.scale.mapv(f64::ln));
+        p.column_mut(1).assign(&self.log_scale);
         p
     }
 }
@@ -95,15 +115,17 @@ impl DistributionMethods for Normal {
 
     fn logpdf(&self, y: &Array1<f64>) -> Array1<f64> {
         // Vectorized log PDF: ln(f(x)) = -0.5 * ln(2π) - ln(σ) - 0.5 * ((x - μ) / σ)²
+        // ln(σ) is the cached raw parameter — no per-element ln call.
         const HALF_LN_2PI: f64 = 0.9189385332046727; // 0.5 * ln(2π)
         let mut result = Array1::zeros(y.len());
         Zip::from(&mut result)
             .and(y)
             .and(&self.loc)
             .and(&self.scale)
-            .for_each(|r, &y_i, &loc, &scale| {
+            .and(&self.log_scale)
+            .for_each(|r, &y_i, &loc, &scale, &log_scale| {
                 let z = (y_i - loc) / scale;
-                *r = -HALF_LN_2PI - scale.ln() - 0.5 * z * z;
+                *r = -HALF_LN_2PI - log_scale - 0.5 * z * z;
             });
         result
     }
@@ -201,15 +223,17 @@ impl Scorable<LogScore> for Normal {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         // Vectorized -logpdf(y)
         // -ln(f(y)) = 0.5*ln(2π) + ln(σ) + 0.5*((y-μ)/σ)²
+        // ln(σ) is the cached raw parameter — no per-element ln call.
         const HALF_LN_2PI: f64 = 0.9189385332046727;
         let mut scores = Array1::zeros(y.len());
         Zip::from(&mut scores)
             .and(y)
             .and(&self.loc)
             .and(&self.scale)
-            .for_each(|s, &y_i, &loc, &scale| {
+            .and(&self.log_scale)
+            .for_each(|s, &y_i, &loc, &scale, &log_scale| {
                 let z = (y_i - loc) / scale;
-                *s = HALF_LN_2PI + scale.ln() + 0.5 * z * z;
+                *s = HALF_LN_2PI + log_scale + 0.5 * z * z;
             });
         scores
     }
@@ -573,15 +597,23 @@ pub struct NormalFixedMean {
     pub scale: Array1<f64>,
     /// The variance.
     pub var: Array1<f64>,
+    /// ln(scale) — the cached raw parameter (see [`Normal::log_scale`]).
+    pub log_scale: Array1<f64>,
 }
 
 impl Distribution for NormalFixedMean {
     fn from_params(params: &Array2<f64>) -> Self {
-        let scale = params.column(0).mapv(f64::exp);
+        let log_scale = params.column(0).to_owned();
+        let scale = crate::vmath::exp_array(&log_scale);
         let var = &scale * &scale;
         let n = scale.len();
         let loc = Array1::zeros(n);
-        NormalFixedMean { loc, scale, var }
+        NormalFixedMean {
+            loc,
+            scale,
+            var,
+            log_scale,
+        }
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
@@ -604,7 +636,7 @@ impl Distribution for NormalFixedMean {
     fn params(&self) -> Array2<f64> {
         let n = self.scale.len();
         let mut p = Array2::zeros((n, 1));
-        p.column_mut(0).assign(&self.scale.mapv(f64::ln));
+        p.column_mut(0).assign(&self.log_scale);
         p
     }
 }
@@ -697,9 +729,10 @@ impl Scorable<LogScore> for NormalFixedMean {
         Zip::from(&mut scores)
             .and(y)
             .and(&self.scale)
-            .for_each(|s, &y_i, &scale| {
+            .and(&self.log_scale)
+            .for_each(|s, &y_i, &scale, &log_scale| {
                 let z = y_i / scale;
-                *s = HALF_LN_2PI + scale.ln() + 0.5 * z * z;
+                *s = HALF_LN_2PI + log_scale + 0.5 * z * z;
             });
         scores
     }

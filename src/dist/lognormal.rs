@@ -19,7 +19,7 @@ pub struct LogNormal {
 impl Distribution for LogNormal {
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
-        let scale = params.column(1).mapv(f64::exp);
+        let scale = crate::vmath::exp_column(&params.column(1));
         LogNormal { loc, scale }
     }
 

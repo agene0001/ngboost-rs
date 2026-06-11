@@ -24,9 +24,9 @@ pub struct StudentT {
 impl Distribution for StudentT {
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
-        let scale = params.column(1).mapv(f64::exp);
+        let scale = crate::vmath::exp_column(&params.column(1));
         let var = &scale * &scale;
-        let df = params.column(2).mapv(f64::exp);
+        let df = crate::vmath::exp_column(&params.column(2));
         StudentT {
             loc,
             scale,
@@ -612,7 +612,7 @@ impl TFixedDf {
     /// Creates a new TFixedDf distribution from parameters with a custom fixed df.
     pub fn from_params_with_df(params: &Array2<f64>, fixed_df: f64) -> Self {
         let loc = params.column(0).to_owned();
-        let scale = params.column(1).mapv(f64::exp);
+        let scale = crate::vmath::exp_column(&params.column(1));
         let var = &scale * &scale;
         let n = loc.len();
         let df = Array1::from_elem(n, fixed_df);

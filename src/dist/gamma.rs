@@ -14,8 +14,8 @@ pub struct Gamma {
 
 impl Distribution for Gamma {
     fn from_params(params: &Array2<f64>) -> Self {
-        let shape = params.column(0).mapv(f64::exp);
-        let rate = params.column(1).mapv(f64::exp);
+        let shape = crate::vmath::exp_column(&params.column(0));
+        let rate = crate::vmath::exp_column(&params.column(1));
         Gamma { shape, rate }
     }
 

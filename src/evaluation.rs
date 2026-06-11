@@ -290,8 +290,13 @@ pub fn concordance_index(
     let all_uncensored = events.iter().all(|&e| e);
 
     if all_uncensored {
-        // Use optimized O(n log n) algorithm for uncensored data
-        return concordance_index_uncensored_fast(predictions, times);
+        // Use optimized O(n log n) algorithm for uncensored data.
+        // Returns None when times contain ties, which the inversion-counting
+        // algorithm cannot exclude from the comparable-pair total; fall through
+        // to the general loop in that case so both paths agree.
+        if let Some(c) = concordance_index_uncensored_fast(predictions, times) {
+            return c;
+        }
     }
 
     // For censored data, use optimized O(n²) algorithm with early pruning
@@ -350,10 +355,13 @@ pub fn concordance_index(
 
 /// Fast concordance index for fully uncensored data using O(n log n) algorithm.
 /// Uses merge sort to count inversions.
-fn concordance_index_uncensored_fast(predictions: &Array1<f64>, times: &Array1<f64>) -> f64 {
+///
+/// Returns `None` if `times` contains ties: tied-time pairs are not comparable
+/// under Harrell's definition, and the inversion count cannot exclude them.
+fn concordance_index_uncensored_fast(predictions: &Array1<f64>, times: &Array1<f64>) -> Option<f64> {
     let n = times.len();
     if n < 2 {
-        return 0.5;
+        return Some(0.5);
     }
 
     // Create pairs of (time, prediction, original_index) and sort by time
@@ -366,6 +374,10 @@ fn concordance_index_uncensored_fast(predictions: &Array1<f64>, times: &Array1<f
 
     pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
+    if pairs.windows(2).any(|w| w[0].0 == w[1].0) {
+        return None;
+    }
+
     // Count concordant pairs using merge sort inversion counting
     // After sorting by time, we need to count how many pairs have
     // predictions in the correct order (higher risk = lower time)
@@ -375,10 +387,10 @@ fn concordance_index_uncensored_fast(predictions: &Array1<f64>, times: &Array1<f
     let (concordant, ties, total) = count_concordant_pairs(&preds_sorted_by_time);
 
     if total == 0.0 {
-        return 0.5;
+        return Some(0.5);
     }
 
-    (concordant + 0.5 * ties) / total
+    Some((concordant + 0.5 * ties) / total)
 }
 
 /// Count concordant pairs, ties, and total comparable pairs using O(n log n) merge sort.
@@ -743,18 +755,17 @@ fn kaplan_meier(times: &Array1<f64>, events: &Array1<bool>) -> KaplanMeierResult
 }
 
 /// Interpolate Kaplan-Meier survival function at a given time.
+///
+/// KM is a right-continuous step function: S(t) = P(T > t), so at an exact
+/// event time the post-drop value applies.
 fn interpolate_km(km: &KaplanMeierResult, t: f64) -> f64 {
-    if km.times.is_empty() {
-        return 1.0;
-    }
-
-    if t <= km.times[0] {
+    if km.times.is_empty() || t < km.times[0] {
         return 1.0;
     }
 
     for i in 0..km.times.len() {
-        if t <= km.times[i] {
-            return km.survival[i.saturating_sub(1)];
+        if t < km.times[i] {
+            return km.survival[i - 1];
         }
     }
 
@@ -906,6 +917,70 @@ mod tests {
         assert_eq!(km.times.len(), 5);
         assert!(km.survival[0] < 1.0);
         assert!(km.survival.last().unwrap() < &km.survival[0]);
+    }
+
+    #[test]
+    fn test_concordance_index_tied_times_excluded() {
+        // Tied event times are not comparable pairs (Harrell). With the only
+        // distinct-time pairs being (1,2) and (1,2)', both concordant:
+        // pairs: (0,1) tied -> excluded; (0,2) t 1<2, p 3>1 concordant;
+        // (1,2) t 1<2, p 2>1 concordant => C = 1.0
+        let predictions = Array1::from_vec(vec![3.0, 2.0, 1.0]);
+        let times = Array1::from_vec(vec![1.0, 1.0, 2.0]);
+        let events = Array1::from_vec(vec![true, true, true]);
+
+        let c_index = concordance_index(&predictions, &times, &events);
+        assert_relative_eq!(c_index, 1.0, epsilon = 1e-10);
+
+        // Only-tied-times data has zero comparable pairs -> 0.5 by convention
+        let predictions = Array1::from_vec(vec![1.0, 2.0]);
+        let times = Array1::from_vec(vec![5.0, 5.0]);
+        let events = Array1::from_vec(vec![true, true]);
+        let c_index = concordance_index(&predictions, &times, &events);
+        assert_relative_eq!(c_index, 0.5, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_concordance_index_fast_matches_general_loop() {
+        // Untied times take the fast inversion-count path; it must equal a
+        // brute-force pairwise computation of Harrell's C.
+        let predictions: Array1<f64> = Array1::from_vec(vec![2.0, 7.0, 1.0, 5.0, 3.0, 6.0, 4.0]);
+        let times: Array1<f64> = Array1::from_vec(vec![3.0, 1.0, 7.0, 2.0, 5.0, 4.0, 6.0]);
+        let events = Array1::from_vec(vec![true; 7]);
+
+        let mut concordant = 0.0;
+        let mut total = 0.0;
+        for i in 0..7 {
+            for j in 0..7 {
+                if times[i] < times[j] {
+                    total += 1.0;
+                    if predictions[i] > predictions[j] {
+                        concordant += 1.0;
+                    } else if (predictions[i] - predictions[j]).abs() < 1e-10 {
+                        concordant += 0.5;
+                    }
+                }
+            }
+        }
+        let expected = concordant / total;
+
+        let c_index = concordance_index(&predictions, &times, &events);
+        assert_relative_eq!(c_index, expected, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_interpolate_km_right_continuous() {
+        // Events at t=1,2 with no censoring: S(1)=0.5 (post-drop), S(0.5)=1.0,
+        // S(1.5)=0.5, S(2)=0.0
+        let times = Array1::from_vec(vec![1.0, 2.0]);
+        let events = Array1::from_vec(vec![true, true]);
+        let km = kaplan_meier(&times, &events);
+
+        assert_relative_eq!(interpolate_km(&km, 0.5), 1.0, epsilon = 1e-10);
+        assert_relative_eq!(interpolate_km(&km, 1.0), 0.5, epsilon = 1e-10);
+        assert_relative_eq!(interpolate_km(&km, 1.5), 0.5, epsilon = 1e-10);
+        assert_relative_eq!(interpolate_km(&km, 2.0), 0.0, epsilon = 1e-10);
+        assert_relative_eq!(interpolate_km(&km, 3.0), 0.0, epsilon = 1e-10);
     }
 
     #[test]

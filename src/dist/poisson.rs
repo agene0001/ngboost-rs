@@ -12,7 +12,7 @@ pub struct Poisson {
 
 impl Distribution for Poisson {
     fn from_params(params: &Array2<f64>) -> Self {
-        let rate = params.column(0).mapv(f64::exp);
+        let rate = crate::vmath::exp_column(&params.column(0));
         Poisson { rate }
     }
 
@@ -122,21 +122,29 @@ impl DistributionMethods for Poisson {
         for i in 0..n_obs {
             let rate = self.rate[i];
             for s in 0..n_samples {
-                // Use Knuth's algorithm for Poisson sampling
-                // This is more reliable than inverse CDF for the statrs implementation
-                let l = (-rate).exp();
-                let mut k = 0u64;
-                let mut p = 1.0_f64;
+                // Knuth's algorithm, run in chunks of rate <= 500 so e^{-rate}
+                // never underflows to 0 (which would cap draws near ~700).
+                // Exact since Poisson(a + b) = Poisson(a) + Poisson(b).
+                let mut remaining = rate;
+                let mut total = 0u64;
+                while remaining > 0.0 {
+                    let chunk = remaining.min(500.0);
+                    remaining -= chunk;
 
-                loop {
-                    k += 1;
-                    let u: f64 = rng.random();
-                    p *= u;
-                    if p <= l {
-                        break;
+                    let l = (-chunk).exp();
+                    let mut k = 0u64;
+                    let mut p = 1.0_f64;
+                    loop {
+                        k += 1;
+                        let u: f64 = rng.random();
+                        p *= u;
+                        if p <= l {
+                            break;
+                        }
                     }
+                    total += k - 1;
                 }
-                samples[[s, i]] = (k - 1) as f64;
+                samples[[s, i]] = total as f64;
             }
         }
         samples
@@ -230,111 +238,131 @@ impl Scorable<LogScore> for Poisson {
     }
 }
 
+/// Build Poisson pmf and cdf tables for k = 0..=k_max using the multiplicative
+/// recurrence pmf(k+1) = pmf(k)·λ/(k+1) — no special-function calls per entry.
+/// Falls back to statrs pmf when e^{-λ} underflows (λ ≳ 708).
+fn poisson_tables(lambda: f64, k_max: i64) -> (Vec<f64>, Vec<f64>) {
+    let len = (k_max + 1).max(1) as usize;
+    let mut pmf = vec![0.0; len];
+    let mut cdf = vec![0.0; len];
+
+    let p0 = (-lambda).exp();
+    if p0 > 0.0 {
+        let mut p = p0;
+        let mut f = 0.0;
+        for (k, (pk, fk)) in pmf.iter_mut().zip(cdf.iter_mut()).enumerate() {
+            if k > 0 {
+                p *= lambda / k as f64;
+            }
+            f += p;
+            *pk = p;
+            *fk = f.min(1.0);
+        }
+    } else if let Ok(d) = PoissonDist::new(lambda) {
+        let mut f = 0.0;
+        for (k, (pk, fk)) in pmf.iter_mut().zip(cdf.iter_mut()).enumerate() {
+            let p = d.pmf(k as u64);
+            f += p;
+            *pk = p;
+            *fk = f.min(1.0);
+        }
+    }
+    (pmf, cdf)
+}
+
+/// CRPS metric value for a single rate λ: M = Σ_y g(y)² · P(Y=y), where
+/// g(y) = λ · dCRPS/dλ = 2λ·(Σ_{k≥y} pmf(k) − Σ_k F(k)·pmf(k)).
+///
+/// Uses prefix/suffix sums over a single pmf/cdf table — O(k_max) total,
+/// replacing the previous O(k_max²) nested loop with per-element cdf calls.
+fn poisson_crps_metric_value(lambda: f64) -> f64 {
+    let std_dev = lambda.sqrt();
+    let y_max = ((lambda + 8.0 * std_dev).ceil() as i64).max(5);
+    // Largest inner truncation over all y: max(λ+6σ, y_max+10)
+    let k_total = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_max + 10);
+
+    let (pmf, cdf) = poisson_tables(lambda, k_total);
+    let len = pmf.len();
+
+    // fp[k] = Σ_{j≤k} F(j)·pmf(j)  (prefix);  suf[k] = Σ_{j≥k} pmf(j)  (suffix)
+    let mut fp = vec![0.0; len];
+    let mut acc = 0.0;
+    for k in 0..len {
+        acc += cdf[k] * pmf[k];
+        fp[k] = acc;
+    }
+    let mut suf = vec![0.0; len + 1];
+    for k in (0..len).rev() {
+        suf[k] = suf[k + 1] + pmf[k];
+    }
+
+    let mut metric_val = 0.0;
+    for y_int in 0..=y_max {
+        let y_us = y_int as usize;
+        let pmf_y = pmf[y_us];
+        if pmf_y < 1e-300 {
+            continue;
+        }
+
+        // Same per-y truncation as the original nested loop
+        let inner_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_int + 10) as usize;
+        let inner_max = inner_max.min(len - 1);
+
+        // d_crps = 2·(Σ_{y≤k≤inner_max} pmf(k) − Σ_{k≤inner_max} F(k)·pmf(k))
+        let tail = suf[y_us] - suf[inner_max + 1];
+        let d_crps = 2.0 * (tail - fp[inner_max]);
+        let g = lambda * d_crps; // d/d(log λ) = λ · d/dλ
+
+        metric_val += g * g * pmf_y;
+    }
+    metric_val
+}
+
 impl Scorable<CRPScore> for Poisson {
     fn is_diagonal_metric(&self) -> bool {
         true
     }
 
     fn diagonal_metric(&self) -> Array2<f64> {
-        // CRPScore metric for Poisson: M = Σ_y g(y)^2 * P(Y=y) (1 param)
+        // CRPScore metric for Poisson: M = Σ_y g(y)² · P(Y=y) (1 param)
         let n_obs = self.rate.len();
         let mut diag = Array2::zeros((n_obs, 1));
-
         for i in 0..n_obs {
-            let lambda = self.rate[i];
-            let std_dev = lambda.sqrt();
-            let k_max = ((lambda + 8.0 * std_dev).ceil() as i64).max(5);
-
-            if let Ok(d) = PoissonDist::new(lambda) {
-                let mut metric_val = 0.0;
-
-                for y_int in 0..=k_max {
-                    let pmf_y = d.pmf(y_int as u64);
-                    if pmf_y < 1e-300 {
-                        continue;
-                    }
-
-                    let mut d_crps = 0.0;
-                    let inner_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_int + 10);
-
-                    for k in 0..=inner_max {
-                        let f_k = d.cdf(k as u64);
-                        let indicator = if y_int <= k { 1.0 } else { 0.0 };
-                        let diff = f_k - indicator;
-                        let pmf_k = d.pmf(k as u64);
-                        d_crps += 2.0 * diff * (-pmf_k);
-                    }
-                    let g = lambda * d_crps;
-
-                    metric_val += g * g * pmf_y;
-                }
-
-                diag[[i, 0]] = metric_val;
-            }
+            diag[[i, 0]] = poisson_crps_metric_value(self.rate[i]);
         }
-
         diag
     }
 
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
-        // CRPS for Poisson distribution (discrete CRPS)
-        // For discrete distributions:
-        // CRPS = E|X - y| - 0.5 * E|X - X'|
-        // where X, X' are independent draws from the Poisson distribution
-        //
-        // For Poisson with rate λ, there's a closed-form expression:
-        // CRPS = y * (2*F(y) - 1) - λ * (2*F(y-1) - 1) + 2*λ*f(floor(y)) - λ*exp(-2λ)*I_0(2λ)
-        // where F is CDF, f is PMF, and I_0 is modified Bessel function
-        //
-        // Simpler approximation using the identity:
-        // CRPS = 2 * Σ_{k=0}^{∞} (F(k) - 1{y ≤ k}) * (F(k) - 1{y ≤ k-1})
-        //      = Σ_{k=0}^{∞} (F(k) - 1{y ≤ k})²
-        //
-        // We compute this by summing over k values with significant probability mass
-
+        // Discrete CRPS: CRPS = Σ_{k=0}^{∞} (F(k) - 1{y ≤ k})²
+        // (identity for integer-valued distributions; verified vs Monte Carlo).
+        // Truncated where the probability mass becomes negligible.
         let mut scores = Array1::zeros(y.len());
 
         for i in 0..y.len() {
             let lambda = self.rate[i];
             let y_i = y[i].round() as i64; // Round to nearest integer
 
-            if let Ok(d) = PoissonDist::new(lambda) {
-                // Compute CRPS using the discrete formula
-                // CRPS = Σ_{k=0}^{∞} (F(k) - 1{y ≤ k})²
-                // We truncate the sum when probability mass becomes negligible
+            // Cover most of the probability mass: mean + 6σ (>99.99%)
+            let std_dev = lambda.sqrt();
+            let k_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_i + 10);
+            let (_, cdf) = poisson_tables(lambda, k_max);
 
-                let mut crps = 0.0;
-
-                // Determine range to sum over (cover most of the probability mass)
-                // Use mean ± 6*std for Poisson (covers >99.99% of mass)
-                let std_dev = lambda.sqrt();
-                let k_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_i + 10);
-
-                for k in 0..=k_max {
-                    let f_k = d.cdf(k as u64);
-                    let indicator = if y_i <= k { 1.0 } else { 0.0 };
-                    let diff = f_k - indicator;
-                    crps += diff * diff;
-                }
-
-                scores[i] = crps;
-            } else {
-                scores[i] = f64::MAX;
+            let mut crps = 0.0;
+            for (k, &f_k) in cdf.iter().enumerate() {
+                let indicator = if y_i <= k as i64 { 1.0 } else { 0.0 };
+                let diff = f_k - indicator;
+                crps += diff * diff;
             }
+            scores[i] = crps;
         }
         scores
     }
 
     fn d_score(&self, y: &Array1<f64>) -> Array2<f64> {
-        // Gradient of discrete CRPS w.r.t. log(rate)
-        // Using numerical differentiation or analytical form
-        //
-        // d(CRPS)/d(log(λ)) = λ * d(CRPS)/d(λ)
-        //
-        // For Poisson CRPS, the gradient involves:
-        // d(F(k))/d(λ) = -f(k) + f(k-1) for k >= 1, and -f(0) for k=0
-        // where f is the PMF
-
+        // Gradient of discrete CRPS w.r.t. log(rate):
+        // dF(k)/dλ = -pmf(k), so
+        // dCRPS/d(log λ) = λ · Σ_k 2(F(k) - 1{y≤k})·(-pmf(k))
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 1));
 
@@ -342,75 +370,29 @@ impl Scorable<CRPScore> for Poisson {
             let lambda = self.rate[i];
             let y_i = y[i].round() as i64;
 
-            if let Ok(d) = PoissonDist::new(lambda) {
-                let mut d_crps = 0.0;
+            let std_dev = lambda.sqrt();
+            let k_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_i + 10);
+            let (pmf, cdf) = poisson_tables(lambda, k_max);
 
-                let std_dev = lambda.sqrt();
-                let k_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_i + 10);
-
-                for k in 0..=k_max {
-                    let f_k = d.cdf(k as u64);
-                    let indicator = if y_i <= k { 1.0 } else { 0.0 };
-                    let diff = f_k - indicator;
-
-                    // d(F(k))/d(λ) for Poisson:
-                    // F(k) = Γ(k+1, λ) / k! = Q(k+1, λ) (regularized incomplete gamma)
-                    // d(F(k))/d(λ) = -f(k) where f(k) is the PMF
-                    let pmf_k = d.pmf(k as u64);
-                    let df_dlambda = -pmf_k;
-
-                    d_crps += 2.0 * diff * df_dlambda;
-                }
-
-                // Convert to d/d(log(λ))
-                d_params[[i, 0]] = lambda * d_crps;
+            let mut d_crps = 0.0;
+            for k in 0..pmf.len() {
+                let indicator = if y_i <= k as i64 { 1.0 } else { 0.0 };
+                let diff = cdf[k] - indicator;
+                d_crps += 2.0 * diff * (-pmf[k]);
             }
+            d_params[[i, 0]] = lambda * d_crps;
         }
 
         d_params
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Deterministic CRPScore metric: M = Σ_y g(y)^2 * P(Y=y)
-        // Since Poisson is discrete, the expectation is an exact finite sum
-        // over the support, truncated where probability mass is negligible.
+        // Deterministic CRPScore metric: M = Σ_y g(y)² · P(Y=y)
         let n_obs = self.rate.len();
         let mut fi = Array3::zeros((n_obs, 1, 1));
-
         for i in 0..n_obs {
-            let lambda = self.rate[i];
-            let std_dev = lambda.sqrt();
-            let k_max = ((lambda + 8.0 * std_dev).ceil() as i64).max(5);
-
-            if let Ok(d) = PoissonDist::new(lambda) {
-                let mut metric_val = 0.0;
-
-                for y_int in 0..=k_max {
-                    let pmf_y = d.pmf(y_int as u64);
-                    if pmf_y < 1e-300 {
-                        continue;
-                    }
-
-                    // Compute CRPS gradient at this y value
-                    let mut d_crps = 0.0;
-                    let inner_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_int + 10);
-
-                    for k in 0..=inner_max {
-                        let f_k = d.cdf(k as u64);
-                        let indicator = if y_int <= k { 1.0 } else { 0.0 };
-                        let diff = f_k - indicator;
-                        let pmf_k = d.pmf(k as u64);
-                        d_crps += 2.0 * diff * (-pmf_k);
-                    }
-                    let g = lambda * d_crps; // d/d(log(λ)) = λ * d/d(λ)
-
-                    metric_val += g * g * pmf_y;
-                }
-
-                fi[[i, 0, 0]] = metric_val;
-            }
+            fi[[i, 0, 0]] = poisson_crps_metric_value(self.rate[i]);
         }
-
         fi
     }
 }
@@ -490,6 +472,23 @@ mod tests {
         // Check that sample mean is close to rate = 3
         let sample_mean: f64 = samples.column(0).iter().sum::<f64>() / samples.nrows() as f64;
         assert!((sample_mean - 3.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_poisson_sample_large_rate() {
+        // rate = 2000 > 708: e^{-rate} underflows to 0, so unchunked Knuth
+        // sampling would cap draws near ~700 instead of centering at 2000
+        let params = Array2::from_shape_vec((1, 1), vec![2000.0_f64.ln()]).unwrap();
+        let dist = Poisson::from_params(&params);
+
+        let samples = dist.sample(500);
+        let sample_mean: f64 = samples.column(0).iter().sum::<f64>() / samples.nrows() as f64;
+        // std of the mean is sqrt(2000/500) = 2, so +-25 is > 12 sigma
+        assert!(
+            (sample_mean - 2000.0).abs() < 25.0,
+            "sample mean {} far from rate 2000",
+            sample_mean
+        );
     }
 
     #[test]
@@ -640,5 +639,79 @@ mod tests {
 
         // Metric should be positive
         assert!(metric[[0, 0, 0]] > 0.0);
+    }
+
+    // ========================================================================
+    // Equivalence tests: fast table/prefix-sum CRPS vs the original
+    // O(k_max²) statrs-based computation
+    // ========================================================================
+
+    /// Original nested-loop metric using statrs cdf/pmf directly (reference).
+    fn reference_crps_metric(lambda: f64) -> f64 {
+        let d = PoissonDist::new(lambda).unwrap();
+        let std_dev = lambda.sqrt();
+        let k_max = ((lambda + 8.0 * std_dev).ceil() as i64).max(5);
+        let mut metric_val = 0.0;
+        for y_int in 0..=k_max {
+            let pmf_y = d.pmf(y_int as u64);
+            if pmf_y < 1e-300 {
+                continue;
+            }
+            let mut d_crps = 0.0;
+            let inner_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_int + 10);
+            for k in 0..=inner_max {
+                let f_k = d.cdf(k as u64);
+                let indicator = if y_int <= k { 1.0 } else { 0.0 };
+                d_crps += 2.0 * (f_k - indicator) * (-d.pmf(k as u64));
+            }
+            let g = lambda * d_crps;
+            metric_val += g * g * pmf_y;
+        }
+        metric_val
+    }
+
+    #[test]
+    fn test_poisson_crps_metric_matches_reference() {
+        for lambda in [0.3, 1.0, 3.0, 7.5, 25.0, 80.0] {
+            let fast = poisson_crps_metric_value(lambda);
+            let reference = reference_crps_metric(lambda);
+            assert_relative_eq!(fast, reference, max_relative = 1e-8);
+        }
+    }
+
+    #[test]
+    fn test_poisson_crps_score_dscore_match_reference() {
+        for lambda in [0.5, 2.0, 9.0, 40.0] {
+            let params = Array2::from_shape_vec((1, 1), vec![lambda_f64_ln(lambda)]).unwrap();
+            let dist = Poisson::from_params(&params);
+            let d = PoissonDist::new(lambda).unwrap();
+            let std_dev = lambda.sqrt();
+
+            for y_v in [0.0, 1.0, (lambda * 0.7).round(), (lambda * 1.5).round()] {
+                let y = Array1::from_vec(vec![y_v]);
+                let y_i = y_v.round() as i64;
+                let k_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_i + 10);
+
+                // Reference score and d_score with statrs cdf/pmf
+                let mut ref_score = 0.0;
+                let mut ref_dcrps = 0.0;
+                for k in 0..=k_max {
+                    let f_k = d.cdf(k as u64);
+                    let ind = if y_i <= k { 1.0 } else { 0.0 };
+                    ref_score += (f_k - ind) * (f_k - ind);
+                    ref_dcrps += 2.0 * (f_k - ind) * (-d.pmf(k as u64));
+                }
+                let ref_d = lambda * ref_dcrps;
+
+                let score = Scorable::<CRPScore>::score(&dist, &y);
+                let d_score = Scorable::<CRPScore>::d_score(&dist, &y);
+                assert_relative_eq!(score[0], ref_score, max_relative = 1e-8);
+                assert_relative_eq!(d_score[[0, 0]], ref_d, max_relative = 1e-8, epsilon = 1e-12);
+            }
+        }
+    }
+
+    fn lambda_f64_ln(v: f64) -> f64 {
+        v.ln()
     }
 }

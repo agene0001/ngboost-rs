@@ -114,6 +114,18 @@ pub trait CensoredScorable<S: Score> {
     where
         Self: Sized,
     {
+        self.censored_grad_regularized(y, natural, 0.0)
+    }
+
+    /// Like [`censored_grad`](Self::censored_grad), with Tikhonov regularization:
+    /// `reg * I` is added to the (censored) Fisher metric before solving.
+    /// Stabilizes training when the metric is near-singular — e.g. the
+    /// CRPS-censored Weibull quadrature metric, whose unregularized solves can
+    /// produce enormous natural-gradient values that blow up the parameters.
+    fn censored_grad_regularized(&self, y: &SurvivalData, natural: bool, reg: f64) -> Array2<f64>
+    where
+        Self: Sized,
+    {
         let grad = self.censored_d_score(y);
         if !natural {
             return grad;
@@ -122,34 +134,16 @@ pub trait CensoredScorable<S: Score> {
         // Fast path: diagonal metric — use flat Array2
         if self.is_diagonal_censored_metric() {
             let diag_metric = self.diagonal_censored_metric();
+            if reg > 0.0 {
+                return diagonal_natural_gradient_flat_regularized(&grad, &diag_metric, reg);
+            }
             return diagonal_natural_gradient_flat(&grad, &diag_metric);
         }
 
         // Non-diagonal: delegate to parallelized solver
         let metric = self.censored_metric();
-        natural_gradient_regularized(&grad, &metric, 0.0)
+        natural_gradient_regularized(&grad, &metric, reg)
     }
-}
-
-/// Compute the natural gradient when the metric (Fisher Information) is diagonal.
-/// Instead of solving a linear system per observation, we simply divide element-wise:
-/// nat_grad[i,j] = grad[i,j] / metric[i,j,j]
-///
-/// This is dramatically faster than LU decomposition for diagonal matrices.
-fn diagonal_natural_gradient(grad: &Array2<f64>, metric: &Array3<f64>) -> Array2<f64> {
-    let n_params = grad.ncols();
-    let mut nat_grad = Array2::zeros(grad.raw_dim());
-
-    for j in 0..n_params {
-        ndarray::Zip::from(nat_grad.column_mut(j))
-            .and(grad.column(j))
-            .and(metric.slice(ndarray::s![.., j, j]))
-            .for_each(|ng, &g, &m| {
-                *ng = g / m;
-            });
-    }
-
-    nat_grad
 }
 
 /// Compute the natural gradient using a flat diagonal metric (Array2 instead of Array3).
@@ -190,16 +184,102 @@ pub fn diagonal_natural_gradient_flat_regularized(
     nat_grad
 }
 
+/// Allocation-free closed-form solve of `(M + reg·I) x = g` for the small systems
+/// that dominate training (2×2 for Gamma/Weibull LogScore, 3×3 for StudentT).
+///
+/// Returns `None` to defer to the generic LAPACK path — either because the system
+/// is larger than 3×3 (e.g. MultivariateNormal) or because the matrix is exactly
+/// singular (matching `solve`'s zero-pivot error, which then routes to `pinv`).
+///
+/// Uses Cramer's rule via the adjugate. Like the generic path, it does NOT reject
+/// non-finite results: a tiny-but-nonzero determinant yields large/Inf values, just
+/// as an ill-conditioned LAPACK solve would, and Python keeps those too.
+#[inline]
+fn solve_small_natural_gradient(
+    g_i: &ndarray::ArrayView1<f64>,
+    metric_i: &ndarray::ArrayView2<f64>,
+    reg: f64,
+    n_params: usize,
+) -> Option<Array1<f64>> {
+    match n_params {
+        1 => {
+            let m = metric_i[[0, 0]] + reg;
+            if m == 0.0 {
+                return None;
+            }
+            Some(Array1::from_elem(1, g_i[0] / m))
+        }
+        2 => {
+            let a = metric_i[[0, 0]] + reg;
+            let b = metric_i[[0, 1]];
+            let c = metric_i[[1, 0]];
+            let d = metric_i[[1, 1]] + reg;
+            let det = a * d - b * c;
+            if det == 0.0 {
+                return None;
+            }
+            let (g0, g1) = (g_i[0], g_i[1]);
+            Some(ndarray::array![
+                (d * g0 - b * g1) / det,
+                (a * g1 - c * g0) / det,
+            ])
+        }
+        3 => {
+            let a = metric_i[[0, 0]] + reg;
+            let b = metric_i[[0, 1]];
+            let c = metric_i[[0, 2]];
+            let d = metric_i[[1, 0]];
+            let e = metric_i[[1, 1]] + reg;
+            let f = metric_i[[1, 2]];
+            let g = metric_i[[2, 0]];
+            let h = metric_i[[2, 1]];
+            let i = metric_i[[2, 2]] + reg;
+
+            // Cofactors (det = a·A00 + b·A10 + c·A20 along the first column)
+            let a00 = e * i - f * h;
+            let a10 = -(d * i - f * g);
+            let a20 = d * h - e * g;
+            let det = a * a00 + d * a10 + g * a20;
+            if det == 0.0 {
+                return None;
+            }
+            // Adjugate (transpose of the cofactor matrix)
+            let a01 = -(b * i - c * h);
+            let a02 = b * f - c * e;
+            let a11 = a * i - c * g;
+            let a12 = -(a * f - c * d);
+            let a21 = -(a * h - b * g);
+            let a22 = a * e - b * d;
+
+            let (g0, g1, g2) = (g_i[0], g_i[1], g_i[2]);
+            let inv_det = 1.0 / det;
+            Some(ndarray::array![
+                (a00 * g0 + a01 * g1 + a02 * g2) * inv_det,
+                (a10 * g0 + a11 * g1 + a12 * g2) * inv_det,
+                (a20 * g0 + a21 * g1 + a22 * g2) * inv_det,
+            ])
+        }
+        _ => None,
+    }
+}
+
 /// Compute the natural gradient for a single observation.
 /// This is the core computation factored out for parallelization.
 /// Optimized to minimize allocations by reusing workspace arrays where possible.
 #[inline]
-fn compute_natural_gradient_single(
+pub(crate) fn compute_natural_gradient_single(
     g_i: &ndarray::ArrayView1<f64>,
     metric_i: &ndarray::ArrayView2<f64>,
     reg: f64,
     n_params: usize,
 ) -> Array1<f64> {
+    // Fast path: closed-form solve for 1×1 / 2×2 / 3×3 systems — no heap
+    // allocation and no LAPACK call. `None` means singular or larger than 3×3,
+    // both of which fall through to the generic path below.
+    if let Some(ng_i) = solve_small_natural_gradient(g_i, metric_i, reg, n_params) {
+        return ng_i;
+    }
+
     // Only clone if we need to modify (when regularization is applied)
     let metric_owned: Array2<f64> = if reg > 0.0 {
         let mut metric_reg = metric_i.to_owned();
@@ -381,9 +461,19 @@ pub trait Scorable<S: Score> {
         }
 
         // Non-diagonal: separate d_score + full metric + solve
+        self.dense_natural_grad(y, 0.0)
+    }
+
+    /// Calculates the natural gradient for a non-diagonal metric, with optional
+    /// Tikhonov regularization (`F + reg·I`).
+    ///
+    /// Default implementation materializes the full (n_obs, p, p) metric and
+    /// solves row-by-row. Override for distributions whose Fisher matrix has a
+    /// closed-form inverse (e.g. Categorical's diag(p) − ppᵀ via Sherman-Morrison).
+    fn dense_natural_grad(&self, y: &Array1<f64>, reg: f64) -> Array2<f64> {
         let grad = self.d_score(y);
         let metric = self.metric();
-        natural_gradient_regularized(&grad, &metric, 0.0)
+        natural_gradient_regularized(&grad, &metric, reg)
     }
 
     /// Calculates the natural gradient using the fused d_score + diagonal_metric path.
@@ -395,5 +485,63 @@ pub trait Scorable<S: Score> {
         } else {
             diagonal_natural_gradient_flat(&grad, &diag_metric)
         }
+    }
+}
+
+#[cfg(test)]
+mod natgrad_tests {
+    use super::*;
+    use ndarray::{array, Array2};
+    use ndarray_linalg::Solve;
+
+    /// The closed-form 2×2 / 3×3 solve must agree with the generic LAPACK solve
+    /// on well-conditioned systems (the regime hit during normal training).
+    #[test]
+    fn closed_form_matches_lapack() {
+        // (matrix, rhs) cases: symmetric PD 2×2 (Gamma/Weibull-like) and 3×3 (StudentT-like)
+        let cases: Vec<(Array2<f64>, Array1<f64>)> = vec![
+            (array![[4.0, -2.0], [-2.0, 3.0]], array![1.5, -0.7]),
+            (array![[1.0, 0.0], [0.0, 2.0]], array![0.3, 0.9]),
+            (
+                array![[5.0, 1.0, 0.5], [1.0, 4.0, -1.0], [0.5, -1.0, 3.0]],
+                array![0.2, -1.1, 0.8],
+            ),
+        ];
+
+        for (m, g) in cases {
+            let n = g.len();
+            let expected = m.solve_into(g.clone()).unwrap();
+            for &reg in &[0.0, 1e-3] {
+                let got =
+                    solve_small_natural_gradient(&g.view(), &m.view(), reg, n).unwrap();
+                let mut m_reg = m.clone();
+                for j in 0..n {
+                    m_reg[[j, j]] += reg;
+                }
+                let expected_reg = m_reg.solve_into(g.clone()).unwrap();
+                let _ = &expected; // (reg=0 path equals `expected`)
+                for j in 0..n {
+                    assert!(
+                        (got[j] - expected_reg[j]).abs() < 1e-12,
+                        "n={n} reg={reg} mismatch at {j}: {} vs {}",
+                        got[j],
+                        expected_reg[j]
+                    );
+                }
+            }
+        }
+    }
+
+    /// A singular matrix returns None so the caller routes to the pinv fallback,
+    /// and systems larger than 3×3 (e.g. MVN) defer to the generic path.
+    #[test]
+    fn singular_and_large_defer() {
+        let singular = array![[1.0, 2.0], [2.0, 4.0]];
+        let g = array![1.0, 1.0];
+        assert!(solve_small_natural_gradient(&g.view(), &singular.view(), 0.0, 2).is_none());
+
+        let big = Array2::<f64>::eye(5);
+        let g5 = Array1::<f64>::ones(5);
+        assert!(solve_small_natural_gradient(&g5.view(), &big.view(), 0.0, 5).is_none());
     }
 }

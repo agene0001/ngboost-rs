@@ -4,7 +4,9 @@ pub type LossMonitor<D> = Box<dyn Fn(&D, &Array1<f64>, Option<&Array1<f64>>) -> 
 use crate::dist::categorical::{Bernoulli, Categorical};
 use crate::dist::normal::Normal;
 use crate::dist::{ClassificationDistn, Distribution};
-use crate::learners::{BaseLearner, DecisionTreeLearner, TrainedBaseLearner, default_tree_learner};
+use crate::learners::{
+    BaseLearner, DecisionTreeLearner, HistogramLearner, TrainedBaseLearner, default_base_learner,
+};
 use crate::scores::{LogScore, Scorable, Score};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
@@ -55,6 +57,10 @@ pub enum LineSearchMethod {
 
 /// Golden ratio constant for golden section search.
 const GOLDEN_RATIO: f64 = 1.618033988749895;
+
+/// Row-chunk size for rayon-parallel tree prediction (get_params_at /
+/// predict_and_update_params). Inputs under 2× this stay sequential.
+const PAR_ROW_CHUNK: usize = 256;
 
 /// Training history result containing loss values at each iteration.
 #[derive(Debug, Clone, Default)]
@@ -807,11 +813,31 @@ where
         let mut best_iter = 0;
         let mut val_loss_list: Vec<f64> = Vec::new();
 
+        // When X is stable across iterations (no row/column subsampling), let
+        // the base learner precompute a fit cache once for the whole run
+        // (e.g. HistogramLearner bins X once instead of every iteration).
+        // Learners that don't benefit return None, costing nothing.
+        let x_is_stable = self.minibatch_frac >= 1.0 && self.col_sample >= 1.0;
+        let stable_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> = if x_is_stable {
+            self.base_learner.build_fit_cache(&x_train)
+        } else {
+            None
+        };
+
         for itr in 0..self.n_estimators {
             // Sample data for this iteration
             let (col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
                 self.sample(&x_train, &y_train, &params, sample_weight);
             self.col_idxs.push(col_idxs);
+
+            // With subsampling, X changes per iteration — build a per-iteration
+            // cache instead, still amortized across the n_params parallel fits.
+            let iter_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
+                match &stable_cache {
+                    Some(c) => Some(std::sync::Arc::clone(c)),
+                    None if !x_is_stable => self.base_learner.build_fit_cache(&x_sampled),
+                    None => None,
+                };
 
             // Dereference Cow to get &Array references (zero-cost for Borrowed)
             let x_sampled_ref = &*x_sampled;
@@ -840,11 +866,9 @@ where
                         self.tikhonov_reg,
                     )
                 } else {
-                    let standard_grad = Scorable::d_score(&batch_dist, y_sampled_ref);
-                    let metric = Scorable::metric(&batch_dist);
-                    crate::scores::natural_gradient_regularized(
-                        &standard_grad,
-                        &metric,
+                    Scorable::<S>::dense_natural_grad(
+                        &batch_dist,
+                        y_sampled_ref,
                         self.tikhonov_reg,
                     )
                 }
@@ -858,12 +882,20 @@ where
 
             let fit_results: Vec<Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>> = {
                 let learners: Vec<B> = (0..n_params).map(|_| self.base_learner.clone()).collect();
+                let cache_ref = iter_cache.as_deref();
                 learners
                     .into_par_iter()
                     .zip(grad_cols.into_par_iter())
                     .map(|(learner, grad_j)| {
-                        let fitted =
-                            learner.fit_with_weights(x_sampled_ref, &grad_j, weight_ref)?;
+                        let fitted = match cache_ref {
+                            Some(c) => learner.fit_with_weights_cached(
+                                x_sampled_ref,
+                                &grad_j,
+                                weight_ref,
+                                c,
+                            )?,
+                            None => learner.fit_with_weights(x_sampled_ref, &grad_j, weight_ref)?,
+                        };
                         let preds = fitted.predict(x_sampled_ref);
                         Ok((fitted, preds))
                     })
@@ -1122,43 +1154,6 @@ where
         )
     }
 
-    /// Compute predictions from a set of learners on input data.
-    /// Handles column subsampling if col_idxs doesn't match all columns.
-    /// Returns an Array2 with shape (n_samples, n_learners).
-    #[inline]
-    fn predict_from_learners(
-        learners: &[Box<dyn TrainedBaseLearner>],
-        x: &Array2<f64>,
-        col_idxs: &[usize],
-    ) -> Array2<f64> {
-        if learners.is_empty() {
-            return Array2::zeros((x.nrows(), 0));
-        }
-
-        let n_samples = x.nrows();
-        let n_params = learners.len();
-
-        // Pre-allocate the result array
-        let mut result = Array2::zeros((n_samples, n_params));
-
-        if col_idxs.len() == x.ncols() {
-            // No column subsampling - predict directly
-            for (j, learner) in learners.iter().enumerate() {
-                let preds = learner.predict(x);
-                result.column_mut(j).assign(&preds);
-            }
-        } else {
-            // Column subsampling - create subset once and reuse
-            let x_subset = x.select(ndarray::Axis(1), col_idxs);
-            for (j, learner) in learners.iter().enumerate() {
-                let preds = learner.predict(&x_subset);
-                result.column_mut(j).assign(&preds);
-            }
-        }
-
-        result
-    }
-
     /// Fused predict + scale + subtract: params -= factor * predictions.
     /// Avoids allocating the full predictions Array2 and intermediate scaled copies.
     /// Instead, predicts one parameter at a time and updates params in-place.
@@ -1174,6 +1169,10 @@ where
             return;
         }
 
+        // NOTE: deliberately NOT rayon-parallelized. This runs once per boosting
+        // iteration (~tens of µs of work); waking the pool 200×/fit costs more
+        // than the walk itself — measured 15-20% SLOWER end-to-end. get_params_at
+        // parallelizes instead: one dispatch covering all estimators.
         if col_idxs.len() == x.ncols() {
             for (j, learner) in learners.iter().enumerate() {
                 let preds = learner.predict(x);
@@ -1224,6 +1223,51 @@ where
             _ => self.base_models.len(),
         };
 
+        let factor_at = |i: usize| {
+            let lr = if i < self.effective_learning_rates.len() {
+                self.effective_learning_rates[i]
+            } else {
+                self.learning_rate
+            };
+            lr * self.scalings[i]
+        };
+
+        // Parallel path: each rayon task runs a contiguous block of rows through
+        // ALL estimators — chunky work units, no synchronization, and per-row
+        // arithmetic order identical to the sequential loop (bit-exact).
+        let p = x.ncols();
+        if x.nrows() >= 2 * PAR_ROW_CHUNK {
+            let base_models = &self.base_models;
+            let col_idxs = &self.col_idxs;
+            let factors: Vec<f64> = (0..n_iters).map(&factor_at).collect();
+            if let (Some(xs), Some(ps)) = (x.as_slice(), params.as_slice_mut()) {
+                ps.par_chunks_mut(PAR_ROW_CHUNK * n_params)
+                    .zip(xs.par_chunks(PAR_ROW_CHUNK * p))
+                    .for_each(|(p_chunk, x_chunk)| {
+                        let rows = x_chunk.len() / p;
+                        let mut buf = vec![0.0; rows];
+                        for ((learners, col_idx), &factor) in base_models
+                            .iter()
+                            .zip(col_idxs.iter())
+                            .zip(factors.iter())
+                        {
+                            let mapping = if col_idx.len() == p {
+                                None
+                            } else {
+                                Some(col_idx.as_slice())
+                            };
+                            for (j, learner) in learners.iter().enumerate() {
+                                learner.predict_rows(x_chunk, p, mapping, &mut buf);
+                                for (r, &b) in buf.iter().enumerate() {
+                                    p_chunk[r * n_params + j] -= factor * b;
+                                }
+                            }
+                        }
+                    });
+                return params;
+            }
+        }
+
         for (i, (learners, col_idx)) in self
             .base_models
             .iter()
@@ -1231,13 +1275,7 @@ where
             .enumerate()
             .take(n_iters)
         {
-            let scale = self.scalings[i];
-            let lr = if i < self.effective_learning_rates.len() {
-                self.effective_learning_rates[i]
-            } else {
-                self.learning_rate
-            };
-            let factor = lr * scale;
+            let factor = factor_at(i);
             Self::predict_and_update_params(learners, x, col_idx, &mut params, factor);
         }
         params
@@ -1487,8 +1525,8 @@ where
         // For normal distribution (2 parameters), adjust the scale parameter
         if let Some(init_params) = self.init_params.as_mut() {
             if init_params.len() >= 2 {
-                // The second parameter is log(scale), so we adjust it based on empirical variance
-                let current_var = (-init_params[1]).exp(); // exp(2*log(scale)) = scale^2
+                // The second parameter is log(scale), so variance = exp(2*log(scale))
+                let current_var = (2.0 * init_params[1]).exp();
                 let target_var = empirical_var;
                 let calibration_factor = (target_var / current_var).sqrt();
                 init_params[1] += calibration_factor.ln();
@@ -1690,13 +1728,14 @@ where
         // Return the midpoint of the final interval
         let scale = (a + b) / 2.0;
 
-        // Verify the scale actually reduces loss, otherwise fall back
+        // Verify the scale actually reduces loss, otherwise fall back to the
+        // binary search, which keeps halving until the loss decreases (a fixed
+        // fallback of 1.0 could *increase* the loss).
         let final_score = compute_score(scale);
         if final_score < initial_score && final_score.is_finite() {
             scale
         } else {
-            // Fall back to a small step
-            1.0
+            self.line_search_binary(resids, start, y, sample_weight, Some(initial_score))
         }
     }
 
@@ -1846,18 +1885,49 @@ fn to_2d_array(cols: Vec<Array1<f64>>) -> Array2<f64> {
 }
 
 // High-level API
+
+/// High-level NGBoost regressor (Normal distribution, LogScore).
+///
+/// Uses histogram trees by default — 2.5–2.7× faster than exact trees at
+/// n ≥ 2000 with verified accuracy parity (tests/accuracy_parity.rs). For
+/// sklearn-bit-equivalent exact trees, use [`NGBExactRegressor`] /
+/// `NGBoost::<Normal, LogScore, DecisionTreeLearner>` with
+/// `default_base_learner()`.
 pub struct NGBRegressor {
-    model: NGBoost<Normal, LogScore, DecisionTreeLearner>,
+    model: NGBoost<Normal, LogScore, HistogramLearner>,
 }
 
+/// NGBoost regressor with the exact (sklearn-equivalent) decision tree
+/// learner — the pre-histogram default, kept as an escape hatch for users
+/// who need bit-level parity with Python ngboost.
+///
+/// ```no_run
+/// use ngboost_rs::{NGBExactRegressor, learners::default_tree_learner};
+/// let mut model = NGBExactRegressor::new(500, 0.01, default_tree_learner());
+/// ```
+pub type NGBExactRegressor =
+    NGBoost<crate::dist::Normal, crate::scores::LogScore, DecisionTreeLearner>;
+
+/// Generic-typed alias for the histogram-tree NGBoost regressor.
+/// Since the histogram learner became the default, this is the same model as
+/// [`NGBRegressor`] (kept for source compatibility); see [`NGBExactRegressor`]
+/// for the exact-tree variant.
+///
+/// ```no_run
+/// use ngboost_rs::{NGBHistRegressor, learners::HistogramLearner};
+/// let mut model = NGBHistRegressor::new(500, 0.01, HistogramLearner::new(3));
+/// ```
+pub type NGBHistRegressor =
+    NGBoost<crate::dist::Normal, crate::scores::LogScore, crate::learners::HistogramLearner>;
+
 pub struct NGBClassifier {
-    model: NGBoost<Bernoulli, LogScore, DecisionTreeLearner>,
+    model: NGBoost<Bernoulli, LogScore, HistogramLearner>,
 }
 
 impl NGBRegressor {
     pub fn new(n_estimators: u32, learning_rate: f64) -> Self {
         Self {
-            model: NGBoost::new(n_estimators, learning_rate, default_tree_learner()),
+            model: NGBoost::new(n_estimators, learning_rate, default_base_learner()),
         }
     }
 
@@ -1970,7 +2040,7 @@ impl NGBRegressor {
             model: NGBoost::with_options(
                 n_estimators,
                 learning_rate,
-                default_tree_learner(),
+                default_base_learner(),
                 natural_gradient,
                 minibatch_frac,
                 col_sample,
@@ -2096,9 +2166,9 @@ impl NGBRegressor {
     pub fn load_model(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let encoded = std::fs::read(path)?;
         let serialized: SerializedNGBoost = bincode::deserialize(&encoded)?;
-        let model = NGBoost::<Normal, LogScore, DecisionTreeLearner>::deserialize(
+        let model = NGBoost::<Normal, LogScore, HistogramLearner>::deserialize(
             serialized,
-            default_tree_learner(),
+            default_base_learner(),
         )?;
         Ok(Self { model })
     }
@@ -2200,13 +2270,13 @@ impl NGBRegressor {
 /// let probs = model.predict_proba(&x_test);
 /// ```
 pub struct NGBMultiClassifier<const K: usize> {
-    model: NGBoost<Categorical<K>, LogScore, DecisionTreeLearner>,
+    model: NGBoost<Categorical<K>, LogScore, HistogramLearner>,
 }
 
 impl<const K: usize> NGBMultiClassifier<K> {
     pub fn new(n_estimators: u32, learning_rate: f64) -> Self {
         Self {
-            model: NGBoost::new(n_estimators, learning_rate, default_tree_learner()),
+            model: NGBoost::new(n_estimators, learning_rate, default_base_learner()),
         }
     }
 
@@ -2227,7 +2297,7 @@ impl<const K: usize> NGBMultiClassifier<K> {
             model: NGBoost::with_options(
                 n_estimators,
                 learning_rate,
-                default_tree_learner(),
+                default_base_learner(),
                 natural_gradient,
                 minibatch_frac,
                 col_sample,
@@ -2506,7 +2576,7 @@ pub type NGBMultiClassifier10 = NGBMultiClassifier<10>;
 impl NGBClassifier {
     pub fn new(n_estimators: u32, learning_rate: f64) -> Self {
         Self {
-            model: NGBoost::new(n_estimators, learning_rate, default_tree_learner()),
+            model: NGBoost::new(n_estimators, learning_rate, default_base_learner()),
         }
     }
 
@@ -2527,7 +2597,7 @@ impl NGBClassifier {
             model: NGBoost::with_options(
                 n_estimators,
                 learning_rate,
-                default_tree_learner(),
+                default_base_learner(),
                 natural_gradient,
                 minibatch_frac,
                 col_sample,
@@ -2720,9 +2790,9 @@ impl NGBClassifier {
     pub fn load_model(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let encoded = std::fs::read(path)?;
         let serialized: SerializedNGBoost = bincode::deserialize(&encoded)?;
-        let model = NGBoost::<Bernoulli, LogScore, DecisionTreeLearner>::deserialize(
+        let model = NGBoost::<Bernoulli, LogScore, HistogramLearner>::deserialize(
             serialized,
-            default_tree_learner(),
+            default_base_learner(),
         )?;
         Ok(Self { model })
     }

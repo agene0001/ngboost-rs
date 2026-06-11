@@ -866,6 +866,7 @@ mod tests {
         let cfg = HyperOptConfig {
             n_trials: 3,
             n_folds: 2,
+            cv_scheme: CvScheme::KFold,
             seed: 0,
             hp_seed: None,
             pruning: PruningStrategy::None,

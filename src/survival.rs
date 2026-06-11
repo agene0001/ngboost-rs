@@ -7,11 +7,14 @@ use crate::dist::exponential::Exponential;
 use crate::dist::lognormal::LogNormal;
 use crate::dist::weibull::Weibull;
 use crate::dist::{Distribution, RegressionDistn};
-use crate::learners::{BaseLearner, DecisionTreeLearner, TrainedBaseLearner, default_tree_learner};
+use crate::learners::{
+    BaseLearner, DecisionTreeLearner, HistogramLearner, TrainedBaseLearner, default_base_learner,
+};
 use crate::scores::{CRPScoreCensored, CensoredScorable, LogScoreCensored, Score, SurvivalData};
-use ndarray::{Array1, Array2, ShapeBuilder};
+use ndarray::{Array1, Array2};
 use rand::prelude::*;
 use rand::rng;
+use rayon::prelude::*;
 use std::marker::PhantomData;
 
 /// NGBoost for survival analysis with right-censored data.
@@ -58,6 +61,12 @@ where
     pub tol: f64,
     pub early_stopping_rounds: Option<u32>,
     pub validation_fraction: f64,
+    /// Tikhonov regularization added to the censored Fisher metric's diagonal
+    /// before the natural-gradient solve (`F + tikhonov_reg * I`). 0.0 disables
+    /// (default). Typical values 1e-6..1e-2; recommended for the CRPS-censored
+    /// Weibull, whose quadrature metric can be near-singular and otherwise
+    /// drive parameters to overflow on some datasets.
+    pub tikhonov_reg: f64,
 
     // Base learner
     base_learner: B,
@@ -97,6 +106,7 @@ where
             tol: 1e-4,
             early_stopping_rounds: None,
             validation_fraction: 0.1,
+            tikhonov_reg: 0.0,
             base_learner,
             base_models: Vec::new(),
             scalings: Vec::new(),
@@ -135,6 +145,7 @@ where
             tol,
             early_stopping_rounds,
             validation_fraction,
+            tikhonov_reg: 0.0,
             base_learner,
             base_models: Vec::new(),
             scalings: Vec::new(),
@@ -146,6 +157,13 @@ where
             _dist: PhantomData,
             _score: PhantomData,
         }
+    }
+
+    /// Set the Tikhonov regularization for the natural-gradient solve
+    /// (builder style). See the `tikhonov_reg` field for guidance.
+    pub fn with_tikhonov_reg(mut self, reg: f64) -> Self {
+        self.tikhonov_reg = reg;
+        self
     }
 
     /// Fit the survival model to the data.
@@ -210,6 +228,9 @@ where
         if time.iter().any(|&v| !v.is_finite() || v <= 0.0) {
             return Err("Time values must be positive and finite");
         }
+        if !self.tikhonov_reg.is_finite() || self.tikhonov_reg < 0.0 {
+            return Err("tikhonov_reg must be non-negative and finite");
+        }
 
         // Validate sample weights if provided
         if let Some(weights) = sample_weight {
@@ -266,31 +287,76 @@ where
         let mut best_val_loss = f64::INFINITY;
         let mut no_improvement_count = 0;
 
+        // When X is stable across iterations (no row/column subsampling), let
+        // the base learner precompute a fit cache once for the whole run (e.g.
+        // HistogramLearner bins X once). `sample()` copies rows in order when
+        // not subsampling, so the cache built on `x` matches `x_sampled`'s
+        // contents and dimensions. Learners without a cache return None.
+        let x_is_stable = self.minibatch_frac >= 1.0 && self.col_sample >= 1.0;
+        let stable_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> = if x_is_stable {
+            self.base_learner.build_fit_cache(x)
+        } else {
+            None
+        };
+
         for itr in 0..self.n_estimators {
-            // Create distribution from current parameters
-            let dist = D::from_params(&params);
-
-            // Compute gradients using censored scoring rule
-            let grads = CensoredScorable::censored_grad(&dist, &y, self.natural_gradient);
-
             // Sample data for this iteration
-            let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weights_sampled) =
+            let (_row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weights_sampled) =
                 self.sample(x, &y, &params, sample_weight);
             self.col_idxs.push(col_idxs.clone());
 
-            let grads_sampled = grads.select(ndarray::Axis(0), &row_idxs);
+            // With subsampling, X changes per iteration — build a per-iteration
+            // cache instead, amortized across the n_params parallel fits.
+            let iter_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
+                match &stable_cache {
+                    Some(c) => Some(std::sync::Arc::clone(c)),
+                    None if !x_is_stable => self.base_learner.build_fit_cache(&x_sampled),
+                    None => None,
+                };
 
-            // Fit base learners for each parameter
-            let mut fitted_learners: Vec<Box<dyn TrainedBaseLearner>> = Vec::new();
-            let mut predictions_cols: Vec<Array1<f64>> = Vec::new();
+            // Create distribution from the minibatch parameters and compute
+            // gradients on the minibatch only (per-row results are identical to
+            // computing on the full set and selecting rows, but avoids the
+            // wasted gradient/Fisher work when minibatch_frac < 1)
+            let dist = D::from_params(&params_sampled);
+            let grads_sampled = CensoredScorable::censored_grad_regularized(
+                &dist,
+                &y_sampled,
+                self.natural_gradient,
+                self.tikhonov_reg,
+            );
 
-            for j in 0..n_params {
-                let grad_j = grads_sampled.column(j).to_owned();
-                let learner = self.base_learner.clone();
-                let fitted =
-                    learner.fit_with_weights(&x_sampled, &grad_j, weights_sampled.as_ref())?;
-                predictions_cols.push(fitted.predict(&x_sampled));
+            // Fit base learners for each parameter in parallel (matches the
+            // main NGBoost training loop's rayon strategy)
+            let weight_ref = weights_sampled.as_ref();
+            let grad_cols: Vec<Array1<f64>> =
+                (0..n_params).map(|j| grads_sampled.column(j).to_owned()).collect();
+            let learners: Vec<B> = (0..n_params).map(|_| self.base_learner.clone()).collect();
+            let cache_ref = iter_cache.as_deref();
+            let fit_results: Vec<
+                Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>,
+            > = learners
+                .into_par_iter()
+                .zip(grad_cols.into_par_iter())
+                .map(|(learner, grad_j)| {
+                    let fitted = match cache_ref {
+                        Some(c) => {
+                            learner.fit_with_weights_cached(&x_sampled, &grad_j, weight_ref, c)?
+                        }
+                        None => learner.fit_with_weights(&x_sampled, &grad_j, weight_ref)?,
+                    };
+                    let preds = fitted.predict(&x_sampled);
+                    Ok((fitted, preds))
+                })
+                .collect();
+
+            let mut fitted_learners: Vec<Box<dyn TrainedBaseLearner>> =
+                Vec::with_capacity(n_params);
+            let mut predictions_cols: Vec<Array1<f64>> = Vec::with_capacity(n_params);
+            for result in fit_results {
+                let (fitted, preds) = result?;
                 fitted_learners.push(fitted);
+                predictions_cols.push(preds);
             }
 
             let predictions = to_2d_array(predictions_cols);
@@ -305,43 +371,19 @@ where
             self.scalings.push(scale);
             self.base_models.push(fitted_learners);
 
-            // Update parameters for ALL training samples by re-predicting on full X
-            // This matches Python's behavior: after fitting base learners on minibatch,
-            // we predict on the FULL training set to update all parameters
+            // Update parameters for ALL training samples by re-predicting on full X.
+            // This matches Python's behavior: after fitting base learners on the
+            // minibatch, we predict on the FULL training set to update all parameters.
+            // Fused predict + scale + subtract avoids intermediate Array2 allocations.
+            let factor = self.learning_rate * scale;
             let fitted_learners = self.base_models.last().unwrap();
-            let full_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == x.ncols() {
-                fitted_learners
-                    .iter()
-                    .map(|learner| learner.predict(x))
-                    .collect()
-            } else {
-                let x_subset = x.select(ndarray::Axis(1), &col_idxs);
-                fitted_learners
-                    .iter()
-                    .map(|learner| learner.predict(&x_subset))
-                    .collect()
-            };
-            let full_predictions = to_2d_array(full_predictions_cols);
-            params -= &(self.learning_rate * scale * &full_predictions);
+            Self::predict_and_update_params(fitted_learners, x, &col_idxs, &mut params, factor);
 
             // Handle validation and early stopping
             if let Some((ref xv, ref yv, ref mut vp)) = val_data {
                 // Apply column subsampling to match training
                 let fitted_learners = self.base_models.last().unwrap();
-                let val_predictions_cols: Vec<Array1<f64>> = if col_idxs.len() == xv.ncols() {
-                    fitted_learners
-                        .iter()
-                        .map(|learner| learner.predict(xv))
-                        .collect()
-                } else {
-                    let xv_subset = xv.select(ndarray::Axis(1), &col_idxs);
-                    fitted_learners
-                        .iter()
-                        .map(|learner| learner.predict(&xv_subset))
-                        .collect()
-                };
-                let val_predictions = to_2d_array(val_predictions_cols);
-                *vp -= &(self.learning_rate * scale * &val_predictions);
+                Self::predict_and_update_params(fitted_learners, xv, &col_idxs, vp, factor);
 
                 let val_dist = D::from_params(vp);
                 let val_loss =
@@ -365,15 +407,22 @@ where
                 }
 
                 if self.should_print_verbose(itr) {
-                    let train_loss =
-                        CensoredScorable::total_censored_score(&dist, &y, sample_weight);
+                    let train_loss = CensoredScorable::total_censored_score(
+                        &dist,
+                        &y_sampled,
+                        weights_sampled.as_ref(),
+                    );
                     println!(
                         "[iter {}] train_loss={:.4} val_loss={:.4}",
                         itr, train_loss, val_loss
                     );
                 }
             } else if self.should_print_verbose(itr) {
-                let train_loss = CensoredScorable::total_censored_score(&dist, &y, sample_weight);
+                let train_loss = CensoredScorable::total_censored_score(
+                    &dist,
+                    &y_sampled,
+                    weights_sampled.as_ref(),
+                );
                 println!("[iter {}] loss={:.4} scale={:.4}", itr, train_loss, scale);
             }
         }
@@ -465,43 +514,47 @@ where
         let initial_score =
             CensoredScorable::total_censored_score(&D::from_params(start), y, sample_weight);
 
+        // Pre-allocate buffer for next_params — reused across all evaluations
+        // (avoids allocating scaled_resids + next_params per scale tested)
+        let mut next_params = Array2::zeros(start.raw_dim());
+        let compute_score_at_scale = |next_params: &mut Array2<f64>, s: f64| -> f64 {
+            ndarray::Zip::from(&mut *next_params)
+                .and(start)
+                .and(resids)
+                .for_each(|np, &p, &r| {
+                    *np = p - s * r;
+                });
+            CensoredScorable::total_censored_score(&D::from_params(next_params), y, sample_weight)
+        };
+
         // Scale up phase
         loop {
             if scale > 256.0 {
                 break;
             }
-            let scaled_resids = resids * (scale * 2.0);
-            let next_params = start - &scaled_resids;
-            let score = CensoredScorable::total_censored_score(
-                &D::from_params(&next_params),
-                y,
-                sample_weight,
-            );
+            let score = compute_score_at_scale(&mut next_params, scale * 2.0);
             if score >= initial_score || !score.is_finite() {
                 break;
             }
             scale *= 2.0;
         }
 
+        // Mean of per-row L2 norms of resids — scale factors out of the norm,
+        // so compute it once instead of materializing scaled_resids per step
+        let resid_norm: f64 = resids
+            .rows()
+            .into_iter()
+            .map(|row| row.iter().map(|x| x * x).sum::<f64>().sqrt())
+            .sum::<f64>()
+            / resids.nrows().max(1) as f64;
+
         // Scale down phase
         loop {
-            let scaled_resids = resids * scale;
-            let norm: f64 = scaled_resids
-                .rows()
-                .into_iter()
-                .map(|row| row.iter().map(|x| x * x).sum::<f64>().sqrt())
-                .sum::<f64>()
-                / scaled_resids.nrows() as f64;
-            if norm < self.tol {
+            if scale * resid_norm < self.tol {
                 break;
             }
 
-            let next_params = start - &scaled_resids;
-            let score = CensoredScorable::total_censored_score(
-                &D::from_params(&next_params),
-                y,
-                sample_weight,
-            );
+            let score = compute_score_at_scale(&mut next_params, scale);
             if score < initial_score && score.is_finite() {
                 break;
             }
@@ -533,23 +586,43 @@ where
             .zip(self.col_idxs.iter())
             .enumerate()
         {
-            let scale = self.scalings[i];
-
-            // Apply column subsampling during prediction to match training
-            let predictions_cols: Vec<Array1<f64>> = if col_idx.len() == x.ncols() {
-                learners.iter().map(|learner| learner.predict(x)).collect()
-            } else {
-                let x_subset = x.select(ndarray::Axis(1), col_idx);
-                learners
-                    .iter()
-                    .map(|learner| learner.predict(&x_subset))
-                    .collect()
-            };
-
-            let predictions = to_2d_array(predictions_cols);
-            params -= &(self.learning_rate * scale * &predictions);
+            let factor = self.learning_rate * self.scalings[i];
+            Self::predict_and_update_params(learners, x, col_idx, &mut params, factor);
         }
         params
+    }
+
+    /// Fused predict + scale + subtract: `params -= factor * predictions`.
+    /// Predicts one parameter at a time and updates `params` in place, avoiding
+    /// the intermediate predictions `Array2` and scaled-copy allocations.
+    #[inline]
+    fn predict_and_update_params(
+        learners: &[Box<dyn TrainedBaseLearner>],
+        x: &Array2<f64>,
+        col_idxs: &[usize],
+        params: &mut Array2<f64>,
+        factor: f64,
+    ) {
+        if learners.is_empty() {
+            return;
+        }
+
+        if col_idxs.len() == x.ncols() {
+            for (j, learner) in learners.iter().enumerate() {
+                let preds = learner.predict(x);
+                ndarray::Zip::from(params.column_mut(j))
+                    .and(&preds)
+                    .for_each(|p, &pred| *p -= factor * pred);
+            }
+        } else {
+            let x_subset = x.select(ndarray::Axis(1), col_idxs);
+            for (j, learner) in learners.iter().enumerate() {
+                let preds = learner.predict(&x_subset);
+                ndarray::Zip::from(params.column_mut(j))
+                    .and(&preds)
+                    .for_each(|p, &pred| *p -= factor * pred);
+            }
+        }
     }
 
     /// Get predicted distribution parameters.
@@ -616,60 +689,72 @@ fn to_2d_array(cols: Vec<Array1<f64>>) -> Array2<f64> {
     }
     let nrows = cols[0].len();
     let ncols = cols.len();
-    // Build in column-major (Fortran) order for contiguous column writes
-    let mut data = Vec::with_capacity(nrows * ncols);
-    for col in &cols {
-        data.extend(col.iter());
+    // Build directly in row-major order — avoids the column-major → row-major copy
+    let mut result = Array2::zeros((nrows, ncols));
+    for (j, col) in cols.iter().enumerate() {
+        result.column_mut(j).assign(col);
     }
-    let result = Array2::from_shape_vec((nrows, ncols).f(), data).unwrap();
-    // Convert to standard (row-major) layout for downstream compatibility
-    result.as_standard_layout().into_owned()
+    result
 }
 
 // ============================================================================
 // Convenience type aliases
 // ============================================================================
 
+// The convenience aliases default to histogram trees (like NGBRegressor):
+// with the fit cache wired into the survival loop they are 1.5–2.6× faster
+// end-to-end, and held-out accuracy parity (or better) is verified per
+// distribution in tests/accuracy_parity.rs (LogNormal −14%, Weibull −25%,
+// Exponential +0.07%, Weibull-CRPS −1.7% NLL/CRPS vs exact trees). For exact
+// sklearn-equivalent trees use the generic `NGBSurvival<D, S, DecisionTreeLearner>`
+// with `default_tree_learner()`.
+
 /// NGBSurvival with LogNormal distribution and LogScore (censored).
-pub type NGBSurvivalLogNormal = NGBSurvival<LogNormal, LogScoreCensored, DecisionTreeLearner>;
+pub type NGBSurvivalLogNormal = NGBSurvival<LogNormal, LogScoreCensored, HistogramLearner>;
 
 /// NGBSurvival with Exponential distribution and LogScore (censored).
-pub type NGBSurvivalExponential = NGBSurvival<Exponential, LogScoreCensored, DecisionTreeLearner>;
+pub type NGBSurvivalExponential = NGBSurvival<Exponential, LogScoreCensored, HistogramLearner>;
 
 /// NGBSurvival with Weibull distribution and LogScore (censored).
-pub type NGBSurvivalWeibull = NGBSurvival<Weibull, LogScoreCensored, DecisionTreeLearner>;
+pub type NGBSurvivalWeibull = NGBSurvival<Weibull, LogScoreCensored, HistogramLearner>;
 
 /// NGBSurvival with Weibull distribution and CRPScore (censored).
-pub type NGBSurvivalWeibullCRPS = NGBSurvival<Weibull, CRPScoreCensored, DecisionTreeLearner>;
+pub type NGBSurvivalWeibullCRPS = NGBSurvival<Weibull, CRPScoreCensored, HistogramLearner>;
 
 // ============================================================================
 // Simplified constructors
 // ============================================================================
 
-impl NGBSurvival<LogNormal, LogScoreCensored, DecisionTreeLearner> {
+impl NGBSurvival<LogNormal, LogScoreCensored, HistogramLearner> {
     /// Create a new NGBSurvival with LogNormal distribution.
     pub fn lognormal(n_estimators: u32, learning_rate: f64) -> Self {
-        Self::new(n_estimators, learning_rate, default_tree_learner())
+        Self::new(n_estimators, learning_rate, default_base_learner())
     }
 }
 
-impl NGBSurvival<Exponential, LogScoreCensored, DecisionTreeLearner> {
+impl NGBSurvival<Exponential, LogScoreCensored, HistogramLearner> {
     /// Create a new NGBSurvival with Exponential distribution.
     pub fn exponential(n_estimators: u32, learning_rate: f64) -> Self {
-        Self::new(n_estimators, learning_rate, default_tree_learner())
+        Self::new(n_estimators, learning_rate, default_base_learner())
     }
 }
 
-impl NGBSurvival<Weibull, LogScoreCensored, DecisionTreeLearner> {
+impl NGBSurvival<Weibull, LogScoreCensored, HistogramLearner> {
     /// Create a new NGBSurvival with Weibull distribution and LogScore.
     pub fn weibull(n_estimators: u32, learning_rate: f64) -> Self {
-        Self::new(n_estimators, learning_rate, default_tree_learner())
+        Self::new(n_estimators, learning_rate, default_base_learner())
     }
 }
 
-impl NGBSurvival<Weibull, CRPScoreCensored, DecisionTreeLearner> {
+impl NGBSurvival<Weibull, CRPScoreCensored, HistogramLearner> {
     /// Create a new NGBSurvival with Weibull distribution and CRPScore.
+    ///
+    /// Defaults `tikhonov_reg` to 1e-6: the CRPS quadrature metric can be
+    /// near-singular, and without regularization training diverges to
+    /// parameter overflow on some datasets (measured cost of the ridge on
+    /// healthy data: ~1% CRPS). Set `tikhonov_reg = 0.0` after construction
+    /// to recover the unregularized behavior.
     pub fn weibull_crps(n_estimators: u32, learning_rate: f64) -> Self {
-        Self::new(n_estimators, learning_rate, default_tree_learner())
+        Self::new(n_estimators, learning_rate, default_base_learner()).with_tikhonov_reg(1e-6)
     }
 }

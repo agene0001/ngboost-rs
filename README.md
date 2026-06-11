@@ -12,6 +12,12 @@ NGBoost is a modular boosting algorithm that allows you to obtain full probabili
 - **Flexible Scoring Rules**: LogScore and CRPScore implementations
 - **Natural Gradient Boosting**: Uses the natural gradient for efficient optimization on probability distribution manifolds
 - **Generic Design**: Easily extensible with custom distributions and base learners
+- **Fast histogram trees by default**: `NGBRegressor`/`NGBClassifier` use a cached
+  255-bin histogram learner — 2.5–2.7× faster end-to-end than exact trees at
+  n ≥ 2000 with held-out accuracy at parity or better across regression,
+  classification, survival, outlier, and discrete-feature benchmarks
+  (`tests/accuracy_parity.rs`). For exact sklearn-equivalent trees (bit-level
+  parity with Python ngboost), use `NGBExactRegressor` with `default_tree_learner()`.
 
 ## Installation
 
