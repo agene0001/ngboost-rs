@@ -552,3 +552,65 @@ fn test_early_stopping_auto_split_tiny_dataset() {
         "validation losses must come from a real (non-empty) validation set"
     );
 }
+
+/// Python parity: early stopping on explicit validation data requires
+/// consistent weighting — train weights without val weights (or vice versa)
+/// is an error, since it would silently skew early stopping.
+#[test]
+fn test_early_stopping_weight_mismatch_is_an_error() {
+    use ngboost_rs::learners::default_base_learner;
+    use ngboost_rs::ngboost::NGBoost;
+    use ngboost_rs::dist::Normal;
+    use ngboost_rs::scores::LogScore;
+
+    let (x, y) = generate_regression_data(200, 3);
+    let (x_train, x_val, y_train, y_val) = train_test_split(x, y, 0.25);
+    let w = Array1::from_elem(y_train.len(), 1.0);
+
+    let mut ngb = NGBoost::<Normal, LogScore, _>::with_options(
+        20,
+        0.05,
+        default_base_learner(),
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-12,
+        Some(5),
+        0.1,
+        false,
+    );
+
+    let result = ngb.fit_with_validation(
+        &x_train,
+        &y_train,
+        Some(&x_val),
+        Some(&y_val),
+        Some(&w),
+        None, // val_sample_weight missing while sample_weight is set
+    );
+    assert!(
+        result.is_err(),
+        "train weights without val weights under early stopping must error (Python parity)"
+    );
+
+    // Without early stopping the combination stays permitted (Python only
+    // checks under early_stopping_rounds).
+    let mut ngb2 = NGBoost::<Normal, LogScore, _>::with_options(
+        20,
+        0.05,
+        default_base_learner(),
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-12,
+        None,
+        0.1,
+        false,
+    );
+    ngb2.fit_with_validation(&x_train, &y_train, Some(&x_val), Some(&y_val), Some(&w), None)
+        .expect("permitted without early stopping");
+}

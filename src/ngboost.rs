@@ -690,6 +690,22 @@ where
             return Err("Input y contains NaN or infinite values");
         }
 
+        // Match Python: with early stopping on explicit validation data, the
+        // weighting of train and validation losses must be consistent —
+        // forgetting val_sample_weight would silently skew early stopping.
+        if self.early_stopping_rounds.is_some() && x_val.is_some() && y_val.is_some() {
+            if sample_weight.is_some() && val_sample_weight.is_none() {
+                return Err(
+                    "sample_weight was provided but val_sample_weight is missing for the validation data",
+                );
+            }
+            if sample_weight.is_none() && val_sample_weight.is_some() {
+                return Err(
+                    "val_sample_weight was provided but sample_weight is missing for the training data",
+                );
+            }
+        }
+
         // Reset state only if requested (fit() resets, partial_fit() doesn't)
         if reset_state {
             self.base_models.clear();

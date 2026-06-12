@@ -192,87 +192,79 @@ impl BaseLearner for StumpLearner {
             return Err("Cannot fit to empty dataset");
         }
 
-        let (best_feature, best_threshold, _best_mse) = if let Some(weights) = sample_weight {
-            find_best_split_weighted(x, y, weights)
+        // A stump is a depth-1 tree: reuse the same Friedman scan as the tree
+        // learners (for a single split, minimizing weighted MSE and maximizing
+        // the Friedman improvement select the same threshold). This replaces
+        // the old O(n_unique·n) per-feature loop with one O(n log n) scan and
+        // inherits midpoint thresholds and NaN-tolerant sorting.
+        let n = x.nrows();
+        let (parent_sum, parent_weight) = if let Some(weights) = sample_weight {
+            let sum = y.iter().zip(weights.iter()).map(|(&yi, &wi)| yi * wi).sum();
+            (sum, weights.sum())
         } else {
-            find_best_split(x, y)
+            (y.sum(), n as f64)
+        };
+        let overall_mean = if parent_weight > 0.0 {
+            parent_sum / parent_weight
+        } else {
+            0.0
         };
 
-        if best_threshold.is_nan() {
-            let mean_val = if let Some(weights) = sample_weight {
-                weighted_mean(y, weights)
-            } else {
-                y.mean().unwrap_or(0.0)
-            };
+        let indices: Vec<usize> = (0..n).collect();
+        let mut sort_buf: Vec<SortedEntry> = Vec::with_capacity(n);
+        let (best_feature, best_threshold, best_improvement) = find_best_split_friedman(
+            x,
+            y,
+            sample_weight,
+            &indices,
+            1,
+            parent_sum,
+            parent_weight,
+            &mut sort_buf,
+        );
 
+        if best_improvement <= 0.0 || best_threshold.is_nan() {
+            // No valid split: a NaN threshold marks the no-split stump
+            // (split_feature() reports None; predict returns the mean).
             return Ok(Box::new(TrainedStumpLearner {
                 feature_index: 0,
-                threshold: 0.0,
-                left_value: mean_val,
-                right_value: mean_val,
+                threshold: f64::NAN,
+                left_value: overall_mean,
+                right_value: overall_mean,
             }));
         }
 
-        let feature_col = x.column(best_feature);
-
-        // Pre-allocate with estimated capacity for better performance
-        let estimated_size = y.len() / 2;
-        let mut left_y = Vec::with_capacity(estimated_size);
-        let mut left_weights = Vec::with_capacity(if sample_weight.is_some() {
-            estimated_size
-        } else {
-            0
-        });
-        let mut right_y = Vec::with_capacity(estimated_size);
-        let mut right_weights = Vec::with_capacity(if sample_weight.is_some() {
-            estimated_size
-        } else {
-            0
-        });
-
-        for (i, &y_val) in y.iter().enumerate() {
-            if feature_col[i] < best_threshold {
-                left_y.push(y_val);
-                if let Some(weights) = sample_weight {
-                    left_weights.push(weights[i]);
-                }
+        // Weighted means on each side; compare via the f32-cast value to
+        // match the scan's quantized view of the feature (as the tree
+        // builders' partitions do).
+        let col = x.column(best_feature);
+        let (mut left_sum, mut left_w, mut right_sum, mut right_w) = (0.0, 0.0, 0.0, 0.0);
+        for i in 0..n {
+            let w = sample_weight.map_or(1.0, |wts| wts[i]);
+            if (col[i] as f32 as f64) < best_threshold {
+                left_sum += y[i] * w;
+                left_w += w;
             } else {
-                right_y.push(y_val);
-                if let Some(weights) = sample_weight {
-                    right_weights.push(weights[i]);
-                }
+                right_sum += y[i] * w;
+                right_w += w;
             }
         }
-
-        let left_mean = if left_y.is_empty() {
-            if let Some(w) = sample_weight {
-                weighted_mean(y, w)
-            } else {
-                y.mean().unwrap_or(0.0)
-            }
-        } else if sample_weight.is_some() {
-            weighted_mean(&Array1::from(left_y), &Array1::from(left_weights))
+        let left_value = if left_w > 0.0 {
+            left_sum / left_w
         } else {
-            Array1::from(left_y).mean().unwrap()
+            overall_mean
         };
-
-        let right_mean = if right_y.is_empty() {
-            if let Some(w) = sample_weight {
-                weighted_mean(y, w)
-            } else {
-                y.mean().unwrap_or(0.0)
-            }
-        } else if sample_weight.is_some() {
-            weighted_mean(&Array1::from(right_y), &Array1::from(right_weights))
+        let right_value = if right_w > 0.0 {
+            right_sum / right_w
         } else {
-            Array1::from(right_y).mean().unwrap()
+            overall_mean
         };
 
         Ok(Box::new(TrainedStumpLearner {
             feature_index: best_feature,
             threshold: best_threshold,
-            left_value: left_mean,
-            right_value: right_mean,
+            left_value,
+            right_value,
         }))
     }
 }
@@ -313,64 +305,6 @@ impl TrainedBaseLearner for TrainedStumpLearner {
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
         Some(SerializableTrainedLearner::Stump(self.clone()))
     }
-}
-
-fn find_best_split(x: &Array2<f64>, y: &Array1<f64>) -> (usize, f64, f64) {
-    let n_features = x.shape()[1];
-    let mut best_feature = 0;
-    let mut best_threshold = f64::NAN;
-    let mut best_mse = f64::INFINITY;
-
-    for feature_index in 0..n_features {
-        let feature_values = x.column(feature_index);
-        let mut unique_values = feature_values.to_vec();
-        unique_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        unique_values.dedup();
-
-        for &threshold in &unique_values {
-            // Pre-allocate with estimated capacity
-            let estimated_size = y.len() / 2;
-            let mut left_y = Vec::with_capacity(estimated_size);
-            let mut right_y = Vec::with_capacity(estimated_size);
-
-            for i in 0..y.len() {
-                if feature_values[i] < threshold {
-                    left_y.push(y[i]);
-                } else {
-                    right_y.push(y[i]);
-                }
-            }
-
-            if left_y.is_empty() || right_y.is_empty() {
-                continue;
-            }
-
-            let left_y_arr = Array1::from(left_y);
-            let right_y_arr = Array1::from(right_y);
-
-            let mean_left = left_y_arr.mean().unwrap();
-            let mean_right = right_y_arr.mean().unwrap();
-
-            let mse_left = left_y_arr.mapv(|v| (v - mean_left).powi(2)).mean().unwrap();
-            let mse_right = right_y_arr
-                .mapv(|v| (v - mean_right).powi(2))
-                .mean()
-                .unwrap();
-
-            let n_left = left_y_arr.len() as f64;
-            let n_right = right_y_arr.len() as f64;
-            let n_total = y.len() as f64;
-
-            let mse = (n_left / n_total) * mse_left + (n_right / n_total) * mse_right;
-
-            if mse < best_mse {
-                best_mse = mse;
-                best_feature = feature_index;
-                best_threshold = threshold;
-            }
-        }
-    }
-    (best_feature, best_threshold, best_mse)
 }
 
 // ============================================================================
@@ -1032,6 +966,7 @@ fn build_histogram_tree_node(
         feature_index: best_feature,
         bin_threshold: best_bin,
         threshold_value: best_threshold_value,
+        improvement: best_improvement,
         left: Box::new(left_child),
         right: Box::new(right_child),
     }
@@ -1098,6 +1033,13 @@ pub enum HistTreeNode {
         feature_index: usize,
         bin_threshold: u8,    // Split on bin index (used during tree building)
         threshold_value: f64, // Actual threshold value for prediction
+        /// Friedman-MSE improvement of this split (= the node's weighted
+        /// impurity decrease, N_t·Var_t − N_l·Var_l − N_r·Var_r), recorded for
+        /// sklearn-style feature importances. `serde(skip)` keeps the bincode
+        /// wire format unchanged: models saved before this field existed still
+        /// load (their importances fall back to split counts).
+        #[serde(skip)]
+        improvement: f64,
         left: Box<HistTreeNode>,
         right: Box<HistTreeNode>,
     },
@@ -1140,6 +1082,56 @@ impl HistTreeNode {
             }
         }
     }
+
+    fn collect_split_importances(&self, out: &mut Vec<(usize, f64)>) {
+        match self {
+            HistTreeNode::Leaf { .. } => {}
+            HistTreeNode::Split {
+                feature_index,
+                improvement,
+                left,
+                right,
+                ..
+            } => {
+                out.push((*feature_index, *improvement));
+                left.collect_split_importances(out);
+                right.collect_split_importances(out);
+            }
+        }
+    }
+}
+
+/// sklearn-style feature importances from per-split (feature, improvement)
+/// pairs: each split contributes its weighted impurity decrease — for MSE
+/// trees that equals the Friedman improvement `N_l·N_r/N_t·(m̄_l−m̄_r)²`
+/// recorded at fit time — normalized to sum to 1 (matching sklearn's
+/// `tree_.compute_feature_importances()`, which Python ngboost aggregates).
+/// Trees deserialized from models saved before improvements were recorded
+/// carry zeros; those fall back to the previous split-count behavior.
+fn importances_from_splits(pairs: &[(usize, f64)], n_features: usize) -> Option<Array1<f64>> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut importances = Array1::zeros(n_features);
+    let total: f64 = pairs.iter().map(|(_, imp)| imp).sum();
+    if total > 0.0 {
+        for &(f, imp) in pairs {
+            if f < n_features {
+                importances[f] += imp;
+            }
+        }
+    } else {
+        for &(f, _) in pairs {
+            if f < n_features {
+                importances[f] += 1.0;
+            }
+        }
+    }
+    let sum: f64 = importances.sum();
+    if sum > 0.0 {
+        importances.mapv_inplace(|v| v / sum);
+    }
+    Some(importances)
 }
 
 /// One node of the flattened prediction tree. Leaves are marked with
@@ -1285,18 +1277,9 @@ impl TrainedBaseLearner for TrainedHistogramTree {
     }
 
     fn feature_importances(&self) -> Option<Array1<f64>> {
-        let features = self.split_features()?;
-        let mut importances = Array1::zeros(self.n_features);
-        for &f in &features {
-            if f < self.n_features {
-                importances[f] += 1.0;
-            }
-        }
-        let sum: f64 = importances.sum();
-        if sum > 0.0 {
-            importances.mapv_inplace(|v| v / sum);
-        }
-        Some(importances)
+        let mut pairs = Vec::new();
+        self.root.collect_split_importances(&mut pairs);
+        importances_from_splits(&pairs, self.n_features)
     }
 
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
@@ -1546,6 +1529,7 @@ fn build_tree_node_presorted(
     TreeNode::Split {
         feature_index: best_feature,
         threshold: best_threshold,
+        improvement: best_improvement,
         left: Box::new(left_child),
         right: Box::new(right_child),
     }
@@ -1571,6 +1555,10 @@ pub struct ArenaTreeNode {
     pub right: u32,
     /// Split threshold for split nodes, prediction value for leaves
     pub threshold_or_value: f64,
+    /// Friedman-MSE improvement for split nodes (sklearn-style importances);
+    /// `serde(skip)` keeps the bincode wire format unchanged.
+    #[serde(skip)]
+    pub improvement: f64,
 }
 
 impl ArenaTreeNode {
@@ -1586,16 +1574,24 @@ impl ArenaTreeNode {
             left: NO_CHILD,
             right: NO_CHILD,
             threshold_or_value: value,
+            improvement: 0.0,
         }
     }
 
     #[inline]
-    fn new_split(feature_index: usize, threshold: f64, left: u32, right: u32) -> Self {
+    fn new_split(
+        feature_index: usize,
+        threshold: f64,
+        improvement: f64,
+        left: u32,
+        right: u32,
+    ) -> Self {
         ArenaTreeNode {
             feature_index: feature_index as u16,
             left,
             right,
             threshold_or_value: threshold,
+            improvement,
         }
     }
 }
@@ -1610,6 +1606,11 @@ pub enum TreeNode {
     Split {
         feature_index: usize,
         threshold: f64,
+        /// Friedman-MSE improvement of this split, for sklearn-style feature
+        /// importances. `serde(skip)` keeps the bincode wire format unchanged
+        /// (old saved models load; their importances fall back to counts).
+        #[serde(skip)]
+        improvement: f64,
         left: Box<TreeNode>,
         right: Box<TreeNode>,
     },
@@ -1626,6 +1627,7 @@ impl TreeNode {
                 threshold,
                 left,
                 right,
+                ..
             } => {
                 if x[[row_idx, *feature_index]] < *threshold {
                     left.predict_row(x, row_idx)
@@ -1652,6 +1654,23 @@ impl TreeNode {
         }
     }
 
+    fn collect_split_importances(&self, out: &mut Vec<(usize, f64)>) {
+        match self {
+            TreeNode::Leaf { .. } => {}
+            TreeNode::Split {
+                feature_index,
+                improvement,
+                left,
+                right,
+                ..
+            } => {
+                out.push((*feature_index, *improvement));
+                left.collect_split_importances(out);
+                right.collect_split_importances(out);
+            }
+        }
+    }
+
     /// Convert legacy TreeNode to arena format
     fn to_arena_nodes(&self, nodes: &mut Vec<ArenaTreeNode>) -> u32 {
         let idx = nodes.len() as u32;
@@ -1663,6 +1682,7 @@ impl TreeNode {
             TreeNode::Split {
                 feature_index,
                 threshold,
+                improvement,
                 left,
                 right,
             } => {
@@ -1670,8 +1690,13 @@ impl TreeNode {
                 nodes.push(ArenaTreeNode::new_leaf(0.0)); // placeholder
                 let left_idx = left.to_arena_nodes(nodes);
                 let right_idx = right.to_arena_nodes(nodes);
-                nodes[idx as usize] =
-                    ArenaTreeNode::new_split(*feature_index, *threshold, left_idx, right_idx);
+                nodes[idx as usize] = ArenaTreeNode::new_split(
+                    *feature_index,
+                    *threshold,
+                    *improvement,
+                    left_idx,
+                    right_idx,
+                );
                 idx
             }
         }
@@ -1747,18 +1772,13 @@ impl TrainedBaseLearner for ArenaDecisionTree {
     }
 
     fn feature_importances(&self) -> Option<Array1<f64>> {
-        let features = self.split_features()?;
-        let mut importances = Array1::zeros(self.n_features);
-        for &f in &features {
-            if f < self.n_features {
-                importances[f] += 1.0;
-            }
-        }
-        let sum: f64 = importances.sum();
-        if sum > 0.0 {
-            importances.mapv_inplace(|v| v / sum);
-        }
-        Some(importances)
+        let pairs: Vec<(usize, f64)> = self
+            .nodes
+            .iter()
+            .filter(|n| !n.is_leaf())
+            .map(|n| (n.feature_index as usize, n.improvement))
+            .collect();
+        importances_from_splits(&pairs, self.n_features)
     }
 
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
@@ -1957,8 +1977,13 @@ fn build_arena_tree_node(
     );
 
     // Update the placeholder with actual split info
-    nodes[node_idx as usize] =
-        ArenaTreeNode::new_split(best_feature, best_threshold, left_idx, right_idx);
+    nodes[node_idx as usize] = ArenaTreeNode::new_split(
+        best_feature,
+        best_threshold,
+        best_improvement,
+        left_idx,
+        right_idx,
+    );
 
     node_idx
 }
@@ -1996,18 +2021,9 @@ impl TrainedBaseLearner for TrainedDecisionTree {
     }
 
     fn feature_importances(&self) -> Option<Array1<f64>> {
-        let features = self.split_features()?;
-        let mut importances = Array1::zeros(self.n_features);
-        for &f in &features {
-            if f < self.n_features {
-                importances[f] += 1.0;
-            }
-        }
-        let sum: f64 = importances.sum();
-        if sum > 0.0 {
-            importances.mapv_inplace(|v| v / sum);
-        }
-        Some(importances)
+        let mut pairs = Vec::new();
+        self.root.collect_split_importances(&mut pairs);
+        importances_from_splits(&pairs, self.n_features)
     }
 
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
@@ -2119,6 +2135,7 @@ fn build_tree_node(
     TreeNode::Split {
         feature_index: best_feature,
         threshold: best_threshold,
+        improvement: best_improvement,
         left: Box::new(left_child),
         right: Box::new(right_child),
     }
@@ -2510,105 +2527,6 @@ pub fn stump_learner() -> StumpLearner {
     StumpLearner
 }
 
-/// Calculate weighted mean
-/// Computes weighted mean using ndarray's dot product (SIMD-enabled).
-#[inline]
-fn weighted_mean(y: &Array1<f64>, weights: &Array1<f64>) -> f64 {
-    let total_weight = weights.sum();
-    if total_weight > 0.0 {
-        y.dot(weights) / total_weight
-    } else {
-        y.mean().unwrap_or(0.0)
-    }
-}
-
-/// Find best split with weighted samples using Friedman MSE criterion.
-/// Optimized to O(n log n) per feature using cumulative sums instead of O(n²).
-fn find_best_split_weighted(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-    weights: &Array1<f64>,
-) -> (usize, f64, f64) {
-    let n_features = x.shape()[1];
-    let n_samples = y.len();
-    let mut best_feature = 0;
-    let mut best_threshold = f64::NAN;
-    let mut best_improvement = 0.0;
-
-    // Pre-compute total weighted sum
-    let total_weight: f64 = weights.sum();
-    let total_sum: f64 = y.iter().zip(weights.iter()).map(|(&yi, &wi)| yi * wi).sum();
-
-    if total_weight == 0.0 {
-        return (best_feature, best_threshold, f64::INFINITY);
-    }
-
-    // Reusable buffer for sorted indices
-    let mut sorted_indices: Vec<usize> = (0..n_samples).collect();
-
-    for feature_index in 0..n_features {
-        // Sort indices by feature value
-        sorted_indices.clear();
-        sorted_indices.extend(0..n_samples);
-        sorted_indices.sort_by(|&a, &b| {
-            x[[a, feature_index]]
-                .partial_cmp(&x[[b, feature_index]])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Scan through sorted samples, maintaining cumulative sums
-        let mut left_weight = 0.0;
-        let mut left_sum = 0.0;
-
-        for pos in 0..(n_samples - 1) {
-            let i = sorted_indices[pos];
-            let yi = y[i];
-            let wi = weights[i];
-
-            left_weight += wi;
-            left_sum += yi * wi;
-
-            let right_weight = total_weight - left_weight;
-            let right_sum = total_sum - left_sum;
-
-            // Skip if either side has zero weight
-            if left_weight <= 0.0 || right_weight <= 0.0 {
-                continue;
-            }
-
-            // Skip if next sample has the same feature value (no valid split point)
-            let next_i = sorted_indices[pos + 1];
-            if (x[[i, feature_index]] - x[[next_i, feature_index]]).abs() < 1e-10 {
-                continue;
-            }
-
-            let left_mean = left_sum / left_weight;
-            let right_mean = right_sum / right_weight;
-
-            // Friedman MSE improvement: weighted variance reduction
-            let improvement =
-                (left_weight * right_weight / total_weight) * (left_mean - right_mean).powi(2);
-
-            if improvement > best_improvement {
-                best_improvement = improvement;
-                best_feature = feature_index;
-                // Threshold is midpoint between current and next value
-                best_threshold = (x[[i, feature_index]] + x[[next_i, feature_index]]) / 2.0;
-            }
-        }
-    }
-
-    // Convert improvement back to MSE for compatibility (lower is better)
-    // Note: The actual MSE value isn't used by the caller, only the threshold matters
-    let best_mse = if best_improvement > 0.0 {
-        1.0 / best_improvement
-    } else {
-        f64::INFINITY
-    };
-
-    (best_feature, best_threshold, best_mse)
-}
-
 #[cfg(test)]
 mod presort_tests {
     use super::*;
@@ -2661,22 +2579,163 @@ mod presort_tests {
                 TreeNode::Split {
                     feature_index: fa,
                     threshold: ta,
+                    improvement: ia,
                     left: la,
                     right: ra,
                 },
                 TreeNode::Split {
                     feature_index: fb,
                     threshold: tb,
+                    improvement: ib,
                     left: lb,
                     right: rb,
                 },
             ) => {
                 assert_eq!(fa, fb, "split feature mismatch");
                 assert!((ta - tb).abs() <= 1e-12, "threshold mismatch: {ta} vs {tb}");
+                assert!(
+                    (ia - ib).abs() <= 1e-12 * ia.abs().max(1.0),
+                    "improvement mismatch: {ia} vs {ib}"
+                );
                 assert_trees_equal(la, lb);
                 assert_trees_equal(ra, rb);
             }
             _ => panic!("tree structure mismatch (leaf vs split)"),
+        }
+    }
+
+    /// Brute-force reference for sklearn-style importances: walk the tree
+    /// re-partitioning the training rows and accumulate each split's weighted
+    /// variance decrease N_t·Var_t − N_l·Var_l − N_r·Var_r per feature.
+    fn variance_decrease_walk(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        node: &TreeNode,
+        indices: &[usize],
+        importances: &mut Array1<f64>,
+    ) {
+        if let TreeNode::Split {
+            feature_index,
+            threshold,
+            left,
+            right,
+            ..
+        } = node
+        {
+            let (mut ls, mut lss, mut ln) = (0.0, 0.0, 0.0);
+            let (mut rs, mut rss, mut rn) = (0.0, 0.0, 0.0);
+            let mut li = Vec::new();
+            let mut ri = Vec::new();
+            for &i in indices {
+                // Same f32-quantized comparison as the fit-time partition
+                if (x[[i, *feature_index]] as f32 as f64) < *threshold {
+                    ls += y[i];
+                    lss += y[i] * y[i];
+                    ln += 1.0;
+                    li.push(i);
+                } else {
+                    rs += y[i];
+                    rss += y[i] * y[i];
+                    rn += 1.0;
+                    ri.push(i);
+                }
+            }
+            let (n, ts, tss) = (ln + rn, ls + rs, lss + rss);
+            let nvar_parent = tss - ts * ts / n;
+            let nvar_left = if ln > 0.0 { lss - ls * ls / ln } else { 0.0 };
+            let nvar_right = if rn > 0.0 { rss - rs * rs / rn } else { 0.0 };
+            importances[*feature_index] += nvar_parent - nvar_left - nvar_right;
+            variance_decrease_walk(x, y, left, &li, importances);
+            variance_decrease_walk(x, y, right, &ri, importances);
+        }
+    }
+
+    /// The stored Friedman improvements must equal the per-split variance
+    /// decrease (the identity sklearn's importances rely on), so
+    /// feature_importances() must match the brute-force reference.
+    #[test]
+    fn importances_match_variance_decrease_reference() {
+        let (x, y) = synth(500, 5, 77);
+        let tree = TrainedDecisionTree {
+            root: build_presorted(&x, &y, None, 3),
+            n_features: x.ncols(),
+        };
+
+        let mut reference = Array1::zeros(x.ncols());
+        let indices: Vec<usize> = (0..x.nrows()).collect();
+        variance_decrease_walk(&x, &y, &tree.root, &indices, &mut reference);
+        let ref_sum = reference.sum();
+        assert!(ref_sum > 0.0, "test data must produce splits");
+        reference.mapv_inplace(|v| v / ref_sum);
+
+        let importances = tree.feature_importances().expect("tree has splits");
+        for f in 0..x.ncols() {
+            assert!(
+                (importances[f] - reference[f]).abs() <= 1e-9,
+                "feature {f}: stored-improvement importance {} vs variance-decrease reference {}",
+                importances[f],
+                reference[f]
+            );
+        }
+        // Sanity: the dominant signal (3·x0) must dominate the importances
+        let max_f = (0..x.ncols()).max_by(|&a, &b| importances[a].total_cmp(&importances[b]));
+        assert_eq!(max_f, Some(0), "x0 carries the strongest signal");
+    }
+
+    /// Models saved before improvements were recorded deserialize with zeroed
+    /// improvements (serde(skip)); importances must fall back to split counts
+    /// rather than returning all-zeros.
+    #[test]
+    fn importances_fall_back_to_counts_for_legacy_trees() {
+        let (x, y) = synth(300, 3, 9);
+        let mut tree = TrainedDecisionTree {
+            root: build_presorted(&x, &y, None, 2),
+            n_features: x.ncols(),
+        };
+        // Simulate a legacy deserialized tree: zero out stored improvements
+        fn zero_improvements(node: &mut TreeNode) {
+            if let TreeNode::Split {
+                improvement,
+                left,
+                right,
+                ..
+            } = node
+            {
+                *improvement = 0.0;
+                zero_improvements(left);
+                zero_improvements(right);
+            }
+        }
+        zero_improvements(&mut tree.root);
+
+        let imp = tree.feature_importances().expect("tree has splits");
+        let sum: f64 = imp.sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "count-fallback importances must normalize to 1, got {sum}"
+        );
+    }
+
+    /// A stump is a depth-1 tree: both must pick the same split and produce
+    /// the same leaf means.
+    #[test]
+    fn stump_matches_depth1_tree() {
+        for seed in [3u64, 41, 99] {
+            let (x, y) = synth(300, 4, seed);
+            let stump = StumpLearner.fit(&x, &y).unwrap();
+            let tree = DecisionTreeLearner::new(1).fit(&x, &y).unwrap();
+
+            assert_eq!(stump.split_feature(), tree.split_features().map(|f| f[0]));
+            let ps = stump.predict(&x);
+            let pt = tree.predict(&x);
+            for i in 0..x.nrows() {
+                assert!(
+                    (ps[i] - pt[i]).abs() <= 1e-12 * pt[i].abs().max(1.0),
+                    "seed {seed} row {i}: stump {} vs depth-1 tree {}",
+                    ps[i],
+                    pt[i]
+                );
+            }
         }
     }
 
@@ -2934,6 +2993,78 @@ mod histogram_tests {
             .sum();
         let r2 = 1.0 - ss_res / ss_tot;
         assert!(r2 > 0.7, "histogram tree failed to learn: R²={r2}");
+    }
+
+    /// Histogram-tree importances must also equal the brute-force variance
+    /// decrease of each split's actual partition (training rows partition by
+    /// `value < threshold_value` exactly as the binned fit does).
+    #[test]
+    fn hist_importances_match_variance_decrease_reference() {
+        fn walk(
+            x: &Array2<f64>,
+            y: &Array1<f64>,
+            node: &HistTreeNode,
+            indices: &[usize],
+            importances: &mut Array1<f64>,
+        ) {
+            if let HistTreeNode::Split {
+                feature_index,
+                threshold_value,
+                left,
+                right,
+                ..
+            } = node
+            {
+                let (mut ls, mut lss, mut ln) = (0.0, 0.0, 0.0);
+                let (mut rs, mut rss, mut rn) = (0.0, 0.0, 0.0);
+                let mut li = Vec::new();
+                let mut ri = Vec::new();
+                for &i in indices {
+                    if x[[i, *feature_index]] < *threshold_value {
+                        ls += y[i];
+                        lss += y[i] * y[i];
+                        ln += 1.0;
+                        li.push(i);
+                    } else {
+                        rs += y[i];
+                        rss += y[i] * y[i];
+                        rn += 1.0;
+                        ri.push(i);
+                    }
+                }
+                let (n, ts, tss) = (ln + rn, ls + rs, lss + rss);
+                let nvar_parent = tss - ts * ts / n;
+                let nvar_left = if ln > 0.0 { lss - ls * ls / ln } else { 0.0 };
+                let nvar_right = if rn > 0.0 { rss - rs * rs / rn } else { 0.0 };
+                importances[*feature_index] += nvar_parent - nvar_left - nvar_right;
+                walk(x, y, left, &li, importances);
+                walk(x, y, right, &ri, importances);
+            }
+        }
+
+        let (x, y) = synth(600, 4, 55);
+        let cache = build_histogram_cache(&x, 255);
+        let indices: Vec<u32> = (0..x.nrows() as u32).collect();
+        let hists = FeatureHists::build(&cache, &indices, &y, None);
+        let root = build_histogram_tree_node(&cache, &y, None, indices, hists, 0, 3, 2, 1);
+        let tree = TrainedHistogramTree::new(root, x.ncols());
+
+        let mut reference = Array1::zeros(x.ncols());
+        let all: Vec<usize> = (0..x.nrows()).collect();
+        walk(&x, &y, &tree.root, &all, &mut reference);
+        let ref_sum = reference.sum();
+        assert!(ref_sum > 0.0, "test data must produce splits");
+        reference.mapv_inplace(|v| v / ref_sum);
+
+        let importances = tree.feature_importances().expect("tree has splits");
+        for f in 0..x.ncols() {
+            assert!(
+                (importances[f] - reference[f]).abs() <= 1e-9,
+                "feature {f}: {} vs reference {}",
+                importances[f],
+                reference[f]
+            );
+        }
     }
 
     /// min_samples_leaf is a raw-count constraint (sklearn semantics). With

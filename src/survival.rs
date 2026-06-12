@@ -249,6 +249,22 @@ where
             }
         }
 
+        // Match Python NGBoost (inherited by NGBSurvival): with early stopping
+        // on explicit validation data, train and validation weighting must be
+        // consistent.
+        if self.early_stopping_rounds.is_some() && x_val.is_some() {
+            if sample_weight.is_some() && val_sample_weight.is_none() {
+                return Err(
+                    "sample_weight was provided but val_sample_weight is missing for the validation data",
+                );
+            }
+            if sample_weight.is_none() && val_sample_weight.is_some() {
+                return Err(
+                    "val_sample_weight was provided but sample_weight is missing for the training data",
+                );
+            }
+        }
+
         // Match Python NGBSurvival (which inherits NGBoost.fit): when early
         // stopping is requested without explicit validation data, carve a
         // validation split off the training data. sklearn's train_test_split

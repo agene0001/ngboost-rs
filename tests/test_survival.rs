@@ -414,3 +414,40 @@ fn test_survival_early_stopping_auto_split() {
     let preds = model.predict(&x);
     assert_eq!(preds.len(), x.nrows());
 }
+
+/// Python parity (inherited by NGBSurvival): early stopping on explicit
+/// validation data with train weights but no val weights is an error.
+#[test]
+fn test_survival_early_stopping_weight_mismatch_is_an_error() {
+    let (x, time, event) = generate_survival_data(200, 3, 0.3, 5);
+    let (xv, tv, ev) = generate_survival_data(80, 3, 0.3, 6);
+    let w = Array1::from_elem(200, 1.0);
+
+    let mut model = NGBSurvival::<LogNormal, LogScoreCensored, _>::with_options(
+        50,
+        0.1,
+        default_tree_learner(),
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-12,
+        Some(5),
+        0.0,
+    );
+    let result = model.fit_with_validation(
+        &x,
+        &time,
+        &event,
+        Some(&xv),
+        Some(&tv),
+        Some(&ev),
+        Some(&w),
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "train weights without val weights under early stopping must error (Python parity)"
+    );
+}
