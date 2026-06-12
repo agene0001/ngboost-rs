@@ -433,36 +433,62 @@ impl BaseLearner for RidgeLearner {
         let n_samples = x.nrows();
         let n_features = x.ncols();
 
-        // Apply sample weights by scaling X and y
-        let (x_weighted, y_weighted) = if let Some(weights) = sample_weight {
-            // Scale by sqrt(weight) so that (X'WX) becomes (X_w'X_w)
-            let sqrt_weights = weights.mapv(|w| w.sqrt());
-            let mut x_w = x.clone();
-            let mut y_w = y.clone();
-            for i in 0..n_samples {
-                let sw = sqrt_weights[i];
-                for j in 0..n_features {
-                    x_w[[i, j]] *= sw;
+        // sklearn semantics: center by the WEIGHTED means of the raw data
+        // first (the intercept is unpenalized), THEN scale rows by
+        // sqrt(weight). Scaling before centering would compute "means" of
+        // sqrt(w)-scaled rows — neither the weighted nor the unweighted mean —
+        // e.g. uniform weights of 4 would double the intercept.
+        let (x_mean, y_mean) = if self.fit_intercept {
+            if let Some(weights) = sample_weight {
+                let w_sum: f64 = weights.sum();
+                if w_sum <= 0.0 {
+                    // All-zero weights carry no information; match the tree
+                    // learners' degenerate behavior of predicting 0.
+                    return Ok(Box::new(TrainedRidgeLearner {
+                        coefficients: vec![0.0; n_features],
+                        intercept: 0.0,
+                        n_features,
+                    }));
                 }
-                y_w[i] *= sw;
+                let mut xm = Array1::<f64>::zeros(n_features);
+                let mut ym = 0.0;
+                for i in 0..n_samples {
+                    let w = weights[i];
+                    ym += w * y[i];
+                    for j in 0..n_features {
+                        xm[j] += w * x[[i, j]];
+                    }
+                }
+                (Some(xm / w_sum), ym / w_sum)
+            } else {
+                (
+                    Some(x.mean_axis(ndarray::Axis(0)).unwrap()),
+                    y.mean().unwrap_or(0.0),
+                )
             }
-            (x_w, y_w)
         } else {
-            (x.clone(), y.clone())
+            (None, 0.0)
         };
 
-        // Handle intercept by centering
-        let (x_centered, y_centered, x_mean, y_mean) = if self.fit_intercept {
-            let x_mean = x_weighted.mean_axis(ndarray::Axis(0)).unwrap();
-            let y_mean = y_weighted.mean().unwrap_or(0.0);
-
-            let x_centered = &x_weighted - &x_mean;
-            let y_centered = &y_weighted - y_mean;
-
-            (x_centered, y_centered, Some(x_mean), y_mean)
-        } else {
-            (x_weighted, y_weighted, None, 0.0)
-        };
+        // Center (if fitting an intercept), then scale rows by sqrt(weight)
+        // so ordinary penalized least squares on the transformed data solves
+        // the weighted problem.
+        let mut x_t = x.clone();
+        let mut y_t = y.clone();
+        if let Some(xm) = &x_mean {
+            x_t -= xm;
+            y_t.mapv_inplace(|v| v - y_mean);
+        }
+        if let Some(weights) = sample_weight {
+            for i in 0..n_samples {
+                let sw = weights[i].sqrt();
+                for j in 0..n_features {
+                    x_t[[i, j]] *= sw;
+                }
+                y_t[i] *= sw;
+            }
+        }
+        let (x_centered, y_centered) = (x_t, y_t);
 
         // Solve Ridge regression: (X'X + alpha*I)^{-1} X'y
         // Using the normal equations approach
@@ -2976,6 +3002,93 @@ mod histogram_tests {
         let pc = capped.fit_with_weights(&x, &y, None).unwrap().predict(&x);
         for i in 0..x.nrows() {
             assert_eq!(pb[i].to_bits(), pc[i].to_bits(), "row {i}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ridge_tests {
+    use super::*;
+
+    fn synth(n: usize, p: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
+        let mut s = seed;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (u32::MAX as f64)
+        };
+        let x = Array2::from_shape_fn((n, p), |_| next());
+        // Nonzero mean so a wrong intercept actually shows up in predictions
+        let y = Array1::from_shape_fn(n, |i| 5.0 + x[[i, 0]] * 3.0 - x[[i, p - 1]] + next() * 0.1);
+        (x, y)
+    }
+
+    /// With alpha = 0 a uniform weight c cancels out of the normal equations
+    /// entirely, so predictions must match the unweighted fit. The old
+    /// scale-then-center order computed means of sqrt(c)-scaled data and
+    /// returned an intercept inflated by sqrt(c) (2x for c = 4).
+    #[test]
+    fn uniform_weights_match_unweighted() {
+        let (x, y) = synth(200, 3, 11);
+        let w = Array1::from_elem(200, 4.0);
+        let learner = RidgeLearner::new(0.0);
+
+        let pw = learner
+            .fit_with_weights(&x, &y, Some(&w))
+            .unwrap()
+            .predict(&x);
+        let pu = learner.fit_with_weights(&x, &y, None).unwrap().predict(&x);
+        for i in 0..x.nrows() {
+            assert!(
+                (pw[i] - pu[i]).abs() <= 1e-9 * pu[i].abs().max(1.0),
+                "row {i}: weighted {} vs unweighted {}",
+                pw[i],
+                pu[i]
+            );
+        }
+    }
+
+    /// sklearn semantics: an integer weight w on a row is exactly equivalent
+    /// to duplicating that row w times (holds for any alpha — both sides
+    /// produce the same X'WX + alpha*I system and the same weighted means).
+    #[test]
+    fn weight_two_equals_duplicated_rows() {
+        let (x, y) = synth(120, 3, 23);
+        let n = x.nrows();
+        // Even rows get weight 2, odd rows weight 1
+        let w = Array1::from_shape_fn(n, |i| if i % 2 == 0 { 2.0 } else { 1.0 });
+
+        // Build the equivalent duplicated dataset
+        let n_dup = n + n / 2 + n % 2;
+        let mut xd = Array2::zeros((n_dup, x.ncols()));
+        let mut yd = Array1::zeros(n_dup);
+        let mut r = 0;
+        for i in 0..n {
+            let reps = if i % 2 == 0 { 2 } else { 1 };
+            for _ in 0..reps {
+                for j in 0..x.ncols() {
+                    xd[[r, j]] = x[[i, j]];
+                }
+                yd[r] = y[i];
+                r += 1;
+            }
+        }
+        assert_eq!(r, n_dup);
+
+        let learner = RidgeLearner::new(0.5);
+        let pw = learner
+            .fit_with_weights(&x, &y, Some(&w))
+            .unwrap()
+            .predict(&x);
+        let pd = learner.fit_with_weights(&xd, &yd, None).unwrap().predict(&x);
+        for i in 0..n {
+            assert!(
+                (pw[i] - pd[i]).abs() <= 1e-9 * pd[i].abs().max(1.0),
+                "row {i}: weighted {} vs duplicated {}",
+                pw[i],
+                pd[i]
+            );
         }
     }
 }

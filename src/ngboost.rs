@@ -697,8 +697,10 @@ where
             self.effective_learning_rates.clear();
             self.col_idxs.clear();
             self.best_val_loss_itr = None;
-            self.evals_result = EvalsResult::default();
         }
+        // Python rebuilds evals_result on EVERY fit/partial_fit call — it
+        // holds the most recent run's loss curves, not a cumulative history.
+        self.evals_result = EvalsResult::default();
         self.n_features = Some(x.ncols());
 
         // Handle automatic validation split if early stopping is enabled
@@ -1756,17 +1758,24 @@ where
 
     /// Serialize the model to a platform-independent format
     pub fn serialize(&self) -> Result<SerializedNGBoost, Box<dyn std::error::Error>> {
-        // Serialize base models
+        // Serialize base models. Each iteration stores one learner per
+        // distribution parameter, indexed positionally — silently skipping an
+        // unserializable learner would shift every later parameter's column,
+        // so it must be an error instead.
         let serialized_base_models: Vec<Vec<crate::learners::SerializableTrainedLearner>> = self
             .base_models
             .iter()
             .map(|learners| {
                 learners
                     .iter()
-                    .filter_map(|learner| learner.to_serializable())
-                    .collect()
+                    .map(|learner| {
+                        learner.to_serializable().ok_or(
+                            "base learner type does not support serialization",
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(SerializedNGBoost {
             n_estimators: self.n_estimators,
