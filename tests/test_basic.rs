@@ -458,3 +458,97 @@ fn test_parallel_prediction_path_bit_exact_col_subsample() {
         }
     }
 }
+
+// ============================================================================
+// Early stopping truncation / partial_fit interaction (June 2026 audit)
+// ============================================================================
+
+/// A partial_fit WITHOUT validation, on a model whose earlier fit early-stopped,
+/// must keep everything it trained: the truncation step may only act on a best
+/// iteration observed during the same run, never on the stale one.
+#[test]
+fn test_partial_fit_after_early_stopped_fit_is_not_truncated() {
+    let (x, y) = generate_regression_data(400, 4);
+    let (x_train, x_val, y_train, y_val) = train_test_split(x, y, 0.25);
+
+    // validation_fraction = 0.0 so the later partial_fit (no explicit val
+    // data) does not auto-split: early stopping is configured but cannot run.
+    let mut ngb = NGBRegressor::with_options(
+        40, 0.05, true, 1.0, 1.0, false, 100.0, 1e-12, Some(5), 0.0, false,
+    );
+    ngb.fit_with_validation(&x_train, &y_train, Some(&x_val), Some(&y_val))
+        .expect("fit should succeed");
+
+    let n_after_fit = ngb.staged_predict(&x_val).len();
+    let best_after_fit = ngb.best_val_loss_itr().expect("validation ran");
+    // With early stopping + validation, fit truncates to the best iteration.
+    assert_eq!(
+        n_after_fit,
+        best_after_fit + 1,
+        "fit should keep exactly best_val_loss_itr + 1 models"
+    );
+
+    ngb.partial_fit(&x_train, &y_train)
+        .expect("partial_fit should succeed");
+    let n_after_partial = ngb.staged_predict(&x_val).len();
+
+    assert_eq!(
+        n_after_partial,
+        n_after_fit + 40,
+        "partial_fit must append all its models; a stale best_val_loss_itr must not truncate them"
+    );
+    // No validation ran in the partial run, so the recorded best is unchanged.
+    assert_eq!(ngb.best_val_loss_itr(), Some(best_after_fit));
+}
+
+/// best_val_loss_itr is a GLOBAL model index (Python parity: its loop counter
+/// starts at len(col_idxs)), so after a partial_fit with validation it must
+/// point past the models from the first fit.
+#[test]
+fn test_best_val_loss_itr_is_global_across_partial_fits() {
+    let (x, y) = generate_regression_data(400, 4);
+    let (x_train, x_val, y_train, y_val) = train_test_split(x, y, 0.25);
+
+    // No early stopping: nothing is truncated; indices must still be global.
+    let mut ngb = NGBRegressor::with_options(
+        15, 0.05, true, 1.0, 1.0, false, 100.0, 1e-12, None, 0.0, false,
+    );
+    ngb.fit_with_validation(&x_train, &y_train, Some(&x_val), Some(&y_val))
+        .expect("fit should succeed");
+    assert_eq!(ngb.staged_predict(&x_val).len(), 15);
+
+    ngb.partial_fit_with_validation(&x_train, &y_train, Some(&x_val), Some(&y_val))
+        .expect("partial_fit should succeed");
+    assert_eq!(ngb.staged_predict(&x_val).len(), 30);
+
+    // The second run resets its best-loss tracker, so its best iteration is
+    // one of its own models: global index 15..30.
+    let best = ngb.best_val_loss_itr().expect("validation ran");
+    assert!(
+        (15..30).contains(&best),
+        "best_val_loss_itr={best} should be a global index in 15..30"
+    );
+}
+
+/// Tiny datasets where n * validation_fraction < 1 must still get a real
+/// (1-row, sklearn-ceil) validation split. The old floor produced an EMPTY
+/// validation set whose loss was 0.0 at every iteration, which "early
+/// stopped" immediately and truncated the model to a single estimator.
+#[test]
+fn test_early_stopping_auto_split_tiny_dataset() {
+    let (x, y) = generate_regression_data(8, 2);
+    let mut ngb = NGBRegressor::with_options(
+        30, 0.1, true, 1.0, 1.0, false, 100.0, 1e-12, Some(10), 0.1, false,
+    );
+    ngb.fit(&x, &y).expect("fit should succeed");
+
+    let val_losses = &ngb.evals_result().val;
+    assert!(
+        !val_losses.is_empty(),
+        "auto-split should have produced validation losses"
+    );
+    assert!(
+        val_losses.iter().any(|&v| v != 0.0),
+        "validation losses must come from a real (non-empty) validation set"
+    );
+}

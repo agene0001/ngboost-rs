@@ -249,6 +249,77 @@ where
             }
         }
 
+        // Match Python NGBSurvival (which inherits NGBoost.fit): when early
+        // stopping is requested without explicit validation data, carve a
+        // validation split off the training data. sklearn's train_test_split
+        // uses ceil for the test fraction, so the validation set is never empty.
+        type AutoSplit = (
+            Array2<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array2<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Option<Array1<f64>>,
+            Option<Array1<f64>>,
+        );
+        let auto: Option<AutoSplit> = if self.early_stopping_rounds.is_some()
+            && x_val.is_none()
+            && time_val.is_none()
+            && event_val.is_none()
+            && self.validation_fraction > 0.0
+            && self.validation_fraction < 1.0
+        {
+            let n_samples = x.nrows();
+            let n_val =
+                (((n_samples as f64) * self.validation_fraction).ceil() as usize).min(n_samples);
+            let n_train = n_samples - n_val;
+            if n_train == 0 {
+                return Err("validation_fraction leaves no training data");
+            }
+            let mut indices: Vec<usize> = (0..n_samples).collect();
+            for i in (1..indices.len()).rev() {
+                let j = self.rng.random_range(0..=i);
+                indices.swap(i, j);
+            }
+            let (train_idx, val_idx) = indices.split_at(n_train);
+            Some((
+                x.select(ndarray::Axis(0), train_idx),
+                time.select(ndarray::Axis(0), train_idx),
+                event.select(ndarray::Axis(0), train_idx),
+                x.select(ndarray::Axis(0), val_idx),
+                time.select(ndarray::Axis(0), val_idx),
+                event.select(ndarray::Axis(0), val_idx),
+                sample_weight.map(|w| w.select(ndarray::Axis(0), train_idx)),
+                sample_weight.map(|w| w.select(ndarray::Axis(0), val_idx)),
+            ))
+        } else {
+            None
+        };
+        let (x, time, event, x_val, time_val, event_val, sample_weight, val_sample_weight) =
+            match &auto {
+                Some((xt, tt, et, xv, tv, ev, wt, wv)) => (
+                    xt,
+                    tt,
+                    et,
+                    Some(xv),
+                    Some(tv),
+                    Some(ev),
+                    wt.as_ref(),
+                    wv.as_ref(),
+                ),
+                None => (
+                    x,
+                    time,
+                    event,
+                    x_val,
+                    time_val,
+                    event_val,
+                    sample_weight,
+                    val_sample_weight,
+                ),
+            };
+
         // Reset state
         self.base_models.clear();
         self.scalings.clear();
@@ -285,7 +356,8 @@ where
         };
 
         let mut best_val_loss = f64::INFINITY;
-        let mut no_improvement_count = 0;
+        let mut val_loss_list: Vec<f64> = Vec::new();
+        let mut best_iter_this_run: Option<usize> = None;
 
         // When X is stable across iterations (no row/column subsampling), let
         // the base learner precompute a fit cache once for the whole run (e.g.
@@ -389,20 +461,30 @@ where
                 let val_loss =
                     CensoredScorable::total_censored_score(&val_dist, yv, val_sample_weight);
 
+                val_loss_list.push(val_loss);
                 if val_loss < best_val_loss {
                     best_val_loss = val_loss;
                     self.best_val_loss_itr = Some(itr as usize);
-                    no_improvement_count = 0;
-                } else {
-                    no_improvement_count += 1;
+                    best_iter_this_run = Some(itr as usize);
                 }
 
+                // Early stopping: same sliding-window criterion as Python's
+                // NGBoost.fit (which NGBSurvival inherits) and the main
+                // ngboost.rs loop — stop once none of the last
+                // `early_stopping_rounds` iterations achieved the best loss.
                 if let Some(rounds) = self.early_stopping_rounds {
-                    if no_improvement_count >= rounds {
-                        if self.verbose {
-                            println!("== Early stopping achieved at iteration {}", itr);
+                    let rounds = rounds as usize;
+                    if val_loss_list.len() > rounds {
+                        let recent_min = val_loss_list[val_loss_list.len() - rounds..]
+                            .iter()
+                            .cloned()
+                            .fold(f64::INFINITY, f64::min);
+                        if best_val_loss < recent_min {
+                            if self.verbose {
+                                println!("== Early stopping achieved at iteration {}", itr);
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
 
@@ -424,6 +506,22 @@ where
                     weights_sampled.as_ref(),
                 );
                 println!("[iter {}] loss={:.4} scale={:.4}", itr, train_loss, scale);
+            }
+        }
+
+        // Trim the patience tail back to the best validation iteration, exactly
+        // as ngboost.rs does, so predictions reflect the best model rather than
+        // the over-fit tail. `best_iter_this_run` is only Some when validation
+        // ran during this call. (Unlike NGBoost, survival fits always reset
+        // state, so the index is both local and global.)
+        if self.early_stopping_rounds.is_some() {
+            if let Some(best) = best_iter_this_run {
+                let keep = best + 1;
+                if keep < self.base_models.len() {
+                    self.base_models.truncate(keep);
+                    self.scalings.truncate(keep);
+                    self.col_idxs.truncate(keep);
+                }
             }
         }
 

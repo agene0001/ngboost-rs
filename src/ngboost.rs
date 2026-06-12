@@ -711,10 +711,16 @@ where
             && self.validation_fraction < 1.0
         {
             // Split training data into training and validation sets
-            // Shuffle indices first to match sklearn's train_test_split behavior
+            // Shuffle indices first to match sklearn's train_test_split behavior.
+            // sklearn uses ceil for the test fraction, so the validation set is
+            // never empty (an empty one would make every val_loss 0.0 and
+            // "early stop" at the first iteration).
             let n_samples = x.nrows();
-            let n_val = ((n_samples as f64) * self.validation_fraction) as usize;
+            let n_val = (((n_samples as f64) * self.validation_fraction).ceil() as usize).min(n_samples);
             let n_train = n_samples - n_val;
+            if n_train == 0 {
+                return Err("validation_fraction leaves no training data");
+            }
 
             // Shuffle indices for random split (matches Python's train_test_split)
             let mut indices: Vec<usize> = (0..n_samples).collect();
@@ -810,8 +816,14 @@ where
         };
 
         let mut best_val_loss = f64::INFINITY;
-        let mut best_iter = 0;
         let mut val_loss_list: Vec<f64> = Vec::new();
+        // Models may already exist (partial_fit). Iteration indices reported in
+        // `best_val_loss_itr` are GLOBAL model indices (Python starts its loop
+        // at len(self.col_idxs)), and truncation below must only ever act on a
+        // best iteration observed during THIS run — a stale index from a
+        // previous fit would chop off everything this run just trained.
+        let model_offset = self.base_models.len();
+        let mut best_iter_this_run: Option<usize> = None;
 
         // When X is stable across iterations (no row/column subsampling), let
         // the base learner precompute a fit cache once for the whole run
@@ -966,8 +978,9 @@ where
 
                 if val_loss < best_val_loss {
                     best_val_loss = val_loss;
-                    best_iter = itr;
-                    self.best_val_loss_itr = Some(itr as usize);
+                    let global_iter = model_offset + itr as usize;
+                    best_iter_this_run = Some(global_iter);
+                    self.best_val_loss_itr = Some(global_iter);
                 }
 
                 // Early stopping: match Python's sliding-window logic
@@ -985,7 +998,8 @@ where
                                 println!("== Early stopping achieved.");
                                 println!(
                                     "== Best iteration / VAL{} (val_loss={:.4})",
-                                    best_iter, best_val_loss
+                                    best_iter_this_run.unwrap_or(0),
+                                    best_val_loss
                                 );
                             }
                             break;
@@ -1042,11 +1056,12 @@ where
         // were added past the best validation iteration (the patience window).
         // Trim every per-iteration buffer back to the best iteration so
         // `predict` / `pred_dist` — and the serialized model used at inference —
-        // reflect the best model rather than the over-fit tail. No-op without
-        // early stopping or validation data (where `best_val_loss_itr` is unset),
-        // or when the best iteration is the last one trained.
+        // reflect the best model rather than the over-fit tail. `best_iter_this_run`
+        // is a global model index and is only Some when validation ran during
+        // THIS call, so a partial_fit without validation never truncates models
+        // based on a stale best from an earlier fit.
         if self.early_stopping_rounds.is_some() {
-            if let Some(best) = self.best_val_loss_itr {
+            if let Some(best) = best_iter_this_run {
                 let keep = best + 1;
                 if keep < self.base_models.len() {
                     self.base_models.truncate(keep);

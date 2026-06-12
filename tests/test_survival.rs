@@ -329,3 +329,88 @@ fn test_survival_data_struct() {
 
     assert!(y_uncensored.event.iter().all(|&e| e));
 }
+
+// ============================================================================
+// Early stopping: truncation + auto validation split (June 2026 audit)
+// ============================================================================
+
+/// With validation data and early stopping, survival fits must trim the
+/// patience tail: exactly best_val_loss_itr + 1 models remain (mirrors the
+/// main NGBoost loop's behavior).
+#[test]
+fn test_survival_early_stopping_truncates_to_best() {
+    let (x, time, event) = generate_survival_data(300, 4, 0.3, 7);
+    let (xv, tv, ev) = generate_survival_data(120, 4, 0.3, 99);
+
+    let mut model = NGBSurvival::<LogNormal, LogScoreCensored, _>::with_options(
+        200,
+        0.1,
+        default_tree_learner(),
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-12,
+        Some(10), // early_stopping_rounds
+        0.0,      // validation_fraction (explicit val data below)
+    );
+    model
+        .fit_with_validation(
+            &x,
+            &time,
+            &event,
+            Some(&xv),
+            Some(&tv),
+            Some(&ev),
+            None,
+            None,
+        )
+        .expect("fit should succeed");
+
+    let best = model
+        .best_val_loss_itr()
+        .expect("validation ran, best iteration must be recorded");
+    assert_eq!(
+        model.base_models.len(),
+        best + 1,
+        "survival fit should keep exactly best_val_loss_itr + 1 models"
+    );
+    assert_eq!(model.base_models.len(), model.scalings.len());
+}
+
+/// Without explicit validation data, early stopping must auto-split a
+/// validation set off the training data (Python NGBSurvival inherits this
+/// from NGBoost.fit; validation_fraction was previously a dead field).
+#[test]
+fn test_survival_early_stopping_auto_split() {
+    let (x, time, event) = generate_survival_data(300, 4, 0.3, 11);
+
+    let mut model = NGBSurvival::<LogNormal, LogScoreCensored, _>::with_options(
+        200,
+        0.1,
+        default_tree_learner(),
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-12,
+        Some(10), // early_stopping_rounds with NO explicit validation data
+        0.2,      // validation_fraction drives the auto-split
+    );
+    model.fit(&x, &time, &event).expect("fit should succeed");
+
+    let best = model
+        .best_val_loss_itr()
+        .expect("auto-split validation must have run");
+    assert_eq!(
+        model.base_models.len(),
+        best + 1,
+        "auto-split early stopping should truncate to the best iteration"
+    );
+
+    // Predictions still work on the full feature matrix.
+    let preds = model.predict(&x);
+    assert_eq!(preds.len(), x.nrows());
+}

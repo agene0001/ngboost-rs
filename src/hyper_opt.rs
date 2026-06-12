@@ -272,7 +272,9 @@ pub struct HyperOptConfig {
     /// How CV folds are partitioned (`KFold` default; `TimeSeries` for forward
     /// chaining on time-ordered rows).
     pub cv_scheme: CvScheme,
-    /// Random seed used for CV-fold assignment and for `Trial.seed = seed + i`.
+    /// Random seed for per-trial model RNGs (`trial_seed = seed + trial`).
+    /// Folds themselves are contiguous, unshuffled row ranges (like sklearn's
+    /// `KFold(shuffle=False)`), so the seed does not affect fold assignment.
     pub seed: u64,
     /// Separate seed for the TPE samplers; defaults to `seed` if `None`.
     pub hp_seed: Option<u64>,
@@ -460,8 +462,13 @@ where
         }
 
         if !pruned {
+            // Record the RUNNING MEAN at each fold, not the raw fold score —
+            // `cv_with_pruning` prunes by comparing a running mean against
+            // these recorded values, so both must be the same statistic.
+            let mut running_sum = 0.0;
             for (step, &score) in intermediate_scores.iter().enumerate() {
-                pruner_state.record(step, score);
+                running_sum += score;
+                pruner_state.record(step, running_sum / (step + 1) as f64);
             }
             n_completed_trials += 1;
         }

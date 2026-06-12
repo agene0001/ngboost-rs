@@ -706,6 +706,9 @@ impl FitCache for HistogramFitCache {
 
 /// Compute bin edges and the row-major binned matrix for X.
 fn build_histogram_cache(x: &Array2<f64>, max_bins: usize) -> HistogramFitCache {
+    // Bin indices are stored as u8, so resolution silently caps at 255 bins;
+    // clamp here so edges, histograms, and split scans all agree on that cap.
+    let max_bins = max_bins.min(255);
     let n_rows = x.nrows();
     let n_features = x.ncols();
 
@@ -745,6 +748,12 @@ fn build_histogram_cache(x: &Array2<f64>, max_bins: usize) -> HistogramFitCache 
 struct FeatureHists {
     count: Vec<f64>,
     sum: Vec<f64>,
+    /// Raw (unweighted) per-bin sample counts, tracked only for weighted fits.
+    /// `min_samples_leaf` is a raw-count constraint (sklearn semantics);
+    /// checking it against weighted counts would reject every split when
+    /// weights are small (e.g. normalized to sum to 1). For unweighted fits
+    /// `count` already holds raw counts and this stays `None`.
+    raw: Option<Vec<f64>>,
     n_bins: usize,
 }
 
@@ -768,8 +777,10 @@ impl FeatureHists {
             .max(1);
         let mut count = vec![0.0; p * n_bins];
         let mut sum = vec![0.0; p * n_bins];
+        let mut raw: Option<Vec<f64>> = None;
 
         if let Some(weights) = sample_weight {
+            let raw = raw.get_or_insert_with(|| vec![0.0; p * n_bins]);
             for &i in indices {
                 let i = i as usize;
                 let w = weights[i];
@@ -779,6 +790,7 @@ impl FeatureHists {
                     let slot = f * n_bins + b as usize;
                     count[slot] += w;
                     sum[slot] += yw;
+                    raw[slot] += 1.0;
                 }
             }
         } else {
@@ -794,7 +806,12 @@ impl FeatureHists {
             }
         }
 
-        FeatureHists { count, sum, n_bins }
+        FeatureHists {
+            count,
+            sum,
+            raw,
+            n_bins,
+        }
     }
 
     /// Sibling-subtraction trick: this node's histograms minus a child's give
@@ -812,9 +829,19 @@ impl FeatureHists {
             .zip(child.sum.iter())
             .map(|(a, b)| a - b)
             .collect();
+        let raw = match (&self.raw, &child.raw) {
+            (Some(a), Some(b)) => Some(
+                a.iter()
+                    .zip(b.iter())
+                    .map(|(a, b)| (a - b).max(0.0))
+                    .collect(),
+            ),
+            _ => None,
+        };
         FeatureHists {
             count,
             sum,
+            raw,
             n_bins: self.n_bins,
         }
     }
@@ -865,6 +892,11 @@ fn build_histogram_tree_node(
     let mut best_improvement = 0.0;
     let mut best_threshold_value = 0.0;
 
+    // min_samples_leaf counts SAMPLES (sklearn semantics), so it must be
+    // checked against raw counts; with weights, `count` holds weighted totals.
+    let parent_raw = indices.len() as f64;
+    let raw_bins = hists.raw.as_deref();
+
     for f in 0..cache.n_features {
         let n_edges = cache.bin_edges[f].len();
         if n_edges < 2 {
@@ -873,16 +905,27 @@ fn build_histogram_tree_node(
         let base = f * hists.n_bins;
         let mut left_count = 0.0;
         let mut left_sum = 0.0;
+        let mut left_raw = 0.0;
 
         // Candidate split after each bin except the last occupied one
         for bin in 0..(n_edges - 1) {
             left_count += hists.count[base + bin];
             left_sum += hists.sum[base + bin];
+            let left_raw = match raw_bins {
+                Some(r) => {
+                    left_raw += r[base + bin];
+                    left_raw
+                }
+                // Unweighted: `count` is already the raw count
+                None => left_count,
+            };
 
             let right_count = parent_count - left_count;
             let right_sum = parent_sum - left_sum;
 
-            if left_count < min_samples_leaf as f64 || right_count < min_samples_leaf as f64 {
+            if left_raw < min_samples_leaf as f64
+                || parent_raw - left_raw < min_samples_leaf as f64
+            {
                 continue;
             }
             if left_count <= 0.0 || right_count <= 0.0 {
@@ -1000,6 +1043,13 @@ fn compute_bin_edges(values: &[f64], max_bins: usize) -> Vec<f64> {
 
 /// Find which bin a value belongs to (binary search)
 fn find_bin(value: f64, edges: &[f64]) -> u8 {
+    // NaN goes to the LAST bin: prediction routes a row right whenever
+    // `value < threshold` is false, which NaN always is, so the last bin is
+    // the only placement consistent between fit-time partitioning and
+    // prediction (and it avoids a partial_cmp panic in the binary search).
+    if value.is_nan() {
+        return (edges.len().saturating_sub(1)).min(254) as u8;
+    }
     if edges.is_empty() || value <= edges[0] {
         return 0;
     }
@@ -2858,5 +2908,74 @@ mod histogram_tests {
             .sum();
         let r2 = 1.0 - ss_res / ss_tot;
         assert!(r2 > 0.7, "histogram tree failed to learn: R²={r2}");
+    }
+
+    /// min_samples_leaf is a raw-count constraint (sklearn semantics). With
+    /// normalized weights (summing to 1) every weighted bin count is < 1, and
+    /// the old weighted-count check rejected every split, silently collapsing
+    /// the tree to a single root leaf.
+    #[test]
+    fn small_normalized_weights_still_split() {
+        let (x, y) = synth(600, 4, 21);
+        let n = x.nrows();
+        let w = Array1::from_elem(n, 1.0 / n as f64);
+        let learner = HistogramLearner::new(3);
+
+        let weighted = learner.fit_with_weights(&x, &y, Some(&w)).unwrap();
+        let unweighted = learner.fit_with_weights(&x, &y, None).unwrap();
+
+        // Uniform weights must not change the tree structure: the Friedman
+        // improvement just scales by the weight, leaving the argmax intact.
+        assert_eq!(
+            weighted.split_features(),
+            unweighted.split_features(),
+            "uniform 1/n weights changed the tree structure"
+        );
+
+        let pw = weighted.predict(&x);
+        let pu = unweighted.predict(&x);
+        for i in 0..n {
+            assert!(
+                (pw[i] - pu[i]).abs() <= 1e-9 * pu[i].abs().max(1.0),
+                "row {i}: weighted {} vs unweighted {}",
+                pw[i],
+                pu[i]
+            );
+        }
+    }
+
+    /// Direct learner use with NaN features must not panic, and NaN must route
+    /// exactly like +inf both at fit time (last bin) and predict time
+    /// (`value < threshold` is false → right child).
+    #[test]
+    fn nan_rows_route_like_positive_infinity() {
+        let (mut x, y) = synth(400, 3, 5);
+        x[[7, 1]] = f64::NAN;
+        x[[123, 0]] = f64::NAN;
+        let learner = HistogramLearner::new(3);
+        let fitted = learner.fit_with_weights(&x, &y, None).unwrap();
+
+        let x_nan = Array2::from_elem((1, 3), f64::NAN);
+        let x_inf = Array2::from_elem((1, 3), f64::INFINITY);
+        assert_eq!(
+            fitted.predict(&x_nan)[0].to_bits(),
+            fitted.predict(&x_inf)[0].to_bits(),
+            "NaN must follow the same path as +inf"
+        );
+    }
+
+    /// Bin indices are stored as u8, so max_bins silently caps at 255; a
+    /// larger request must behave exactly like 255, not corrupt the binning.
+    #[test]
+    fn max_bins_above_u8_capacity_is_clamped() {
+        let (x, y) = synth(2000, 3, 13);
+        let big = HistogramLearner::with_params(3, 4096, 1, 2);
+        let capped = HistogramLearner::with_params(3, 255, 1, 2);
+
+        let pb = big.fit_with_weights(&x, &y, None).unwrap().predict(&x);
+        let pc = capped.fit_with_weights(&x, &y, None).unwrap().predict(&x);
+        for i in 0..x.nrows() {
+            assert_eq!(pb[i].to_bits(), pc[i].to_bits(), "row {i}");
+        }
     }
 }
