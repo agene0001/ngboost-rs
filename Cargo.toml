@@ -22,10 +22,12 @@ rayon = { version = "1.12.0", optional = true }
 bumpalo = { version = "3.20.3", features = ["collections"] }
 typed-arena = "2.0.2"
 
-# Hyperparameter optimization (tpe uses rand 0.8, so we pull rand 0.8 under
-# the `rand_compat` alias for TPE's RNG interop — same trick as gradientlss-rs).
+# Hyperparameter optimization. tpe 0.3.1 depends on rand 0.10 — the same
+# major version as our `rand` above — so Cargo unifies them into one shared
+# crate and TPE's RNG interop works with a plain `rand::rngs::StdRng`.
+# (Older tpe 0.2.x used rand 0.8, which is why a `rand_compat` alias to an
+# older rand used to be needed; no longer.)
 tpe = "0.3.1"
-rand_compat = { package = "rand", version = "0.10.2" }
 serde_json = "1.0.150"
 
 # Optional BLAS backends - user must enable one
