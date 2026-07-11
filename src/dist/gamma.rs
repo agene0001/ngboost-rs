@@ -303,12 +303,26 @@ impl Scorable<CRPScore> for Gamma {
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Deterministic quadrature for E[g * g^T].
-        // Uses probability integral transform: u = F(y), y = F^{-1}(u)
-        // so E[h(Y)] = ∫_0^1 h(F^{-1}(u)) du, computed via midpoint rule.
+        // Deterministic quadrature for E[g * gᵀ] over Y ~ Gamma(α, β).
+        //
+        // No inverse CDF (the previous PIT rule used statrs `inverse_cdf`
+        // root-finding per node — same hang class observed for StudentT, and
+        // ~100µs/node). Instead:
+        //  - α ≥ 1: single log-domain panel, s = ln(w), w ~ Gamma(α,1):
+        //      E[h] = ∫ h(e^s/β) exp(αs − e^s − lnΓ(α)) ds
+        //    on s ∈ [(ln 1e-13 + lnΓ(α+1))/α, ln(α + 12√α + 40)] (non-iterative
+        //    truncation bounds; both tails decay (super)exponentially in s).
+        //  - α < 1: hybrid. Deep-left tail uses the asymptotic inverse CDF
+        //    F(w) ≈ w^α/Γ(1+α) (exact as w→0), whose quantile is closed-form:
+        //      w(u) = exp((ln u + lnΓ(1+α))/α),  node weight e^{−w}·Δu.
+        //    Remainder (w > min(α,1)e⁻⁴) uses the log-domain panel.
+        // Validated vs 2M-point references: rel err ≤ 2.3e-5 over
+        // α ∈ [0.005, 1000] — everywhere 1.5-4 orders better than the old
+        // 200-pt PIT rule (whose tail truncation gave 2.5e-5..1.3e-1).
+        use statrs::function::gamma::ln_gamma;
         let n_obs = self.shape.len();
         let n_params = 2;
-        let n_points = 200;
+        let n_points: usize = 200;
         let eps = 1e-5;
 
         let mut fi = Array3::zeros((n_obs, n_params, n_params));
@@ -316,39 +330,80 @@ impl Scorable<CRPScore> for Gamma {
         for i in 0..n_obs {
             let shape_i = self.shape[i];
             let rate_i = self.rate[i];
+            if !(shape_i > 0.0 && rate_i > 0.0) || !shape_i.is_finite() || !rate_i.is_finite() {
+                continue;
+            }
 
-            let d = match GammaDist::new(shape_i, rate_i) {
-                Ok(d) => d,
-                Err(_) => continue,
+            // Gradient kernel at a point y (finite differences, same as d_score).
+            let grads_at = |y_i: f64| -> [f64; 2] {
+                let g0 = (self.crps_single(y_i, shape_i * (1.0 + eps), rate_i)
+                    - self.crps_single(y_i, shape_i * (1.0 - eps), rate_i))
+                    / (2.0 * eps);
+                let g1 = (self.crps_single(y_i, shape_i, rate_i * (1.0 + eps))
+                    - self.crps_single(y_i, shape_i, rate_i * (1.0 - eps)))
+                    / (2.0 * eps);
+                [g0, g1]
             };
 
-            for j in 0..n_points {
-                let u = (j as f64 + 0.5) / n_points as f64;
-                let y_i = d.inverse_cdf(u);
-
-                // Compute gradient via finite differences (same as d_score)
-                let shape_plus = shape_i * (1.0 + eps);
-                let shape_minus = shape_i * (1.0 - eps);
-                let g0 = (self.crps_single(y_i, shape_plus, rate_i)
-                    - self.crps_single(y_i, shape_minus, rate_i))
-                    / (2.0 * eps);
-
-                let rate_plus = rate_i * (1.0 + eps);
-                let rate_minus = rate_i * (1.0 - eps);
-                let g1 = (self.crps_single(y_i, shape_i, rate_plus)
-                    - self.crps_single(y_i, shape_i, rate_minus))
-                    / (2.0 * eps);
-
-                let grads = [g0, g1];
-                for a in 0..n_params {
-                    for b in 0..n_params {
-                        fi[[i, a, b]] += grads[a] * grads[b];
+            let mut acc = [[0.0f64; 2]; 2];
+            fn accumulate(acc: &mut [[f64; 2]; 2], w: f64, g: [f64; 2]) {
+                if w > 0.0 && w.is_finite() && g[0].is_finite() && g[1].is_finite() {
+                    for a in 0..2 {
+                        for b in 0..2 {
+                            acc[a][b] += w * g[a] * g[b];
+                        }
                     }
+                }
+            }
+
+            let ln_gamma_a = ln_gamma(shape_i);
+            let ln_gamma_a1 = ln_gamma(shape_i + 1.0);
+            let s_hi = (shape_i + 12.0 * shape_i.sqrt() + 40.0).ln();
+
+            // Log-domain panel over s ∈ [s_lo, s_hi] with n nodes.
+            let log_panel =
+                |acc: &mut [[f64; 2]; 2], s_lo: f64, s_hi: f64, n: usize| {
+                    if n == 0 || s_hi <= s_lo {
+                        return;
+                    }
+                    let ds = (s_hi - s_lo) / n as f64;
+                    for j in 0..n {
+                        let s = s_lo + ds * (j as f64 + 0.5);
+                        let w_node = s.exp();
+                        // pdf(w)·w·Δs computed in log space (no y^(α−1) overflow)
+                        let w = (shape_i * s - w_node - ln_gamma_a).exp() * ds;
+                        accumulate(acc, w, grads_at(w_node / rate_i));
+                    }
+                };
+
+            if shape_i >= 1.0 {
+                let s_lo = ((1e-13f64).ln() + ln_gamma_a1) / shape_i;
+                log_panel(&mut acc, s_lo, s_hi, n_points);
+            } else {
+                // Breakpoint below which the CRPS kernels are ~constant.
+                let sb = (shape_i.min(1.0).ln() - 4.0).max((1e-280f64).ln() / shape_i.max(1e-3));
+                // Left-tail mass under the asymptotic CDF (closed form).
+                let p_b = (shape_i * sb - ln_gamma_a1).exp();
+                let n1 = n_points / 8;
+                // Asymptotic-inverse-CDF panel: u uniform on (0, p_b),
+                // w(u) = exp((ln u + lnΓ(1+α))/α), weight = e^{−w}·Δu.
+                let du = p_b / n1 as f64;
+                for j in 0..n1 {
+                    let u = du * (j as f64 + 0.5);
+                    let w_node = ((u.ln() + ln_gamma_a1) / shape_i).exp();
+                    let w = (-w_node).exp() * du;
+                    accumulate(&mut acc, w, grads_at(w_node / rate_i));
+                }
+                log_panel(&mut acc, sb, s_hi, n_points - n1);
+            }
+
+            for a in 0..2 {
+                for b in 0..2 {
+                    fi[[i, a, b]] = acc[a][b];
                 }
             }
         }
 
-        fi.mapv_inplace(|x| x / n_points as f64);
         fi
     }
 }
@@ -378,7 +433,8 @@ impl Gamma {
 }
 
 /// Trigamma function (second derivative of log gamma).
-fn trigamma(x: f64) -> f64 {
+/// Also used by StudentT's closed-form Fisher (`dist::studentt`).
+pub(crate) fn trigamma(x: f64) -> f64 {
     let mut x = x;
     let mut result = 0.0;
 
@@ -410,6 +466,33 @@ fn beta(a: f64, b: f64) -> f64 {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// CRPS metric E[ggᵀ] pinned to 2M-point PIT-quadrature references
+    /// (scipy, dumped 2026-07-09). Covers the hybrid small-shape branch
+    /// (α<1: asymptotic-inverse-CDF tail + log panel) and the log-panel
+    /// branch (α≥1). New-rule validation errors were ≤2.3e-5 relative.
+    #[test]
+    fn test_gamma_crps_metric_matches_reference() {
+        // (shape, rate, m00, m11, m01)
+        let cases = [
+            (0.05, 2.5, 4.452588158e-5, 1.999268456e-5, -2.866218337e-5),
+            (0.3, 2.5, 4.226957972e-3, 2.557937774e-3, -3.194849769e-3),
+            (3.0, 2.5, 4.848041975e-1, 4.460508116e-1, -4.623662583e-1),
+        ];
+        for &(shape, rate, m00, m11, m01) in &cases {
+            let params = Array2::from_shape_vec(
+                (1, 2),
+                vec![(shape as f64).ln(), (rate as f64).ln()],
+            )
+            .unwrap();
+            let d = Gamma::from_params(&params);
+            let fi = Scorable::<CRPScore>::metric(&d);
+            assert_relative_eq!(fi[[0, 0, 0]], m00, max_relative = 1e-3);
+            assert_relative_eq!(fi[[0, 1, 1]], m11, max_relative = 1e-3);
+            assert_relative_eq!(fi[[0, 0, 1]], m01, max_relative = 1e-3);
+            assert_relative_eq!(fi[[0, 1, 0]], m01, max_relative = 1e-3);
+        }
+    }
 
     #[test]
     fn test_gamma_distribution_methods() {

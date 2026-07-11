@@ -70,6 +70,41 @@ test_dist!(test_normal_fixed_var, NormalFixedVar);
 test_dist!(test_normal_fixed_mean, NormalFixedMean);
 
 // ============================================================================
+// CRPScore end-to-end fits for the distributions whose CRPS metrics used
+// quantile-based quadrature. Regression guard for the statrs `inverse_cdf`
+// hang class (a StudentT LogScore fit was observed stuck 30+ CPU-minutes in
+// ONE inverse_cdf call on a drifted df); the metrics are now quantile-free,
+// and these tests keep the natural-gradient CRPS path exercised.
+// ============================================================================
+
+macro_rules! test_dist_crps {
+    ($name:ident, $dist:ty) => {
+        #[test]
+        fn $name() {
+            use ngboost_rs::scores::CRPScore;
+            let n_samples = 100;
+            let n_features = 5;
+            let x = Array2::random((n_samples, n_features), Uniform::new(0., 1.).unwrap());
+            let y = x.dot(&Array1::from(vec![1.5, -2.3, 0.4, 3.1, -1.1]))
+                + &Array1::random(n_samples, Uniform::new(-0.5, 0.5).unwrap());
+            let y = y.mapv(|v| if v < 0.0 { 0.01 } else { v });
+
+            let mut model: NGBoost<$dist, CRPScore, StumpLearner> =
+                NGBoost::new(10, 0.1, StumpLearner);
+            let fit_result = model.fit(&x, &y);
+            assert!(fit_result.is_ok());
+
+            let y_pred = model.predict(&x);
+            assert_eq!(y_pred.len(), n_samples);
+            assert!(y_pred.iter().all(|v| v.is_finite()));
+        }
+    };
+}
+
+test_dist_crps!(test_studentt_crps_fit, StudentT);
+test_dist_crps!(test_gamma_crps_fit, Gamma);
+
+// ============================================================================
 // Poisson test (requires integer targets)
 // ============================================================================
 

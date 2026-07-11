@@ -379,9 +379,18 @@ impl<const P: usize> Scorable<LogScore> for MultivariateNormal<P> {
             // Gradient of the lower triangular elements
             for (par_idx, (&row, &col)) in rows.iter().zip(cols.iter()).enumerate() {
                 if row == col {
-                    // Diagonal: d/d(log(L_ii)) = L_ii * diff_i * eta_i - 1
+                    // Diagonal: L_ii = exp(θ) + 1e-6 (singularity guard in
+                    // get_chol_factor), so ∂L_ii/∂θ = exp(θ) = L_ii − 1e-6.
+                    // Differentiate THROUGH the guard:
+                    //   d/dθ [½‖η‖²]     = diff_i · η_i · (L_ii − 1e-6)
+                    //   d/dθ [−log L_ii] = −(L_ii − 1e-6)/L_ii
+                    // Python uses L_ii for both (treats the guard as constant),
+                    // making its gradient inconsistent with its own loss by
+                    // ~1e-6·|η_i·diff_i| on every row — deliberate deviation.
                     let l_ii = self.l[[i, row, row]];
-                    gradient[[i, P + par_idx]] = diff[[i, row, 0]] * eta[[i, row]] * l_ii - 1.0;
+                    let dl_dtheta = l_ii - 1e-6;
+                    gradient[[i, P + par_idx]] =
+                        diff[[i, row, 0]] * eta[[i, row]] * dl_dtheta - dl_dtheta / l_ii;
                 } else {
                     // Off-diagonal: d/d(L_ij) = eta_j * diff_i
                     gradient[[i, P + par_idx]] = eta[[i, col]] * diff[[i, row, 0]];
@@ -529,4 +538,53 @@ fn cholesky_lower(a: &Array2<f64>) -> Option<Array2<f64>> {
     }
 
     Some(l)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scores::{LogScore, Scorable};
+
+    /// Regression test for the eps-guard gradient bug: the analytic d_score
+    /// must be the exact derivative of the (eps-guarded) score. Python's MVN
+    /// gradient treats the `exp(θ)+1e-6` diagonal guard as constant and is
+    /// off by ~1e-6·|η·diff| on every row; ours differentiates through it.
+    #[test]
+    fn test_mvn_d_score_matches_own_score_fd() {
+        // 4 obs, k=3 → 9 params: loc(3) + tril(6), diag log-scale.
+        let vals = [
+            0.5_f64, -1.0, 2.0, 0.3, -0.4, 0.2, 0.5, -0.3, -0.6, // obs 0
+            -0.2, 0.8, 1.0, -0.5, 0.6, 0.4, -0.2, 0.1, 0.3, // obs 1
+            1.5, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // obs 2 (identity-ish L)
+            0.0, 0.0, 0.0, 0.6, 0.5, -0.6, 0.4, -0.5, 0.6, // obs 3
+        ];
+        let params = Array2::from_shape_vec((4, 9), vals.to_vec()).unwrap();
+        let d = MultivariateNormal::<3>::from_params(&params);
+        // y flattened row-major (n_obs * 3)
+        let y = Array1::from_vec(vec![
+            0.9, -0.4, 2.5, 0.1, 1.2, 0.2, 2.0, -0.8, -1.0, 0.5, -0.5, 0.7,
+        ]);
+
+        let analytic = Scorable::<LogScore>::d_score(&d, &y);
+
+        let h = 1e-6;
+        for j in 0..9 {
+            let mut pp = params.clone();
+            pp.column_mut(j).mapv_inplace(|v| v + h);
+            let sp = Scorable::<LogScore>::score(&MultivariateNormal::<3>::from_params(&pp), &y);
+            let mut pm = params.clone();
+            pm.column_mut(j).mapv_inplace(|v| v - h);
+            let sm = Scorable::<LogScore>::score(&MultivariateNormal::<3>::from_params(&pm), &y);
+            for i in 0..4 {
+                let fd = (sp[i] - sm[i]) / (2.0 * h);
+                let diff = (analytic[[i, j]] - fd).abs();
+                assert!(
+                    diff < 1e-6,
+                    "d_score[{i},{j}]={} vs FD {} (diff {diff:.2e})",
+                    analytic[[i, j]],
+                    fd
+                );
+            }
+        }
+    }
 }

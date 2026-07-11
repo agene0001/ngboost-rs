@@ -302,56 +302,46 @@ impl Scorable<LogScore> for StudentT {
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Deterministic quadrature for E[g * g^T].
-        // Uses probability integral transform: u = F(z), z = F^{-1}(u)
-        // so E[h(Z)] = ∫_0^1 h(F^{-1}(u)) du, computed via midpoint rule.
+        // Closed-form Fisher information in the internal (loc, log σ, log ν)
+        // parameterization (Lange, Little & Taylor 1989, transformed to
+        // log-scale coordinates):
+        //   I[0,0] = (ν+1) / ((ν+3) σ²)
+        //   I[1,1] = 2ν / (ν+3)
+        //   I[1,2] = I[2,1] = −2ν / ((ν+1)(ν+3))
+        //   I[2,2] = ν² [ψ′(ν/2) − ψ′((ν+1)/2)] / 4 − ν(ν+5) / (2(ν+1)(ν+3))
+        //   I[0,1] = I[0,2] = 0 (odd integrands: t is symmetric about loc)
+        // Verified against 2M-point PIT quadrature and 4M-sample MC of E[ggᵀ]
+        // (max diff ~5e-6, the references' own error). Replaces a 200-point
+        // midpoint quadrature that underestimated I[2,2] by 16–37% from tail
+        // truncation and cost ~200 inverse-CDF calls per row.
+        //
+        // I[2,2] is a difference of two ~0.5 quantities decaying like ~3.5/ν²,
+        // so the exact form loses to catastrophic cancellation for large ν
+        // (≥1.6% wrong at ν=1e5, garbage at 1e6). Above ν=1e4 switch to the
+        // asymptotic (3.5 − 13/ν)/ν², which agrees with the exact form to
+        // ~3e-5 at the boundary and stays positive (Fisher is PD).
+        use super::gamma::trigamma;
         let n_obs = self.loc.len();
-        let n_params = 3;
-        let n_points = 200;
-
-        let mut fi = Array3::zeros((n_obs, n_params, n_params));
+        let mut fi = Array3::zeros((n_obs, 3, 3));
 
         for i in 0..n_obs {
-            let loc_i = self.loc[i];
-            let scale_i = self.scale[i];
             let var_i = self.var[i];
-            let df_i = self.df[i];
+            let df = self.df[i];
 
-            let std_t = match StudentsTDist::new(0.0, 1.0, df_i) {
-                Ok(d) => d,
-                Err(_) => continue,
+            let i22 = if df > 1e4 {
+                (3.5 - 13.0 / df) / (df * df)
+            } else {
+                df * df * 0.25 * (trigamma(df / 2.0) - trigamma((df + 1.0) / 2.0))
+                    - df * (df + 5.0) / (2.0 * (df + 1.0) * (df + 3.0))
             };
 
-            for j in 0..n_points {
-                let u = (j as f64 + 0.5) / n_points as f64;
-                let z = std_t.inverse_cdf(u);
-                let y_i = loc_i + scale_i * z;
-
-                let diff = y_i - loc_i;
-                let diff_sq = diff * diff;
-                let denom = df_i * var_i + diff_sq;
-
-                let g0 = -(df_i + 1.0) * diff / denom;
-                let g1 = 1.0 - (df_i + 1.0) * diff_sq / denom;
-
-                let term_1 = (df_i / 2.0) * digamma((df_i + 1.0) / 2.0);
-                let term_2 = (-df_i / 2.0) * digamma(df_i / 2.0);
-                let term_3 = -0.5;
-                let term_4_1 = (-df_i / 2.0) * (1.0 + diff_sq / (df_i * var_i)).ln();
-                let term_4_2_num = (df_i + 1.0) * diff_sq;
-                let term_4_2_den = 2.0 * (df_i * var_i) * (1.0 + diff_sq / (df_i * var_i));
-                let g2 = -(term_1 + term_2 + term_3 + term_4_1 + term_4_2_num / term_4_2_den);
-
-                let grads = [g0, g1, g2];
-                for a in 0..n_params {
-                    for b in 0..n_params {
-                        fi[[i, a, b]] += grads[a] * grads[b];
-                    }
-                }
-            }
+            fi[[i, 0, 0]] = (df + 1.0) / ((df + 3.0) * var_i);
+            fi[[i, 1, 1]] = 2.0 * df / (df + 3.0);
+            fi[[i, 1, 2]] = -2.0 * df / ((df + 1.0) * (df + 3.0));
+            fi[[i, 2, 1]] = fi[[i, 1, 2]];
+            fi[[i, 2, 2]] = i22;
         }
 
-        fi.mapv_inplace(|x| x / n_points as f64);
         fi
     }
 }
@@ -460,12 +450,24 @@ impl Scorable<CRPScore> for StudentT {
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Deterministic quadrature for E[g * g^T].
-        // Uses probability integral transform: u = F(z), z = F^{-1}(u)
+        // Deterministic quadrature for E[g * gᵀ] over Z ~ t_ν.
+        //
+        // Change of variables z = tan(θ), θ midpoint-uniform on (−π/2, π/2):
+        //   E[h(Z)] = ∫ h(z) f_ν(z) dz ≈ (π/n) Σ h(tanθ_j) f_ν(tanθ_j) sec²θ_j
+        // No inverse CDF: the previous PIT rule (z = F⁻¹(u)) used statrs
+        // `inverse_cdf`, whose root-finding can fail to converge on drifted ν
+        // (observed: a fit stuck 30+ CPU-min inside ONE call) and cost ~100µs
+        // per node. The tan rule needs only pdf/cdf and is 1-7 orders of
+        // magnitude MORE accurate (validated vs 2M-point references:
+        // rel err 1.6e-6 at ν=2.7, ~1e-11 for ν≥5; old rule ~2.5e-5 tail bias).
+        // Accuracy degrades only as ν→1 (integrand tail ~z^{1−ν}): ~1e-3 at
+        // ν=1.5, ~2e-2 at ν=1.2 — comparable to the old rule there, and the
+        // score itself is guarded for ν≤1.
         let n_obs = self.loc.len();
         let n_params = 3;
         let n_points = 200;
         let eps = 1e-6;
+        let pi = std::f64::consts::PI;
 
         let mut fi = Array3::zeros((n_obs, n_params, n_params));
 
@@ -486,11 +488,15 @@ impl Scorable<CRPScore> for StudentT {
             };
 
             for j in 0..n_points {
-                let u = (j as f64 + 0.5) / n_points as f64;
-                let z = std_t.inverse_cdf(u);
+                let theta = -pi / 2.0 + pi * (j as f64 + 0.5) / n_points as f64;
+                let z = theta.tan();
+                let w = std_t.pdf(z) * (1.0 + z * z) * (pi / n_points as f64);
+                if w == 0.0 || !w.is_finite() {
+                    continue; // underflowed tail node contributes nothing
+                }
 
                 // g0 = d(CRPS)/d(μ) = -(2F(z)-1)
-                let g0 = -(2.0 * u - 1.0);
+                let g0 = -(2.0 * std_t.cdf(z) - 1.0);
 
                 // g1 = d(CRPS)/d(log(σ))
                 let crps_std = compute_t_crps_std(z, nu);
@@ -506,13 +512,12 @@ impl Scorable<CRPScore> for StudentT {
                 let grads = [g0, g1, g2];
                 for a in 0..n_params {
                     for b in 0..n_params {
-                        fi[[i, a, b]] += grads[a] * grads[b];
+                        fi[[i, a, b]] += w * grads[a] * grads[b];
                     }
                 }
             }
         }
 
-        fi.mapv_inplace(|x| x / n_points as f64);
         fi
     }
 }
@@ -1238,6 +1243,129 @@ impl Scorable<LogScore> for TFixedDfFixedVar {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// Reference E[ggᵀ] for the 3-param StudentT LogScore via high-resolution
+    /// PIT midpoint quadrature (the method the closed form replaced, at a
+    /// point count where its tail-truncation error is ~1e-3 instead of ~30%).
+    fn studentt_fisher_quadrature(loc: f64, scale: f64, df: f64, n_points: usize) -> [[f64; 3]; 3] {
+        let var = scale * scale;
+        let std_t = StudentsTDist::new(0.0, 1.0, df).unwrap();
+        let mut fi = [[0.0f64; 3]; 3];
+        for j in 0..n_points {
+            let u = (j as f64 + 0.5) / n_points as f64;
+            let z = std_t.inverse_cdf(u);
+            let diff = scale * z;
+            let diff_sq = diff * diff;
+            let denom = df * var + diff_sq;
+            let g0 = -(df + 1.0) * diff / denom;
+            let g1 = 1.0 - (df + 1.0) * diff_sq / denom;
+            let term_1 = (df / 2.0) * digamma((df + 1.0) / 2.0);
+            let term_2 = (-df / 2.0) * digamma(df / 2.0);
+            let term_4_1 = (-df / 2.0) * (1.0 + diff_sq / (df * var)).ln();
+            let term_4_2 =
+                (df + 1.0) * diff_sq / (2.0 * (df * var) * (1.0 + diff_sq / (df * var)));
+            let g2 = -(term_1 + term_2 - 0.5 + term_4_1 + term_4_2);
+            let g = [g0, g1, g2];
+            for a in 0..3 {
+                for b in 0..3 {
+                    fi[a][b] += g[a] * g[b];
+                }
+            }
+        }
+        for row in fi.iter_mut() {
+            for v in row.iter_mut() {
+                *v /= n_points as f64;
+            }
+        }
+        let _ = loc; // Fisher is translation invariant; loc kept for clarity
+        fi
+    }
+
+    #[test]
+    fn test_studentt_logscore_metric_closed_form_vs_quadrature() {
+        // Closed-form Fisher must match a 100k-point quadrature of E[ggᵀ]
+        // (reference tail-truncation error ~1.5e-3) on every entry.
+        for &(loc, scale, df) in &[(0.5, 1.3, 2.7), (-1.0, 0.6, 8.0), (2.0, 1.0, 20.0)] {
+            let params =
+                Array2::from_shape_vec((1, 3), vec![loc, (scale as f64).ln(), (df as f64).ln()])
+                    .unwrap();
+            let dist = StudentT::from_params(&params);
+            let fi = Scorable::<LogScore>::metric(&dist);
+            let reference = studentt_fisher_quadrature(loc, scale, df, 100_000);
+            for a in 0..3 {
+                for b in 0..3 {
+                    let closed = fi[[0, a, b]];
+                    let quad = reference[a][b];
+                    if quad.abs() < 1e-8 {
+                        // Odd integrands: exactly zero in closed form,
+                        // ~fp-cancellation-zero in quadrature.
+                        assert!(closed.abs() < 1e-12, "[{a},{b}] expected 0, got {closed}");
+                    } else {
+                        assert_relative_eq!(closed, quad, max_relative = 1e-2);
+                    }
+                }
+            }
+        }
+    }
+
+    /// CRPS metric E[ggᵀ] pinned to 2M-point PIT-quadrature references
+    /// (scipy, dumped 2026-07-09). The tan-rule replacement's validation
+    /// errors were 1.6e-6 (ν=2.7) down to ~1e-11 (ν≥5).
+    /// Note E[g0²] = E[(2U−1)²] = 1/3 exactly.
+    #[test]
+    fn test_studentt_crps_metric_matches_reference() {
+        // (nu, m11, m22, m12) at sigma = 0.7; m00 = 1/3 always.
+        let cases = [
+            (2.7, 3.9400582e-2, 3.670059478e-3, -1.132702258e-2),
+            (5.0, 3.0838072e-2, 5.988928621e-4, -4.110146721e-3),
+            (20.0, 2.5558790e-2, 2.358913637e-5, -7.509118801e-4),
+        ];
+        for &(nu, m11, m22, m12) in &cases {
+            let params = Array2::from_shape_vec(
+                (1, 3),
+                vec![0.0, 0.7_f64.ln(), (nu as f64).ln()],
+            )
+            .unwrap();
+            let d = StudentT::from_params(&params);
+            let fi = Scorable::<CRPScore>::metric(&d);
+            assert_relative_eq!(fi[[0, 0, 0]], 1.0 / 3.0, max_relative = 1e-4);
+            assert_relative_eq!(fi[[0, 1, 1]], m11, max_relative = 1e-3);
+            assert_relative_eq!(fi[[0, 2, 2]], m22, max_relative = 1e-3);
+            assert_relative_eq!(fi[[0, 1, 2]], m12, max_relative = 1e-3);
+        }
+    }
+
+    #[test]
+    fn test_studentt_logscore_metric_known_values() {
+        // I[1,1] = 2ν/(ν+3): classic value 1/2 at ν=1 (Cauchy log-scale Fisher).
+        // I[0,0] = (ν+1)/((ν+3)σ²).
+        let params =
+            Array2::from_shape_vec((1, 3), vec![0.0, 2.0_f64.ln(), 1.0_f64.ln()]).unwrap();
+        let dist = StudentT::from_params(&params);
+        let fi = Scorable::<LogScore>::metric(&dist);
+        assert_relative_eq!(fi[[0, 1, 1]], 0.5, max_relative = 1e-12);
+        assert_relative_eq!(fi[[0, 0, 0]], 2.0 / (4.0 * 4.0), max_relative = 1e-12);
+    }
+
+    #[test]
+    fn test_studentt_logscore_metric_large_df_branch() {
+        // The asymptotic I[2,2] branch must join continuously at ν=1e4 and
+        // stay strictly positive where the exact form would be cancellation
+        // noise (possibly negative → indefinite "Fisher").
+        let metric_at = |df: f64| {
+            let params = Array2::from_shape_vec((1, 3), vec![0.0, 0.0, df.ln()]).unwrap();
+            let dist = StudentT::from_params(&params);
+            Scorable::<LogScore>::metric(&dist)[[0, 2, 2]]
+        };
+        let below = metric_at(9.999e3);
+        let above = metric_at(1.0001e4);
+        assert_relative_eq!(below, above, max_relative = 1e-3);
+        for &df in &[1e5, 1e6, 1e8] {
+            let i22 = metric_at(df);
+            assert!(i22 > 0.0, "I[2,2] must stay positive at df={df}, got {i22}");
+            assert_relative_eq!(i22, 3.5 / (df * df), max_relative = 1e-3);
+        }
+    }
 
     #[test]
     fn test_studentt_crpscore() {
