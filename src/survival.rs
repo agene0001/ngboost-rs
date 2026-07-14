@@ -15,6 +15,7 @@ use ndarray::{Array1, Array2};
 use rand::prelude::*;
 use rand::rng;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 /// NGBoost for survival analysis with right-censored data.
@@ -416,7 +417,7 @@ where
 
             // Fit base learners for each parameter in parallel (matches the
             // main NGBoost training loop's rayon strategy)
-            let weight_ref = weights_sampled.as_ref();
+            let weight_ref: Option<&Array1<f64>> = weights_sampled.as_ref().map(|w| w.as_ref());
             let grad_cols: Vec<Array1<f64>> =
                 (0..n_params).map(|j| grads_sampled.column(j).to_owned()).collect();
             let learners: Vec<B> = (0..n_params).map(|_| self.base_learner.clone()).collect();
@@ -449,13 +450,10 @@ where
 
             let predictions = to_2d_array(predictions_cols);
 
-            // Line search to find optimal step size
-            let scale = self.line_search(
-                &predictions,
-                &params_sampled,
-                &y_sampled,
-                weights_sampled.as_ref(),
-            );
+            // Line search to find optimal step size. `dist` is the distribution
+            // at `params_sampled`, so pass it as the start point instead of
+            // letting line_search rebuild it with from_params.
+            let scale = self.line_search(&predictions, &params_sampled, &dist, &y_sampled, weight_ref);
             self.scalings.push(scale);
             self.base_models.push(fitted_learners);
 
@@ -465,7 +463,16 @@ where
             // Fused predict + scale + subtract avoids intermediate Array2 allocations.
             let factor = self.learning_rate * scale;
             let fitted_learners = self.base_models.last().unwrap();
-            Self::predict_and_update_params(fitted_learners, x, &col_idxs, &mut params, factor);
+            if x_is_stable {
+                // No subsampling: x_sampled IS x (Cow::Borrowed) and col_idxs is
+                // the full range, so `predictions` already holds these learners'
+                // predictions on x — reuse them (same f64s, bit-identical).
+                ndarray::Zip::from(&mut params)
+                    .and(&predictions)
+                    .for_each(|p, &g| *p -= factor * g);
+            } else {
+                Self::predict_and_update_params(fitted_learners, x, &col_idxs, &mut params, factor);
+            }
 
             // Handle validation and early stopping
             if let Some((ref xv, ref yv, ref mut vp)) = val_data {
@@ -505,22 +512,16 @@ where
                 }
 
                 if self.should_print_verbose(itr) {
-                    let train_loss = CensoredScorable::total_censored_score(
-                        &dist,
-                        &y_sampled,
-                        weights_sampled.as_ref(),
-                    );
+                    let train_loss =
+                        CensoredScorable::total_censored_score(&dist, &y_sampled, weight_ref);
                     println!(
                         "[iter {}] train_loss={:.4} val_loss={:.4}",
                         itr, train_loss, val_loss
                     );
                 }
             } else if self.should_print_verbose(itr) {
-                let train_loss = CensoredScorable::total_censored_score(
-                    &dist,
-                    &y_sampled,
-                    weights_sampled.as_ref(),
-                );
+                let train_loss =
+                    CensoredScorable::total_censored_score(&dist, &y_sampled, weight_ref);
                 println!("[iter {}] loss={:.4} scale={:.4}", itr, train_loss, scale);
             }
         }
@@ -544,25 +545,43 @@ where
         Ok(())
     }
 
-    fn sample(
+    // `params` gets its own lifetime: its Cow dies at the line search, after
+    // which the caller mutates `params` while the other borrows stay live.
+    fn sample<'a, 'p>(
         &mut self,
-        x: &Array2<f64>,
-        y: &SurvivalData,
-        params: &Array2<f64>,
-        sample_weight: Option<&Array1<f64>>,
+        x: &'a Array2<f64>,
+        y: &'a SurvivalData,
+        params: &'p Array2<f64>,
+        sample_weight: Option<&'a Array1<f64>>,
     ) -> (
         Vec<usize>,
         Vec<usize>,
-        Array2<f64>,
-        SurvivalData,
-        Array2<f64>,
-        Option<Array1<f64>>,
+        Cow<'a, Array2<f64>>,
+        Cow<'a, SurvivalData>,
+        Cow<'p, Array2<f64>>,
+        Option<Cow<'a, Array1<f64>>>,
     ) {
         let n_samples = x.nrows();
         let n_features = x.ncols();
 
+        let no_row_sampling = self.minibatch_frac >= 1.0;
+        let no_col_sampling = self.col_sample >= 1.0;
+
+        // Fast path: no sampling at all — borrow original data, zero copies
+        // (mirrors NGBoost::sample)
+        if no_row_sampling && no_col_sampling {
+            return (
+                (0..n_samples).collect(),
+                (0..n_features).collect(),
+                Cow::Borrowed(x),
+                Cow::Borrowed(y),
+                Cow::Borrowed(params),
+                sample_weight.map(Cow::Borrowed),
+            );
+        }
+
         // Sample rows (minibatch)
-        let sample_size = if self.minibatch_frac >= 1.0 {
+        let sample_size = if no_row_sampling {
             n_samples
         } else {
             ((n_samples as f64) * self.minibatch_frac) as usize
@@ -577,7 +596,7 @@ where
         };
 
         // Sample columns
-        let col_size = if self.col_sample >= 1.0 {
+        let col_size = if no_col_sampling {
             n_features
         } else if self.col_sample > 0.0 {
             (((n_features as f64) * self.col_sample) as usize).max(1)
@@ -593,10 +612,14 @@ where
             indices.into_iter().take(col_size).collect()
         };
 
-        // Create sampled data
-        let x_sampled = x
-            .select(ndarray::Axis(0), &row_idxs)
-            .select(ndarray::Axis(1), &col_idxs);
+        // Create sampled data (skip the column select when all columns kept —
+        // select with the full index range would be a second full copy)
+        let x_sampled = if col_size == n_features {
+            x.select(ndarray::Axis(0), &row_idxs)
+        } else {
+            x.select(ndarray::Axis(0), &row_idxs)
+                .select(ndarray::Axis(1), &col_idxs)
+        };
         let y_sampled = SurvivalData {
             time: y.time.select(ndarray::Axis(0), &row_idxs),
             event: y.event.select(ndarray::Axis(0), &row_idxs),
@@ -604,15 +627,15 @@ where
         let params_sampled = params.select(ndarray::Axis(0), &row_idxs);
 
         // Sample weights if provided
-        let weights_sampled =
-            sample_weight.map(|weights| weights.select(ndarray::Axis(0), &row_idxs));
+        let weights_sampled = sample_weight
+            .map(|weights| Cow::Owned(weights.select(ndarray::Axis(0), &row_idxs)));
 
         (
             row_idxs,
             col_idxs,
-            x_sampled,
-            y_sampled,
-            params_sampled,
+            Cow::Owned(x_sampled),
+            Cow::Owned(y_sampled),
+            Cow::Owned(params_sampled),
             weights_sampled,
         )
     }
@@ -621,12 +644,14 @@ where
         &self,
         resids: &Array2<f64>,
         start: &Array2<f64>,
+        start_dist: &D,
         y: &SurvivalData,
         sample_weight: Option<&Array1<f64>>,
     ) -> f64 {
+        // `start_dist` must be the distribution at `start`; the caller already
+        // has it, so we avoid rebuilding it with from_params here.
         let mut scale = 1.0;
-        let initial_score =
-            CensoredScorable::total_censored_score(&D::from_params(start), y, sample_weight);
+        let initial_score = CensoredScorable::total_censored_score(start_dist, y, sample_weight);
 
         // Pre-allocate buffer for next_params — reused across all evaluations
         // (avoids allocating scaled_resids + next_params per scale tested)
@@ -641,16 +666,22 @@ where
             CensoredScorable::total_censored_score(&D::from_params(next_params), y, sample_weight)
         };
 
-        // Scale up phase
+        // Scale up phase. Remember the last passing probe: when at least one
+        // doubling happened, the down phase's first candidate is exactly that
+        // scale, and its pass condition (score < initial && finite) is exactly
+        // the condition the probe already met — reuse the score, skip the eval.
+        let mut last_probe: Option<(f64, f64)> = None;
         loop {
             if scale > 256.0 {
                 break;
             }
-            let score = compute_score_at_scale(&mut next_params, scale * 2.0);
+            let probe_scale = scale * 2.0;
+            let score = compute_score_at_scale(&mut next_params, probe_scale);
             if score >= initial_score || !score.is_finite() {
                 break;
             }
-            scale *= 2.0;
+            scale = probe_scale;
+            last_probe = Some((scale, score));
         }
 
         // Mean of per-row L2 norms of resids — scale factors out of the norm,
@@ -668,7 +699,10 @@ where
                 break;
             }
 
-            let score = compute_score_at_scale(&mut next_params, scale);
+            let score = match last_probe {
+                Some((s, sc)) if s == scale => sc,
+                _ => compute_score_at_scale(&mut next_params, scale),
+            };
             if score < initial_score && score.is_finite() {
                 break;
             }

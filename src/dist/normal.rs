@@ -617,12 +617,14 @@ impl Distribution for NormalFixedMean {
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
-        let std_dev = y.std(0.0);
-        // from_params expects log(scale), so return log(std_dev).
-        // Note: Python's NormalFixedMean.fit() has a bug here — it returns raw s
-        // instead of log(s), causing from_params to compute exp(s) instead of s.
-        let safe_std_dev = if std_dev <= 0.0 { 1.0 } else { std_dev };
-        array![safe_std_dev.ln()]
+        // The model fixes loc = 0, so the marginal MLE for scale is the RMS
+        // about zero, sqrt(mean(y²)) — NOT the std about the sample mean.
+        // Python uses sp.stats.norm.fit(Y)'s free-mean s here (a bug we
+        // deliberately don't copy), and additionally returns raw s where
+        // from_params expects log(s) (a second Python bug, also not copied).
+        let rms = y.mapv(|v| v * v).mean().sqrt();
+        let safe_rms = if rms <= 0.0 { 1.0 } else { rms };
+        array![safe_rms.ln()]
     }
 
     fn n_params(&self) -> usize {
@@ -944,6 +946,29 @@ mod tests {
         assert_relative_eq!(dist.mean()[1], 5.0, epsilon = 1e-10);
         assert_relative_eq!(dist.variance()[0], 1.0, epsilon = 1e-10);
         assert_relative_eq!(dist.variance()[1], 1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_normal_fixed_mean_fit_is_rms_about_zero() {
+        // loc is fixed at 0, so the scale MLE is sqrt(mean(y²)), not the
+        // centered std. For y with nonzero mean these differ; the RMS init
+        // must have lower (or equal) NLL under the actual model.
+        let y = Array1::from_vec(vec![1.5, 2.0, 2.5, 3.0, 1.0, 2.2, 1.8, 2.6]);
+        let fitted = NormalFixedMean::fit(&y);
+        let rms = y.mapv(|v| v * v).mean().sqrt();
+        assert_relative_eq!(fitted[0], rms.ln(), epsilon = 1e-12);
+
+        let n = y.len();
+        let make = |log_s: f64| {
+            let params = Array2::from_elem((n, 1), log_s);
+            NormalFixedMean::from_params(&params)
+        };
+        let nll_rms: f64 = Scorable::<LogScore>::score(&make(fitted[0]), &y).sum();
+        let nll_std: f64 = Scorable::<LogScore>::score(&make(y.std(0.0).ln()), &y).sum();
+        assert!(
+            nll_rms < nll_std,
+            "RMS init should beat centered-std init under loc=0: {nll_rms} vs {nll_std}"
+        );
     }
 
     #[test]

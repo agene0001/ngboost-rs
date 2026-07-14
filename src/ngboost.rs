@@ -971,13 +971,23 @@ where
             let col_idxs_ref = self.col_idxs.last().unwrap();
             let fitted_learners = self.base_models.last().unwrap();
             let factor = effective_learning_rate * scale;
-            Self::predict_and_update_params(
-                fitted_learners,
-                &x_train,
-                col_idxs_ref,
-                &mut params,
-                factor,
-            );
+            if x_is_stable {
+                // No subsampling: x_sampled IS x_train (Cow::Borrowed) and
+                // col_idxs is the full range, so proj_grad already holds these
+                // learners' predictions on x_train — reuse them instead of
+                // re-walking every tree (same f64s, bit-identical update).
+                ndarray::Zip::from(&mut params)
+                    .and(&proj_grad)
+                    .for_each(|p, &g| *p -= factor * g);
+            } else {
+                Self::predict_and_update_params(
+                    fitted_learners,
+                    &x_train,
+                    col_idxs_ref,
+                    &mut params,
+                    factor,
+                );
+            }
 
             // Update validation parameters if validation data is provided
             let mut val_loss = 0.0;
@@ -1583,25 +1593,6 @@ where
         Some(aggregated)
     }
 
-    /// Compute mean of per-row L2 norms of (scale * resids), matching Python's
-    /// `np.mean(np.linalg.norm(scaled_resids, axis=1))`.
-    fn mean_row_norms(&self, resids: &Array2<f64>, scale: f64) -> f64 {
-        let n_rows = resids.nrows();
-        if n_rows == 0 {
-            return 0.0;
-        }
-        let abs_scale = scale.abs();
-        let sum_norms: f64 = resids
-            .rows()
-            .into_iter()
-            .map(|row| {
-                let row_norm_sq: f64 = row.iter().map(|&x| x * x).sum();
-                row_norm_sq.sqrt()
-            })
-            .sum();
-        abs_scale * sum_norms / n_rows as f64
-    }
-
     fn line_search(
         &self,
         resids: &Array2<f64>,
@@ -1659,24 +1650,50 @@ where
             Scorable::total_score(&D::from_params(next_params), y, sample_weight)
         };
 
+        // Scores already evaluated, keyed by exact scale value (scales are
+        // powers of two, so f64 equality is exact). The down phase re-applies
+        // its own comparison to the cached VALUE — this matters because the up
+        // phase passes on score <= initial while the down phase requires a
+        // strict score < initial, so pass/fail can't be cached, only scores.
+        let mut evaluated: Vec<(f64, f64)> = Vec::with_capacity(12);
+
         // Scale up phase: test at current scale, then double if good.
         // Matches Python: exits with scale = first value that failed.
         loop {
             let score = compute_score_at_scale(&mut next_params, scale);
+            evaluated.push((scale, score));
             if !score.is_finite() || score > initial_score || scale > 256.0 {
                 break;
             }
             scale *= 2.0;
         }
 
+        // Mean per-row L2 norm of (scale * resids), matching Python's
+        // np.mean(np.linalg.norm(scaled_resids, axis=1)). The sum is
+        // scale-invariant — compute the O(n·k) pass once, rescale per step.
+        let n_rows = resids.nrows();
+        let sum_norms: f64 = resids
+            .rows()
+            .into_iter()
+            .map(|row| row.iter().map(|&x| x * x).sum::<f64>().sqrt())
+            .sum();
+
         // Scale down phase: find a step that actually reduces loss
         loop {
-            let norm = self.mean_row_norms(resids, scale);
+            let norm = if n_rows == 0 {
+                0.0
+            } else {
+                scale.abs() * sum_norms / n_rows as f64
+            };
             if norm < self.tol {
                 break;
             }
 
-            let score = compute_score_at_scale(&mut next_params, scale);
+            let score = evaluated
+                .iter()
+                .find(|(s, _)| *s == scale)
+                .map(|&(_, sc)| sc)
+                .unwrap_or_else(|| compute_score_at_scale(&mut next_params, scale));
             if score.is_finite() && score < initial_score {
                 break;
             }
