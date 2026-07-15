@@ -428,14 +428,9 @@ where
                 .into_par_iter()
                 .zip(grad_cols.into_par_iter())
                 .map(|(learner, grad_j)| {
-                    let fitted = match cache_ref {
-                        Some(c) => {
-                            learner.fit_with_weights_cached(&x_sampled, &grad_j, weight_ref, c)?
-                        }
-                        None => learner.fit_with_weights(&x_sampled, &grad_j, weight_ref)?,
-                    };
-                    let preds = fitted.predict(&x_sampled);
-                    Ok((fitted, preds))
+                    // Fused fit + train-predictions (leaf-scatter for
+                    // histogram trees), mirroring the main NGBoost loop.
+                    learner.fit_predict_cached(&x_sampled, &grad_j, weight_ref, cache_ref)
                 })
                 .collect();
 

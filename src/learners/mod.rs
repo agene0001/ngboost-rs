@@ -44,6 +44,27 @@ pub trait BaseLearner: Send + Sync {
     ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
         self.fit_with_weights(x, y, sample_weight)
     }
+
+    /// Fit and return both the fitted learner and its predictions on the
+    /// training `x`. The default fits, then predicts. Learners that can
+    /// harvest the training predictions during fitting itself (a histogram
+    /// tree already routes every row to its leaf while partitioning)
+    /// override this to skip the second walk over the tree — the returned
+    /// predictions must be bit-identical to `fitted.predict(x)`.
+    fn fit_predict_cached(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        cache: Option<&dyn FitCache>,
+    ) -> Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str> {
+        let fitted = match cache {
+            Some(c) => self.fit_with_weights_cached(x, y, sample_weight, c)?,
+            None => self.fit_with_weights(x, y, sample_weight)?,
+        };
+        let preds = fitted.predict(x);
+        Ok((fitted, preds))
+    }
 }
 
 pub trait TrainedBaseLearner: Send + Sync {
@@ -615,6 +636,33 @@ impl BaseLearner for HistogramLearner {
             _ => self.fit_with_weights(x, y, sample_weight),
         }
     }
+
+    fn fit_predict_cached(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        cache: Option<&dyn FitCache>,
+    ) -> Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str> {
+        if x.nrows() == 0 {
+            return Err("Cannot fit to empty dataset");
+        }
+        let mut preds = Array1::zeros(x.nrows());
+        let preds_slice = preds
+            .as_slice_mut()
+            .expect("freshly allocated Array1 is contiguous");
+        let fitted = match cache.and_then(|c| c.as_any().downcast_ref::<HistogramFitCache>()) {
+            Some(c) if c.n_rows == x.nrows() && c.n_features == x.ncols() => {
+                self.fit_from_cache_scattering(c, y, sample_weight, Some(preds_slice))?
+            }
+            // No / wrong / stale cache — bin x fresh, still leaf-scatter
+            _ => {
+                let c = build_histogram_cache(x, self.max_bins);
+                self.fit_from_cache_scattering(&c, y, sample_weight, Some(preds_slice))?
+            }
+        };
+        Ok((fitted, preds))
+    }
 }
 
 impl HistogramLearner {
@@ -623,6 +671,21 @@ impl HistogramLearner {
         cache: &HistogramFitCache,
         y: &Array1<f64>,
         sample_weight: Option<&Array1<f64>>,
+    ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
+        self.fit_from_cache_scattering(cache, y, sample_weight, None)
+    }
+
+    /// Like [`fit_from_cache`], but when `preds` is given, every row's leaf
+    /// value is written into it during the build (leaf-scatter) — the tree
+    /// partition already routes each row to exactly one leaf, so the training
+    /// predictions come for free instead of via a second tree walk. The
+    /// scattered values are bit-identical to `fitted.predict(x)` (tested).
+    fn fit_from_cache_scattering(
+        &self,
+        cache: &HistogramFitCache,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        preds: Option<&mut [f64]>,
     ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
         if y.len() != cache.n_rows {
             return Err("y length does not match cached X");
@@ -640,6 +703,7 @@ impl HistogramLearner {
             self.max_depth,
             self.min_samples_split,
             self.min_samples_leaf,
+            preds,
         );
 
         Ok(Box::new(TrainedHistogramTree::new(root, cache.n_features)))
@@ -812,35 +876,22 @@ impl FeatureHists {
     }
 
     /// Sibling-subtraction trick: this node's histograms minus a child's give
-    /// the other child's, without a second data pass.
-    fn subtract(&self, child: &FeatureHists) -> FeatureHists {
-        let count = self
-            .count
-            .iter()
-            .zip(child.count.iter())
-            .map(|(a, b)| (a - b).max(0.0))
-            .collect();
-        let sum = self
-            .sum
-            .iter()
-            .zip(child.sum.iter())
-            .map(|(a, b)| a - b)
-            .collect();
-        let raw = match (&self.raw, &child.raw) {
-            (Some(a), Some(b)) => Some(
-                a.iter()
-                    .zip(b.iter())
-                    .map(|(a, b)| (a - b).max(0.0))
-                    .collect(),
-            ),
-            _ => None,
-        };
-        FeatureHists {
-            count,
-            sum,
-            raw,
-            n_bins: self.n_bins,
+    /// the other child's, without a second data pass. Consumes self — the
+    /// parent's histograms are dead after the split — so the ~20KB vecs are
+    /// mutated in place instead of reallocated at every split node.
+    fn subtract(mut self, child: &FeatureHists) -> FeatureHists {
+        for (a, b) in self.count.iter_mut().zip(child.count.iter()) {
+            *a = (*a - b).max(0.0);
         }
+        for (a, b) in self.sum.iter_mut().zip(child.sum.iter()) {
+            *a -= b;
+        }
+        if let (Some(a), Some(b)) = (self.raw.as_mut(), child.raw.as_ref()) {
+            for (x, y) in a.iter_mut().zip(b.iter()) {
+                *x = (*x - y).max(0.0);
+            }
+        }
+        self
     }
 
     /// Total (count, sum) over all bins of one feature.
@@ -870,6 +921,7 @@ fn build_histogram_tree_node(
     max_depth: usize,
     min_samples_split: usize,
     min_samples_leaf: usize,
+    mut preds: Option<&mut [f64]>,
 ) -> HistTreeNode {
     let (parent_count, parent_sum) = hists.totals(0);
     let node_value = if parent_count > 0.0 {
@@ -878,9 +930,21 @@ fn build_histogram_tree_node(
         0.0
     };
 
+    // Leaf-scatter: every row of a leaf gets the leaf's value — the exact
+    // f64 `predict` would return for it (partition and predict route rows
+    // identically; see `leaf_scatter_matches_predict` tests).
+    let make_leaf = |indices: &[u32], preds: &mut Option<&mut [f64]>| {
+        if let Some(p) = preds.as_deref_mut() {
+            for &i in indices {
+                p[i as usize] = node_value;
+            }
+        }
+        HistTreeNode::Leaf { value: node_value }
+    };
+
     // Check stopping conditions
     if depth >= max_depth || indices.len() < min_samples_split || parent_count <= 0.0 {
-        return HistTreeNode::Leaf { value: node_value };
+        return make_leaf(&indices, &mut preds);
     }
 
     // Find the best Friedman-MSE split by scanning bin prefix sums per feature
@@ -906,6 +970,19 @@ fn build_histogram_tree_node(
 
         // Candidate split after each bin except the last occupied one
         for bin in 0..(n_edges - 1) {
+            // A bin holding NO rows leaves every accumulator unchanged, so its
+            // candidate is an exact duplicate of the previous one — never taken
+            // under strict `>` and with identical gate outcomes. Skip it. With
+            // weights, count can be 0 while zero-weight rows still occupy the
+            // bin (raw > 0) and DO move the min_samples_leaf gate — so the
+            // emptiness test must use raw counts there.
+            let empty = match raw_bins {
+                Some(r) => r[base + bin] == 0.0,
+                None => hists.count[base + bin] == 0.0,
+            };
+            if empty {
+                continue;
+            }
             left_count += hists.count[base + bin];
             left_sum += hists.sum[base + bin];
             let left_raw = match raw_bins {
@@ -945,7 +1022,7 @@ fn build_histogram_tree_node(
 
     // If no valid split found
     if best_improvement <= 0.0 {
-        return HistTreeNode::Leaf { value: node_value };
+        return make_leaf(&indices, &mut preds);
     }
 
     // Partition row ids by bin
@@ -962,7 +1039,7 @@ fn build_histogram_tree_node(
     }
 
     if left_indices.len() < min_samples_leaf || right_indices.len() < min_samples_leaf {
-        return HistTreeNode::Leaf { value: node_value };
+        return make_leaf(&indices, &mut preds);
     }
 
     // Histogram subtraction: scan the smaller child, derive the larger
@@ -986,6 +1063,7 @@ fn build_histogram_tree_node(
         max_depth,
         min_samples_split,
         min_samples_leaf,
+        preds.as_deref_mut(),
     );
     let right_child = build_histogram_tree_node(
         cache,
@@ -997,6 +1075,7 @@ fn build_histogram_tree_node(
         max_depth,
         min_samples_split,
         min_samples_leaf,
+        preds,
     );
 
     HistTreeNode::Split {
@@ -2939,6 +3018,61 @@ mod histogram_tests {
         (x, y)
     }
 
+    /// Leaf-scattered training predictions must be BIT-identical to
+    /// `fitted.predict(x)` — the invariant `fit_predict_cached` relies on.
+    /// Covers the partition/predict routing edge cases: values exactly on
+    /// bin edges (integer features), NaN rows (both route right), weighted
+    /// fits, and min_samples_leaf-forced leaf fallbacks.
+    #[test]
+    fn leaf_scatter_matches_predict() {
+        // Continuous, unweighted
+        let (x, y) = synth(1500, 6, 7);
+        // Integer-valued feature column → every value sits exactly on a bin
+        // edge, exercising the x == edges[bin] tie (routes right both ways)
+        let mut x = x;
+        for i in 0..x.nrows() {
+            x[[i, 2]] = (x[[i, 2]] * 8.0).floor();
+        }
+        // A NaN row: rejected by NGBoost::fit but legal via the learner API
+        x[[17, 4]] = f64::NAN;
+
+        let learner = HistogramLearner::new(4);
+        let cache = learner.build_fit_cache(&x).unwrap();
+
+        for weights in [
+            None,
+            Some(Array1::from_shape_fn(x.nrows(), |i| {
+                0.5 + ((i % 7) as f64) * 0.3
+            })),
+        ] {
+            let (fitted, scattered) = learner
+                .fit_predict_cached(&x, &y, weights.as_ref(), Some(cache.as_ref()))
+                .unwrap();
+            let walked = fitted.predict(&x);
+            for i in 0..x.nrows() {
+                assert_eq!(
+                    scattered[i].to_bits(),
+                    walked[i].to_bits(),
+                    "scatter/predict mismatch at row {i} (weighted: {})",
+                    weights.is_some()
+                );
+            }
+        }
+
+        // min_samples_leaf large enough to force no-split leaf fallbacks
+        let learner = HistogramLearner {
+            max_depth: 4,
+            max_bins: 255,
+            min_samples_leaf: 400,
+            min_samples_split: 2,
+        };
+        let (fitted, scattered) = learner.fit_predict_cached(&x, &y, None, None).unwrap();
+        let walked = fitted.predict(&x);
+        for i in 0..x.nrows() {
+            assert_eq!(scattered[i].to_bits(), walked[i].to_bits());
+        }
+    }
+
     /// fit_with_weights (which builds its own cache) and fit_with_weights_cached
     /// (with an externally built cache on the same X) must produce identical trees.
     #[test]
@@ -3083,7 +3217,7 @@ mod histogram_tests {
         let cache = build_histogram_cache(&x, 255);
         let indices: Vec<u32> = (0..x.nrows() as u32).collect();
         let hists = FeatureHists::build(&cache, &indices, &y, None);
-        let root = build_histogram_tree_node(&cache, &y, None, indices, hists, 0, 3, 2, 1);
+        let root = build_histogram_tree_node(&cache, &y, None, indices, hists, 0, 3, 2, 1, None);
         let tree = TrainedHistogramTree::new(root, x.ncols());
 
         let mut reference = Array1::zeros(x.ncols());

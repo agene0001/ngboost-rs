@@ -1405,6 +1405,26 @@ fn bench_hist_fit(c: &mut Criterion) {
                     .unwrap()
             })
         });
+
+        // Within-binary A/B for leaf-scatter: the fit loop's actual unit of
+        // work is fit + training predictions. "fit_then_predict" is the old
+        // path (separate tree walk); "fit_predict" harvests predictions
+        // during the build.
+        group.bench_with_input(BenchmarkId::new("fit_then_predict", n), &n, |b, _| {
+            b.iter(|| {
+                let fitted = learner
+                    .fit_with_weights_cached(black_box(&x), black_box(&y), None, cache.as_ref())
+                    .unwrap();
+                black_box(fitted.predict(black_box(&x)))
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("fit_predict", n), &n, |b, _| {
+            b.iter(|| {
+                learner
+                    .fit_predict_cached(black_box(&x), black_box(&y), None, Some(cache.as_ref()))
+                    .unwrap()
+            })
+        });
     }
     group.finish();
 }
