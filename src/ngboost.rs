@@ -843,30 +843,42 @@ where
         let model_offset = self.base_models.len();
         let mut best_iter_this_run: Option<usize> = None;
 
-        // When X is stable across iterations (no row/column subsampling), let
-        // the base learner precompute a fit cache once for the whole run
-        // (e.g. HistogramLearner bins X once instead of every iteration).
-        // Learners that don't benefit return None, costing nothing.
+        // The fit cache (bin edges + binned matrix) depends only on X's
+        // columns, so with full columns the cache built once on the full X
+        // serves every iteration — including row-subsampled ones, whose trees
+        // fit on a row-index subset of it (LightGBM-style: bin once globally,
+        // bag rows against the global bins). Only column subsampling forces
+        // per-iteration caches. Learners that don't benefit return None.
         let x_is_stable = self.minibatch_frac >= 1.0 && self.col_sample >= 1.0;
-        let stable_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> = if x_is_stable {
-            self.base_learner.build_fit_cache(&x_train)
-        } else {
-            None
-        };
+        let stable_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
+            if self.col_sample >= 1.0 {
+                self.base_learner.build_fit_cache(&x_train)
+            } else {
+                None
+            };
 
         for itr in 0..self.n_estimators {
             // Sample data for this iteration
-            let (col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
+            let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
                 self.sample(&x_train, &y_train, &params, sample_weight);
             self.col_idxs.push(col_idxs);
 
-            // With subsampling, X changes per iteration — build a per-iteration
-            // cache instead, still amortized across the n_params parallel fits.
+            // Row-subset fast path: rows subsampled, columns intact, and the
+            // learner has a full-X cache — fit on row indices of that cache
+            // instead of re-binning the minibatch every iteration.
+            let use_row_subset = row_idxs.is_some() && stable_cache.is_some();
+
+            // With column subsampling, X changes per iteration — build a
+            // per-iteration cache, still amortized across n_params fits.
             let iter_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
-                match &stable_cache {
-                    Some(c) => Some(std::sync::Arc::clone(c)),
-                    None if !x_is_stable => self.base_learner.build_fit_cache(&x_sampled),
-                    None => None,
+                if use_row_subset {
+                    None // the subset path uses stable_cache directly
+                } else {
+                    match &stable_cache {
+                        Some(c) => Some(std::sync::Arc::clone(c)),
+                        None if !x_is_stable => self.base_learner.build_fit_cache(&x_sampled),
+                        None => None,
+                    }
                 };
 
             // Dereference Cow to get &Array references (zero-cost for Borrowed)
@@ -910,20 +922,56 @@ where
             let grad_cols: Vec<Array1<f64>> =
                 (0..n_params).map(|j| grads.column(j).to_owned()).collect();
 
-            let fit_results: Vec<Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>> = {
-                let learners: Vec<B> = (0..n_params).map(|_| self.base_learner.clone()).collect();
-                let cache_ref = iter_cache.as_deref();
-                learners
-                    .into_par_iter()
-                    .zip(grad_cols.into_par_iter())
-                    .map(|(learner, grad_j)| {
-                        // Fused fit + train-predictions: histogram trees
-                        // harvest the predictions during the build
-                        // (leaf-scatter) instead of re-walking the tree.
-                        learner.fit_predict_cached(x_sampled_ref, &grad_j, weight_ref, cache_ref)
-                    })
-                    .collect()
-            };
+            let fit_results: Vec<Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>> =
+                if use_row_subset {
+                    // Fit each tree on the row-index subset of the full-X
+                    // cache. The gradient is scattered into a full-length
+                    // buffer aligned with the cache's row ids (rows outside
+                    // the minibatch are never read); returned predictions
+                    // come back in row_idxs order, matching y_sampled.
+                    let rows: &[u32] = row_idxs.as_deref().unwrap();
+                    let cache_ref = stable_cache.as_deref().unwrap();
+                    let x_train_ref = &*x_train;
+                    let n_train = x_train_ref.nrows();
+                    let learners: Vec<B> =
+                        (0..n_params).map(|_| self.base_learner.clone()).collect();
+                    learners
+                        .into_par_iter()
+                        .zip(grad_cols.into_par_iter())
+                        .map(|(learner, grad_j)| {
+                            let mut grad_full = Array1::zeros(n_train);
+                            for (k, &r) in rows.iter().enumerate() {
+                                grad_full[r as usize] = grad_j[k];
+                            }
+                            learner.fit_predict_cached_rows(
+                                x_train_ref,
+                                &grad_full,
+                                sample_weight,
+                                cache_ref,
+                                rows,
+                            )
+                        })
+                        .collect()
+                } else {
+                    let learners: Vec<B> =
+                        (0..n_params).map(|_| self.base_learner.clone()).collect();
+                    let cache_ref = iter_cache.as_deref();
+                    learners
+                        .into_par_iter()
+                        .zip(grad_cols.into_par_iter())
+                        .map(|(learner, grad_j)| {
+                            // Fused fit + train-predictions: histogram trees
+                            // harvest the predictions during the build
+                            // (leaf-scatter) instead of re-walking the tree.
+                            learner.fit_predict_cached(
+                                x_sampled_ref,
+                                &grad_j,
+                                weight_ref,
+                                cache_ref,
+                            )
+                        })
+                        .collect()
+                };
 
             // Unpack results, propagating any errors
             let mut fitted_learners: Vec<Box<dyn TrainedBaseLearner>> =
@@ -1096,6 +1144,8 @@ where
         Ok(())
     }
 
+    // First element: the sampled row ids (in the order the sampled arrays are
+    // laid out), or None when rows were not subsampled.
     fn sample<'a>(
         &mut self,
         x: &'a Array2<f64>,
@@ -1103,6 +1153,7 @@ where
         params: &'a Array2<f64>,
         sample_weight: Option<&'a Array1<f64>>,
     ) -> (
+        Option<Vec<u32>>,
         Vec<usize>,
         Cow<'a, Array2<f64>>,
         Cow<'a, Array1<f64>>,
@@ -1119,6 +1170,7 @@ where
         if no_row_sampling && no_col_sampling {
             let col_idxs: Vec<usize> = (0..n_features).collect();
             return (
+                None,
                 col_idxs,
                 Cow::Borrowed(x),
                 Cow::Borrowed(y),
@@ -1181,7 +1233,15 @@ where
         let sample_weights_sampled =
             sample_weight.map(|weights| Cow::Owned(weights.select(ndarray::Axis(0), &row_idxs)));
 
+        // Only report row ids when rows were genuinely subsampled
+        let row_ids = if sample_size == n_samples {
+            None
+        } else {
+            Some(row_idxs.iter().map(|&r| r as u32).collect())
+        };
+
         (
+            row_ids,
             col_idxs,
             Cow::Owned(x_sampled),
             Cow::Owned(y_sampled),

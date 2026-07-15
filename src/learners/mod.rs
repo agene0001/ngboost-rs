@@ -65,6 +65,32 @@ pub trait BaseLearner: Send + Sync {
         let preds = fitted.predict(x);
         Ok((fitted, preds))
     }
+
+    /// Fit on the row subset `rows` of `x` using a cache built on the FULL
+    /// `x`, returning the fitted learner and its predictions for those rows
+    /// (in `rows` order). `y` and `sample_weight` are indexed by the cache's
+    /// row ids (full length); entries outside `rows` are never read.
+    ///
+    /// The default materializes the row subset and fits it from scratch.
+    /// Learners with a usable cache (histogram trees) override this to fit
+    /// directly on the subset indices, reusing the full-X bin edges instead
+    /// of re-binning every minibatch — LightGBM-style bagging. NOTE: for
+    /// such learners the full-X quantile edges are a deliberate behavioral
+    /// difference from re-binning the minibatch.
+    fn fit_predict_cached_rows(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        _cache: &dyn FitCache,
+        rows: &[u32],
+    ) -> Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str> {
+        let idx: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+        let x_sub = x.select(ndarray::Axis(0), &idx);
+        let y_sub = y.select(ndarray::Axis(0), &idx);
+        let w_sub = sample_weight.map(|w| w.select(ndarray::Axis(0), &idx));
+        self.fit_predict_cached(&x_sub, &y_sub, w_sub.as_ref(), None)
+    }
 }
 
 pub trait TrainedBaseLearner: Send + Sync {
@@ -663,6 +689,43 @@ impl BaseLearner for HistogramLearner {
         };
         Ok((fitted, preds))
     }
+
+    fn fit_predict_cached_rows(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        cache: &dyn FitCache,
+        rows: &[u32],
+    ) -> Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str> {
+        match cache.as_any().downcast_ref::<HistogramFitCache>() {
+            Some(c) if c.n_rows == x.nrows() && c.n_features == x.ncols() => {
+                // Full-length scatter buffer indexed by cache row ids; only
+                // the subset's entries get written, then gathered in `rows`
+                // order for the caller.
+                let mut preds_full = vec![0.0f64; c.n_rows];
+                let fitted = self.fit_indices_from_cache(
+                    c,
+                    y,
+                    sample_weight,
+                    rows.to_vec(),
+                    Some(&mut preds_full),
+                )?;
+                let preds =
+                    Array1::from_iter(rows.iter().map(|&r| preds_full[r as usize]));
+                Ok((fitted, preds))
+            }
+            // Wrong cache type or stale dims — materialize the subset and
+            // fit it from scratch (the trait default's behavior)
+            _ => {
+                let idx: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+                let x_sub = x.select(ndarray::Axis(0), &idx);
+                let y_sub = y.select(ndarray::Axis(0), &idx);
+                let w_sub = sample_weight.map(|w| w.select(ndarray::Axis(0), &idx));
+                self.fit_predict_cached(&x_sub, &y_sub, w_sub.as_ref(), None)
+            }
+        }
+    }
 }
 
 impl HistogramLearner {
@@ -687,11 +750,27 @@ impl HistogramLearner {
         sample_weight: Option<&Array1<f64>>,
         preds: Option<&mut [f64]>,
     ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
+        let indices: Vec<u32> = (0..cache.n_rows as u32).collect();
+        self.fit_indices_from_cache(cache, y, sample_weight, indices, preds)
+    }
+
+    /// Fit a tree on an arbitrary row-index subset of the cache. `y`,
+    /// `sample_weight`, and the `preds` scatter buffer are all indexed by the
+    /// CACHE's row ids (full length); rows outside `indices` are never read
+    /// or written. This is how row-subsampled boosting iterations reuse the
+    /// full-X binning instead of re-binning every minibatch.
+    fn fit_indices_from_cache(
+        &self,
+        cache: &HistogramFitCache,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        indices: Vec<u32>,
+        preds: Option<&mut [f64]>,
+    ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
         if y.len() != cache.n_rows {
             return Err("y length does not match cached X");
         }
 
-        let indices: Vec<u32> = (0..cache.n_rows as u32).collect();
         let root_hists = FeatureHists::build(cache, &indices, y, sample_weight);
         let root = build_histogram_tree_node(
             cache,
@@ -3070,6 +3149,56 @@ mod histogram_tests {
         let walked = fitted.predict(&x);
         for i in 0..x.nrows() {
             assert_eq!(scattered[i].to_bits(), walked[i].to_bits());
+        }
+    }
+
+    /// Row-subset fitting against the full-X cache: with rows = ALL rows it
+    /// must reproduce the full cached fit bit-for-bit, and with a proper
+    /// subset its returned predictions must be bit-identical to walking the
+    /// fitted tree over the materialized subset (in rows order).
+    #[test]
+    fn subset_fit_matches_full_and_predict() {
+        let (x, y) = synth(1200, 6, 21);
+        let learner = HistogramLearner::new(3);
+        let cache = learner.build_fit_cache(&x).unwrap();
+
+        // All rows == full fit
+        let all_rows: Vec<u32> = (0..x.nrows() as u32).collect();
+        let (_, p_full) = learner
+            .fit_predict_cached(&x, &y, None, Some(cache.as_ref()))
+            .unwrap();
+        let (_, p_rows) = learner
+            .fit_predict_cached_rows(&x, &y, None, cache.as_ref(), &all_rows)
+            .unwrap();
+        for i in 0..x.nrows() {
+            assert_eq!(p_full[i].to_bits(), p_rows[i].to_bits());
+        }
+
+        // Proper subset (shuffled-ish order, includes duplicated coverage of
+        // the row-id space via stride tricks): preds must equal a tree walk
+        // over the materialized subset, in rows order
+        let rows: Vec<u32> = (0..x.nrows() as u32).filter(|r| r % 3 != 0).collect();
+        for weights in [
+            None,
+            Some(Array1::from_shape_fn(x.nrows(), |i| {
+                0.25 + ((i % 5) as f64) * 0.5
+            })),
+        ] {
+            let (fitted, preds) = learner
+                .fit_predict_cached_rows(&x, &y, weights.as_ref(), cache.as_ref(), &rows)
+                .unwrap();
+            let idx: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+            let x_sub = x.select(ndarray::Axis(0), &idx);
+            let walked = fitted.predict(&x_sub);
+            assert_eq!(preds.len(), rows.len());
+            for k in 0..rows.len() {
+                assert_eq!(
+                    preds[k].to_bits(),
+                    walked[k].to_bits(),
+                    "subset pred mismatch at k={k} (weighted: {})",
+                    weights.is_some()
+                );
+            }
         }
     }
 

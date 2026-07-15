@@ -614,3 +614,34 @@ fn test_early_stopping_weight_mismatch_is_an_error() {
     ngb2.fit_with_validation(&x_train, &y_train, Some(&x_val), Some(&y_val), Some(&w), None)
         .expect("permitted without early stopping");
 }
+
+/// The row-subsampled histogram path (full-X bin edges reused across
+/// iterations) must produce a model that learns the signal, for both the
+/// row-only case (subset fast path) and row+column subsampling (per-iteration
+/// cache path).
+#[test]
+fn test_minibatch_histogram_subset_path_learns() {
+    let (x, y) = generate_regression_data(600, 5);
+    let (x_test, y_test) = generate_regression_data(200, 5);
+
+    for (mb, cs) in [(0.7_f64, 1.0_f64), (0.7, 0.6)] {
+        let mut model = NGBRegressor::with_options(
+            150, 0.05, true, mb, cs, false, 100.0, 1e-4, None, 0.1, false,
+        );
+        model.fit(&x, &y).unwrap();
+
+        let pred = model.predict(&x_test);
+        let mean_y = y_test.mean().unwrap();
+        let ss_tot: f64 = y_test.iter().map(|v| (v - mean_y).powi(2)).sum();
+        let ss_res: f64 = pred
+            .iter()
+            .zip(y_test.iter())
+            .map(|(p, v)| (p - v).powi(2))
+            .sum();
+        let r2 = 1.0 - ss_res / ss_tot;
+        assert!(
+            r2 > 0.5,
+            "subsampled fit (mb={mb}, cs={cs}) should learn: R² = {r2}"
+        );
+    }
+}

@@ -376,31 +376,41 @@ where
         let mut val_loss_list: Vec<f64> = Vec::new();
         let mut best_iter_this_run: Option<usize> = None;
 
-        // When X is stable across iterations (no row/column subsampling), let
-        // the base learner precompute a fit cache once for the whole run (e.g.
-        // HistogramLearner bins X once). `sample()` copies rows in order when
-        // not subsampling, so the cache built on `x` matches `x_sampled`'s
-        // contents and dimensions. Learners without a cache return None.
+        // The fit cache depends only on X's columns: with full columns the
+        // cache built once on the full X serves every iteration — including
+        // row-subsampled ones, whose trees fit on a row-index subset of it
+        // (LightGBM-style global binning). Only column subsampling forces
+        // per-iteration caches. Learners without a cache return None.
         let x_is_stable = self.minibatch_frac >= 1.0 && self.col_sample >= 1.0;
-        let stable_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> = if x_is_stable {
-            self.base_learner.build_fit_cache(x)
-        } else {
-            None
-        };
+        let stable_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
+            if self.col_sample >= 1.0 {
+                self.base_learner.build_fit_cache(x)
+            } else {
+                None
+            };
 
         for itr in 0..self.n_estimators {
             // Sample data for this iteration
-            let (_row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weights_sampled) =
+            let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weights_sampled) =
                 self.sample(x, &y, &params, sample_weight);
             self.col_idxs.push(col_idxs.clone());
 
-            // With subsampling, X changes per iteration — build a per-iteration
-            // cache instead, amortized across the n_params parallel fits.
+            // Row-subset fast path (mirrors ngboost.rs): rows subsampled,
+            // columns intact, learner has a full-X cache.
+            let rows_subsampled = row_idxs.len() < x.nrows();
+            let use_row_subset = rows_subsampled && stable_cache.is_some();
+
+            // With column subsampling, X changes per iteration — build a
+            // per-iteration cache, amortized across the n_params fits.
             let iter_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
-                match &stable_cache {
-                    Some(c) => Some(std::sync::Arc::clone(c)),
-                    None if !x_is_stable => self.base_learner.build_fit_cache(&x_sampled),
-                    None => None,
+                if use_row_subset {
+                    None // the subset path uses stable_cache directly
+                } else {
+                    match &stable_cache {
+                        Some(c) => Some(std::sync::Arc::clone(c)),
+                        None if !x_is_stable => self.base_learner.build_fit_cache(&x_sampled),
+                        None => None,
+                    }
                 };
 
             // Create distribution from the minibatch parameters and compute
@@ -424,15 +434,40 @@ where
             let cache_ref = iter_cache.as_deref();
             let fit_results: Vec<
                 Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>,
-            > = learners
-                .into_par_iter()
-                .zip(grad_cols.into_par_iter())
-                .map(|(learner, grad_j)| {
-                    // Fused fit + train-predictions (leaf-scatter for
-                    // histogram trees), mirroring the main NGBoost loop.
-                    learner.fit_predict_cached(&x_sampled, &grad_j, weight_ref, cache_ref)
-                })
-                .collect();
+            > = if use_row_subset {
+                let rows: Vec<u32> = row_idxs.iter().map(|&r| r as u32).collect();
+                let cache_full = stable_cache.as_deref().unwrap();
+                let n_train = x.nrows();
+                learners
+                    .into_par_iter()
+                    .zip(grad_cols.into_par_iter())
+                    .map(|(learner, grad_j)| {
+                        // Scatter the minibatch gradient into a full-length
+                        // buffer aligned with the cache's row ids.
+                        let mut grad_full = Array1::zeros(n_train);
+                        for (k, &r) in rows.iter().enumerate() {
+                            grad_full[r as usize] = grad_j[k];
+                        }
+                        learner.fit_predict_cached_rows(
+                            x,
+                            &grad_full,
+                            sample_weight,
+                            cache_full,
+                            &rows,
+                        )
+                    })
+                    .collect()
+            } else {
+                learners
+                    .into_par_iter()
+                    .zip(grad_cols.into_par_iter())
+                    .map(|(learner, grad_j)| {
+                        // Fused fit + train-predictions (leaf-scatter for
+                        // histogram trees), mirroring the main NGBoost loop.
+                        learner.fit_predict_cached(&x_sampled, &grad_j, weight_ref, cache_ref)
+                    })
+                    .collect()
+            };
 
             let mut fitted_learners: Vec<Box<dyn TrainedBaseLearner>> =
                 Vec::with_capacity(n_params);
