@@ -656,6 +656,11 @@ pub struct HistogramFitCache {
     binned: Vec<u8>,
     n_rows: usize,
     n_features: usize,
+    /// Unweighted ROOT bin counts per (feature, bin) slot. They depend only on
+    /// the binned matrix, so every tree fit from this cache shares them —
+    /// computed once on the first root build (OnceLock: the n_params trees of
+    /// a boosting iteration fit in parallel against the same Arc'd cache).
+    root_counts: std::sync::OnceLock<Vec<f64>>,
 }
 
 impl FitCache for HistogramFitCache {
@@ -700,11 +705,18 @@ fn build_histogram_cache(x: &Array2<f64>, max_bins: usize) -> HistogramFitCache 
         binned,
         n_rows,
         n_features,
+        root_counts: std::sync::OnceLock::new(),
     }
 }
 
 /// Per-feature histograms for one tree node: weighted count and y-sum per bin,
 /// stored flat as `[feature * n_bins + bin]`.
+///
+/// NEGATIVE RESULT (2026-07): interleaving count/sum as `[f64; 2]` pairs
+/// (the LightGBM histogram layout) benched consistently SLOWER at n≤5000 and
+/// slower than this layout at every size on Apple Silicon — the ~20KB arrays
+/// both sit in L1/L2, so the halved cache-line traffic never materializes and
+/// the doubled index arithmetic just costs. Do not retry the interleave here.
 struct FeatureHists {
     count: Vec<f64>,
     sum: Vec<f64>,
@@ -712,7 +724,7 @@ struct FeatureHists {
     /// `min_samples_leaf` is a raw-count constraint (sklearn semantics);
     /// checking it against weighted counts would reject every split when
     /// weights are small (e.g. normalized to sum to 1). For unweighted fits
-    /// `count` already holds raw counts and this stays `None`.
+    /// the count half of `cs` already holds raw counts and this stays `None`.
     raw: Option<Vec<f64>>,
     n_bins: usize,
 }
@@ -751,6 +763,31 @@ impl FeatureHists {
                     count[slot] += w;
                     sum[slot] += yw;
                     raw[slot] += 1.0;
+                }
+            }
+        } else if indices.len() == cache.n_rows {
+            // ROOT node, unweighted: bin counts depend only on the binned
+            // matrix, so seed them from the cache (computed once per cache,
+            // shared by every tree of every boosting iteration) and
+            // accumulate only the y-sums. Counts are exact integer sums of
+            // 1.0 — identical to accumulating them per row.
+            let counts = cache.root_counts.get_or_init(|| {
+                let mut c = vec![0.0; p * n_bins];
+                for &i in indices {
+                    let row = &cache.binned[i as usize * p..(i as usize + 1) * p];
+                    for (f, &b) in row.iter().enumerate() {
+                        c[f * n_bins + b as usize] += 1.0;
+                    }
+                }
+                c
+            });
+            count.copy_from_slice(counts);
+            for &i in indices {
+                let i = i as usize;
+                let yi = y[i];
+                let row = &cache.binned[i * p..(i + 1) * p];
+                for (f, &b) in row.iter().enumerate() {
+                    sum[f * n_bins + b as usize] += yi;
                 }
             }
         } else {

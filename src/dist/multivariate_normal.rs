@@ -2,6 +2,7 @@ use crate::dist::{Distribution, RegressionDistn};
 use crate::scores::{LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, s};
 use ndarray_linalg::Inverse;
+use rand::prelude::*;
 
 /// Get the lower triangular indices for a p x p matrix.
 /// Returns (row_indices, col_indices, diagonal_mask).
@@ -89,23 +90,9 @@ impl<const P: usize> MultivariateNormal<P> {
     /// Get the covariance matrix (computed lazily).
     pub fn cov(&mut self) -> &Array3<f64> {
         if self.cov.is_none() {
-            let mut cov = Array3::zeros((self.n_obs, P, P));
-            for i in 0..self.n_obs {
-                let cov_inv_i = self.cov_inv.slice(s![i, .., ..]).to_owned();
-                if let Ok(cov_i) = cov_inv_i.inv() {
-                    for r in 0..P {
-                        for c in 0..P {
-                            cov[[i, r, c]] = cov_i[[r, c]];
-                        }
-                    }
-                } else {
-                    // Fallback to identity if singular
-                    for r in 0..P {
-                        cov[[i, r, r]] = 1.0;
-                    }
-                }
-            }
-            self.cov = Some(cov);
+            self.cov = Some(crate::dist::MultivariateDistributionMethods::covariance(
+                self,
+            ));
         }
         self.cov.as_ref().unwrap()
     }
@@ -314,6 +301,65 @@ impl<const P: usize> Distribution for MultivariateNormal<P> {
 }
 
 impl<const P: usize> RegressionDistn for MultivariateNormal<P> {}
+
+impl<const P: usize> crate::dist::MultivariateDistributionMethods for MultivariateNormal<P> {
+    fn mean(&self) -> Array2<f64> {
+        self.loc.clone()
+    }
+
+    fn covariance(&self) -> Array3<f64> {
+        // Σ = (L Lᵀ)⁻¹, inverted per observation; identity fallback on
+        // singular precision (mirrors the lazy `cov()` cache path).
+        let mut cov = Array3::zeros((self.n_obs, P, P));
+        for i in 0..self.n_obs {
+            let cov_inv_i = self.cov_inv.slice(s![i, .., ..]).to_owned();
+            if let Ok(cov_i) = cov_inv_i.inv() {
+                cov.slice_mut(s![i, .., ..]).assign(&cov_i);
+            } else {
+                for r in 0..P {
+                    cov[[i, r, r]] = 1.0;
+                }
+            }
+        }
+        cov
+    }
+
+    fn sample(&self, n_samples: usize) -> Array3<f64> {
+        // Mirrors Python ngboost's MVN.rv(): x = loc + chol(Σ) · z with
+        // z ~ N(0, I). chol(Σ) is computed once per observation.
+        use crate::dist::MultivariateDistributionMethods;
+        let cov = MultivariateDistributionMethods::covariance(self);
+        let mut chols: Vec<Array2<f64>> = Vec::with_capacity(self.n_obs);
+        for i in 0..self.n_obs {
+            let cov_i = cov.slice(s![i, .., ..]).to_owned();
+            // Identity fallback matches covariance()'s singular handling.
+            chols.push(cholesky_lower(&cov_i).unwrap_or_else(|| Array2::eye(P)));
+        }
+
+        let mut rng = rand::rng();
+        let std_normal = statrs::distribution::Normal::new(0.0, 1.0).unwrap();
+        let mut samples = Array3::zeros((n_samples, self.n_obs, P));
+        let mut z = [0.0f64; 32]; // P ≤ 32 in practice; assert below
+        assert!(P <= 32, "MVN sampling supports up to 32 dimensions");
+        for s_idx in 0..n_samples {
+            for i in 0..self.n_obs {
+                for zj in z.iter_mut().take(P) {
+                    let u: f64 = rng.random();
+                    *zj = statrs::distribution::ContinuousCDF::inverse_cdf(&std_normal, u);
+                }
+                let lc = &chols[i];
+                for r in 0..P {
+                    let mut v = self.loc[[i, r]];
+                    for (c, zc) in z.iter().enumerate().take(r + 1) {
+                        v += lc[[r, c]] * zc;
+                    }
+                    samples[[s_idx, i, r]] = v;
+                }
+            }
+        }
+        samples
+    }
+}
 
 impl<const P: usize> Scorable<LogScore> for MultivariateNormal<P> {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
@@ -543,7 +589,101 @@ fn cholesky_lower(a: &Array2<f64>) -> Option<Array2<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dist::MultivariateDistributionMethods;
     use crate::scores::{LogScore, Scorable};
+
+    /// Build a 2-obs MVN<2> with a known covariance: params place loc and
+    /// the precision Cholesky L directly (diag entries are log-transformed).
+    /// L = [[1,0],[−0.5,2]] ⇒ Σ⁻¹ = LLᵀ, Σ = (LLᵀ)⁻¹ known analytically.
+    fn known_mvn2() -> (MultivariateNormal<2>, Array2<f64>) {
+        // param layout: loc0, loc1, l00(log), l10, l11(log)
+        // exp(log 1)+1e-6 ≈ 1, exp(log 2)+1e-6 ≈ 2 (eps-guard shifts by 1e-6)
+        let row = [0.7, -1.2, 0.0_f64, -0.5, (2.0_f64).ln()];
+        let vals: Vec<f64> = row.iter().chain(row.iter()).cloned().collect();
+        let params = Array2::from_shape_vec((2, 5), vals).unwrap();
+        let d = MultivariateNormal::<2>::from_params(&params);
+
+        // Σ = inv(L Lᵀ) with the eps-guarded diagonal
+        let l00 = 1.0 + 1e-6;
+        let l11 = 2.0 + 1e-6;
+        let l = ndarray::array![[l00, 0.0], [-0.5, l11]];
+        let prec = l.dot(&l.t());
+        let det = prec[[0, 0]] * prec[[1, 1]] - prec[[0, 1]] * prec[[1, 0]];
+        let sigma = ndarray::array![
+            [prec[[1, 1]] / det, -prec[[0, 1]] / det],
+            [-prec[[1, 0]] / det, prec[[0, 0]] / det]
+        ];
+        (d, sigma)
+    }
+
+    #[test]
+    fn test_mvn_mean_and_covariance() {
+        let (d, sigma) = known_mvn2();
+        let mean = MultivariateDistributionMethods::mean(&d);
+        assert_eq!(mean.shape(), &[2, 2]);
+        assert!((mean[[0, 0]] - 0.7).abs() < 1e-12);
+        assert!((mean[[1, 1]] - (-1.2)).abs() < 1e-12);
+
+        let cov = MultivariateDistributionMethods::covariance(&d);
+        assert_eq!(cov.shape(), &[2, 2, 2]);
+        for i in 0..2 {
+            for r in 0..2 {
+                for c in 0..2 {
+                    assert!(
+                        (cov[[i, r, c]] - sigma[[r, c]]).abs() < 1e-9,
+                        "cov[{i},{r},{c}] = {} vs analytic {}",
+                        cov[[i, r, c]],
+                        sigma[[r, c]]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mvn_sample_moments_match() {
+        let (d, sigma) = known_mvn2();
+        let n = 60_000;
+        let samples = MultivariateDistributionMethods::sample(&d, n);
+        assert_eq!(samples.shape(), &[n, 2, 2]);
+
+        // Empirical mean and covariance of obs 0's draws vs loc/Σ
+        let loc = [0.7, -1.2];
+        let mut m = [0.0f64; 2];
+        for s in 0..n {
+            for r in 0..2 {
+                m[r] += samples[[s, 0, r]];
+            }
+        }
+        m.iter_mut().for_each(|v| *v /= n as f64);
+        for r in 0..2 {
+            assert!(
+                (m[r] - loc[r]).abs() < 0.05,
+                "mean[{r}] = {} vs {}",
+                m[r],
+                loc[r]
+            );
+        }
+
+        let mut c = [[0.0f64; 2]; 2];
+        for s in 0..n {
+            for r in 0..2 {
+                for q in 0..2 {
+                    c[r][q] += (samples[[s, 0, r]] - m[r]) * (samples[[s, 0, q]] - m[q]);
+                }
+            }
+        }
+        for r in 0..2 {
+            for q in 0..2 {
+                let emp = c[r][q] / n as f64;
+                assert!(
+                    (emp - sigma[[r, q]]).abs() < 0.05,
+                    "cov[{r},{q}] = {emp} vs {}",
+                    sigma[[r, q]]
+                );
+            }
+        }
+    }
 
     /// Regression test for the eps-guard gradient bug: the analytic d_score
     /// must be the exact derivative of the (eps-guarded) score. Python's MVN

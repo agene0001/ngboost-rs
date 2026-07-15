@@ -412,7 +412,14 @@ impl Scorable<CRPScore> for StudentT {
             let y_i = y[i];
 
             if nu <= 1.0 {
-                continue; // Skip for invalid df
+                // CRPS is undefined here and score() returns a flat 1e10
+                // penalty. A zero gradient would strand the row permanently
+                // (the boosting step could never move df back above 1), so
+                // emit a small restoring gradient on log(df). The metric for
+                // these rows is identity, so this passes through the natural
+                // gradient unchanged.
+                d_params[[i, 2]] = -1.0;
+                continue;
             }
 
             let z = (y_i - mu) / sigma;
@@ -1243,6 +1250,46 @@ impl Scorable<LogScore> for TFixedDfFixedVar {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn test_studentt_crps_df_below_one_has_restoring_gradient() {
+        // Rows whose predicted df drifts ≤ 1 get the flat 1e10 CRPS penalty;
+        // the gradient must push log(df) back up (negative d/dlog(df)) so the
+        // boosting step can recover instead of stranding the row forever.
+        // params: [loc, log(scale), log(df)] — df = 0.5 for row 0, 3.0 for row 1.
+        let params = Array2::from_shape_vec(
+            (2, 3),
+            vec![0.0, 0.0, (0.5_f64).ln(), 0.0, 0.0, (3.0_f64).ln()],
+        )
+        .unwrap();
+        let dist = StudentT::from_params(&params);
+        let y = ndarray::array![0.3, 0.3];
+
+        let scores = Scorable::<CRPScore>::score(&dist, &y);
+        assert_eq!(scores[0], 1e10);
+        assert!(scores[1] < 1.0, "healthy row must have a real CRPS");
+
+        let d = Scorable::<CRPScore>::d_score(&dist, &y);
+        assert_eq!(d[[0, 0]], 0.0);
+        assert_eq!(d[[0, 1]], 0.0);
+        assert!(
+            d[[0, 2]] < 0.0,
+            "df≤1 row needs a negative log-df gradient (descent step raises df), got {}",
+            d[[0, 2]]
+        );
+        // Healthy row unaffected: gradient is finite and not the sentinel
+        assert!(d.row(1).iter().all(|v| v.is_finite()));
+
+        // Metric for the penalized row is identity, so the natural gradient
+        // preserves the restoring direction.
+        let m = Scorable::<CRPScore>::metric(&dist);
+        for a in 0..3 {
+            for b in 0..3 {
+                let expect = if a == b { 1.0 } else { 0.0 };
+                assert_eq!(m[[0, a, b]], expect);
+            }
+        }
+    }
 
     /// Reference E[ggᵀ] for the 3-param StudentT LogScore via high-resolution
     /// PIT midpoint quadrature (the method the closed form replaced, at a

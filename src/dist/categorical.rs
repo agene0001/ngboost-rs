@@ -1,6 +1,7 @@
 use crate::dist::{ClassificationDistn, Distribution};
 use crate::scores::{CRPScore, LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, Axis};
+use rand::prelude::*;
 
 /// Softmax function applied along axis 0 with numerical stability improvements.
 /// Optimized with in-place operations to reduce memory allocations.
@@ -125,6 +126,35 @@ impl<const K: usize> Distribution for Categorical<K> {
             }
         }
         p
+    }
+}
+
+impl<const K: usize> Categorical<K> {
+    /// Draw class-index samples from each observation's categorical
+    /// distribution, matching Python ngboost's `Categorical.sample`:
+    /// the class is the number of leading cumulative probabilities
+    /// (excluding the last) strictly below a uniform draw.
+    ///
+    /// Returns an array of shape (n_samples, n_observations) whose values
+    /// are class indices in `0..K` stored as f64.
+    pub fn sample(&self, n_samples: usize) -> Array2<f64> {
+        let mut samples = Array2::zeros((n_samples, self.n_obs));
+        let mut rng = rand::rng();
+        for s in 0..n_samples {
+            for i in 0..self.n_obs {
+                let u: f64 = rng.random();
+                let mut acc = 0.0;
+                let mut class = 0usize;
+                for k in 0..(K - 1) {
+                    acc += self.probs[[k, i]];
+                    if acc < u {
+                        class = k + 1;
+                    }
+                }
+                samples[[s, i]] = class as f64;
+            }
+        }
+        samples
     }
 }
 
@@ -429,6 +459,36 @@ mod tests {
         let score = Scorable::<CRPScore>::score(&dist, &y);
         // Brier score ≈ (0 - 1)^2 + (1 - 0)^2 = 2
         assert!(score[0] > 1.9);
+    }
+
+    #[test]
+    fn test_categorical_sample_frequencies_match_probs() {
+        // Two observations with different distributions; empirical class
+        // frequencies over many draws must approach the softmax probs.
+        let params = Array2::from_shape_vec((2, 2), vec![1.0, -0.5, 0.0, 2.0]).unwrap();
+        let dist = Categorical3::from_params(&params);
+        let n = 60_000;
+        let samples = dist.sample(n);
+        assert_eq!(samples.shape(), &[n, 2]);
+
+        for obs in 0..2 {
+            let mut counts = [0usize; 3];
+            for s in 0..n {
+                let class = samples[[s, obs]];
+                assert_eq!(class, class.floor(), "class index must be integral");
+                let k = class as usize;
+                assert!(k < 3, "class index out of range: {class}");
+                counts[k] += 1;
+            }
+            for k in 0..3 {
+                let freq = counts[k] as f64 / n as f64;
+                let p = dist.probs[[k, obs]];
+                assert!(
+                    (freq - p).abs() < 0.02,
+                    "obs {obs} class {k}: freq {freq} vs prob {p}"
+                );
+            }
+        }
     }
 
     #[test]

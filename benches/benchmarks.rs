@@ -1381,12 +1381,41 @@ fn bench_survival_training(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_hist_fit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hist_fit");
+    group.sample_size(40);
+
+    // The per-boosting-iteration unit of work: one cached histogram-tree fit
+    // (root histogram build + node scans + child builds via subtraction).
+    // Deterministic data so A/B runs across builds fit IDENTICAL trees.
+    for &n in &[2_000usize, 5_000, 10_000, 50_000] {
+        let p = 10;
+        let x = Array2::from_shape_fn((n, p), |(i, j)| {
+            ((i * 31 + j * 17) as f64 * 0.7315).sin() * 2.0
+        });
+        let y = Array1::from_shape_fn(n, |i| (i as f64 * 2.399).cos());
+        let learner = HistogramLearner::new(3);
+        let cache = learner.build_fit_cache(&x).unwrap();
+
+        group.throughput(Throughput::Elements((n * p) as u64));
+        group.bench_with_input(BenchmarkId::new("cached_fit", n), &n, |b, _| {
+            b.iter(|| {
+                learner
+                    .fit_with_weights_cached(black_box(&x), black_box(&y), None, cache.as_ref())
+                    .unwrap()
+            })
+        });
+    }
+    group.finish();
+}
+
 // ============================================================================
 // Criterion Configuration
 // ============================================================================
 
 criterion_group!(
     benches,
+    bench_hist_fit,
     bench_presort_scan,
     bench_survival_training,
     bench_natural_gradient,
