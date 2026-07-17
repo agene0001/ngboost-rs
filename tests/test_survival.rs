@@ -179,6 +179,44 @@ fn test_ngbsurvival_lognormal_fit() {
     }
 }
 
+/// The rayon row-chunk get_params path (contiguous x, nrows >= 512) must be
+/// bit-identical to the sequential fallback (forced here via an f-order copy
+/// of the same data, whose as_slice() is None).
+#[test]
+fn test_survival_parallel_get_params_bit_exact() {
+    let (x, time, event) = generate_survival_data(150, 4, 0.3, 7);
+
+    let mut model =
+        NGBSurvival::<Exponential, LogScoreCensored, _>::new(30, 0.1, default_tree_learner());
+    model.fit(&x, &time, &event).unwrap();
+
+    // 600 rows > 2 * PAR_ROW_CHUNK -> parallel path for row-major input
+    let (x_big, _, _) = generate_survival_data(600, 4, 0.3, 8);
+    let par = model.pred_param(&x_big);
+
+    // Same values in column-major layout -> as_slice() is None -> sequential
+    use ndarray::ShapeBuilder;
+    let mut col_major = Vec::with_capacity(x_big.len());
+    for c in 0..x_big.ncols() {
+        for r in 0..x_big.nrows() {
+            col_major.push(x_big[[r, c]]);
+        }
+    }
+    let x_f =
+        Array2::from_shape_vec((x_big.nrows(), x_big.ncols()).f(), col_major).unwrap();
+    assert!(
+        x_f.as_slice().is_none(),
+        "f-order copy must not be standard layout"
+    );
+    assert_eq!(x_f, x_big);
+    let seq = model.pred_param(&x_f);
+
+    assert_eq!(par.shape(), seq.shape());
+    for (a, b) in par.iter().zip(seq.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "parallel != sequential");
+    }
+}
+
 #[test]
 fn test_ngbsurvival_exponential_fit() {
     let (x, time, event) = generate_survival_data(100, 5, 0.3, 42);

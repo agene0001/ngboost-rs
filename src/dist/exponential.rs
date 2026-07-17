@@ -259,22 +259,24 @@ impl CensoredScorable<LogScoreCensored> for Exponential {
     }
 
     fn censored_score(&self, y: &SurvivalData) -> Array1<f64> {
-        let eps = 1e-10;
         let mut scores = Array1::zeros(y.len());
 
         for i in 0..y.len() {
             let t = y.time[i];
             let e = y.event[i];
-            // Exponential distribution with rate = 1/scale
-            let d = Exp::new(self.rate[i]).unwrap();
 
             if e {
                 // Uncensored: -log(pdf(t)) = -ln(rate) + rate*t = ln(scale) + t/scale
                 scores[i] = self.scale[i].ln() + t / self.scale[i];
             } else {
-                // Censored: -log(1 - cdf(t)) = -log(exp(-rate*t)) = rate*t = t/scale
-                let survival = 1.0 - d.cdf(t) + eps;
-                scores[i] = -survival.ln();
+                // Censored: -log(S(t)) = -log(exp(-t/scale)) = t/scale, exactly.
+                // Python computes -ln(1 - cdf(t) + 1e-10), which saturates at
+                // -ln(1e-10) ≈ 23.03 once t/scale ≳ 23 while censored_d_score
+                // keeps returning the exact -t/scale — an internally
+                // inconsistent score/gradient pair in the deep tail. The closed
+                // form needs no eps (S(t) > 0 for all finite t); deliberate
+                // deviation from Python.
+                scores[i] = t / self.scale[i];
             }
         }
         scores
@@ -416,6 +418,41 @@ mod tests {
         let mode = dist.mode();
         assert_relative_eq!(mode[0], 0.0, epsilon = 1e-10);
         assert_relative_eq!(mode[1], 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_censored_log_score_exact_in_deep_tail() {
+        // Censored -log S(t) = t/scale exactly. The old statrs path
+        // -ln(1 - cdf(t) + 1e-10) saturated at ~23.03, decoupling the score
+        // from censored_d_score's exact -t/scale.
+        let params = Array2::from_shape_vec((3, 1), vec![0.0, 0.0, 0.0]).unwrap();
+        let dist = Exponential::from_params(&params);
+        let y = SurvivalData {
+            time: Array1::from_vec(vec![5.0, 30.0, 60.0]),
+            event: Array1::from_vec(vec![false, false, false]),
+        };
+        let scores = CensoredScorable::<LogScoreCensored>::censored_score(&dist, &y);
+        assert_relative_eq!(scores[0], 5.0, epsilon = 1e-12);
+        assert_relative_eq!(scores[1], 30.0, epsilon = 1e-12);
+        assert_relative_eq!(scores[2], 60.0, epsilon = 1e-12);
+
+        // Score/gradient consistency: d/d(log_scale) via central FD == d_score
+        let h = 1e-6;
+        let params_p = Array2::from_shape_vec((3, 1), vec![h, h, h]).unwrap();
+        let params_m = Array2::from_shape_vec((3, 1), vec![-h, -h, -h]).unwrap();
+        let s_p = CensoredScorable::<LogScoreCensored>::censored_score(
+            &Exponential::from_params(&params_p),
+            &y,
+        );
+        let s_m = CensoredScorable::<LogScoreCensored>::censored_score(
+            &Exponential::from_params(&params_m),
+            &y,
+        );
+        let d = CensoredScorable::<LogScoreCensored>::censored_d_score(&dist, &y);
+        for i in 0..3 {
+            let fd = (s_p[i] - s_m[i]) / (2.0 * h);
+            assert_relative_eq!(d[[i, 0]], fd, epsilon = 1e-4);
+        }
     }
 
     #[test]

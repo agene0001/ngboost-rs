@@ -2,7 +2,6 @@ use crate::dist::{Distribution, RegressionDistn};
 use crate::scores::{LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, s};
 use ndarray_linalg::Inverse;
-use rand::prelude::*;
 
 /// Get the lower triangular indices for a p x p matrix.
 /// Returns (row_indices, col_indices, diagonal_mask).
@@ -337,15 +336,15 @@ impl<const P: usize> crate::dist::MultivariateDistributionMethods for Multivaria
         }
 
         let mut rng = rand::rng();
-        let std_normal = statrs::distribution::Normal::new(0.0, 1.0).unwrap();
+        let mut std_z = crate::vmath::StdNormalSampler::new();
         let mut samples = Array3::zeros((n_samples, self.n_obs, P));
         let mut z = [0.0f64; 32]; // P ≤ 32 in practice; assert below
         assert!(P <= 32, "MVN sampling supports up to 32 dimensions");
         for s_idx in 0..n_samples {
             for i in 0..self.n_obs {
                 for zj in z.iter_mut().take(P) {
-                    let u: f64 = rng.random();
-                    *zj = statrs::distribution::ContinuousCDF::inverse_cdf(&std_normal, u);
+                    // Direct polar Box-Muller draw (no per-draw inverse-erf).
+                    *zj = std_z.next(&mut rng);
                 }
                 let lc = &chols[i];
                 for r in 0..P {

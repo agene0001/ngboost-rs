@@ -60,7 +60,7 @@ const GOLDEN_RATIO: f64 = 1.618033988749895;
 
 /// Row-chunk size for rayon-parallel tree prediction (get_params_at /
 /// predict_and_update_params). Inputs under 2× this stay sequential.
-const PAR_ROW_CHUNK: usize = 256;
+pub(crate) const PAR_ROW_CHUNK: usize = 256;
 
 /// Training history result containing loss values at each iteration.
 #[derive(Debug, Clone, Default)]
@@ -861,7 +861,12 @@ where
             // Sample data for this iteration
             let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
                 self.sample(&x_train, &y_train, &params, sample_weight);
-            self.col_idxs.push(col_idxs);
+            // NOTE: col_idxs is pushed onto self.col_idxs only AFTER the base
+            // learners fit successfully (below) — pushing here desynced
+            // col_idxs from base_models when a fit errored, and a later
+            // partial_fit would then pair every new model with the previous
+            // iteration's stale column subset (silent prediction corruption
+            // whenever col_sample < 1.0).
 
             // Row-subset fast path: rows subsampled, columns intact, and the
             // learner has a full-X cache — fit on row indices of that cache
@@ -982,6 +987,10 @@ where
                 fitted_learners.push(fitted);
                 predictions_cols.push(preds);
             }
+
+            // Learner fits succeeded — only now record this iteration's
+            // column subset, keeping col_idxs aligned with base_models.
+            self.col_idxs.push(col_idxs);
 
             let proj_grad = to_2d_array(predictions_cols);
 
@@ -1179,11 +1188,15 @@ where
             );
         }
 
-        // Sample rows (minibatch)
+        // Sample rows (minibatch). Floor to at least 1 row: a tiny
+        // minibatch_frac with small n would otherwise select 0 rows and fail
+        // the learner fit with "empty dataset" (Python's int() has the same
+        // bug and errors cryptically inside sklearn — deliberate deviation;
+        // the column subsample has always had the same .max(1) guard).
         let sample_size = if no_row_sampling {
             n_samples
         } else {
-            ((n_samples as f64) * self.minibatch_frac) as usize
+            (((n_samples as f64) * self.minibatch_frac) as usize).max(1)
         };
 
         // Uniform random sampling without replacement (matches Python's np.random.choice behavior)
@@ -1312,11 +1325,13 @@ where
             .outer_iter_mut()
             .for_each(|mut row| row.assign(init_params));
 
-        // Match Python: `if max_iter and i == max_iter` — in Python, max_iter=0
-        // is falsy, so it iterates ALL models. Only a positive max_iter limits.
+        // Some(k) = "use the first k boosting stages"; Some(0) is the
+        // init-only distribution. (Python treats max_iter=0 as falsy and
+        // silently uses ALL models — a foot-gun we deliberately deviate
+        // from: 0 stages means 0 stages.)
         let n_iters = match max_iter {
-            Some(m) if m > 0 => m.min(self.base_models.len()),
-            _ => self.base_models.len(),
+            Some(m) => m.min(self.base_models.len()),
+            None => self.base_models.len(),
         };
 
         let factor_at = |i: usize| {
@@ -1328,51 +1343,56 @@ where
             lr * self.scalings[i]
         };
 
-        // Parallel path: each rayon task runs a contiguous block of rows through
-        // ALL estimators — chunky work units, no synchronization, and per-row
-        // arithmetic order identical to the sequential loop (bit-exact).
+        // One shared chunk kernel for both the parallel and sequential paths:
+        // runs a contiguous block of rows through ALL estimators via
+        // predict_rows with a single reusable buffer — no per-learner Array1
+        // allocations and no per-iteration x.select copies under column
+        // subsampling (the mapping-aware walk handles col_idxs). Per-row
+        // arithmetic order is identical to the legacy per-learner predict
+        // loop (bit-exact; the parallel path was verified against it
+        // including col_sample < 1, to_bits). Non-contiguous x is copied to
+        // standard layout ONCE (as_standard_layout is zero-copy when x is
+        // already row-major) instead of falling back to the allocation-heavy
+        // legacy loop.
         let p = x.ncols();
-        if x.nrows() >= 2 * PAR_ROW_CHUNK {
-            let base_models = &self.base_models;
-            let col_idxs = &self.col_idxs;
-            let factors: Vec<f64> = (0..n_iters).map(&factor_at).collect();
-            if let (Some(xs), Some(ps)) = (x.as_slice(), params.as_slice_mut()) {
-                ps.par_chunks_mut(PAR_ROW_CHUNK * n_params)
-                    .zip(xs.par_chunks(PAR_ROW_CHUNK * p))
-                    .for_each(|(p_chunk, x_chunk)| {
-                        let rows = x_chunk.len() / p;
-                        let mut buf = vec![0.0; rows];
-                        for ((learners, col_idx), &factor) in base_models
-                            .iter()
-                            .zip(col_idxs.iter())
-                            .zip(factors.iter())
-                        {
-                            let mapping = if col_idx.len() == p {
-                                None
-                            } else {
-                                Some(col_idx.as_slice())
-                            };
-                            for (j, learner) in learners.iter().enumerate() {
-                                learner.predict_rows(x_chunk, p, mapping, &mut buf);
-                                for (r, &b) in buf.iter().enumerate() {
-                                    p_chunk[r * n_params + j] -= factor * b;
-                                }
-                            }
-                        }
-                    });
-                return params;
+        let base_models = &self.base_models;
+        let col_idxs = &self.col_idxs;
+        let factors: Vec<f64> = (0..n_iters).map(&factor_at).collect();
+        let run_chunk = |x_chunk: &[f64], p_chunk: &mut [f64]| {
+            let rows = x_chunk.len() / p;
+            let mut buf = vec![0.0; rows];
+            // zip with `factors` (len n_iters) truncates to the requested
+            // iteration count
+            for ((learners, col_idx), &factor) in base_models
+                .iter()
+                .zip(col_idxs.iter())
+                .zip(factors.iter())
+            {
+                let mapping = if col_idx.len() == p {
+                    None
+                } else {
+                    Some(col_idx.as_slice())
+                };
+                for (j, learner) in learners.iter().enumerate() {
+                    learner.predict_rows(x_chunk, p, mapping, &mut buf);
+                    for (r, &b) in buf.iter().enumerate() {
+                        p_chunk[r * n_params + j] -= factor * b;
+                    }
+                }
             }
-        }
+        };
 
-        for (i, (learners, col_idx)) in self
-            .base_models
-            .iter()
-            .zip(self.col_idxs.iter())
-            .enumerate()
-            .take(n_iters)
-        {
-            let factor = factor_at(i);
-            Self::predict_and_update_params(learners, x, col_idx, &mut params, factor);
+        let x_std = x.as_standard_layout();
+        let xs = x_std.as_slice().expect("standard layout is contiguous");
+        let ps = params
+            .as_slice_mut()
+            .expect("freshly allocated params is standard layout");
+        if x.nrows() >= 2 * PAR_ROW_CHUNK {
+            ps.par_chunks_mut(PAR_ROW_CHUNK * n_params)
+                .zip(xs.par_chunks(PAR_ROW_CHUNK * p))
+                .for_each(|(p_chunk, x_chunk)| run_chunk(x_chunk, p_chunk));
+        } else {
+            run_chunk(xs, ps);
         }
         params
     }
@@ -1382,9 +1402,33 @@ where
         self.get_params(x)
     }
 
-    /// Get the predicted distribution parameters up to a specific iteration
+    /// Get the predicted distribution parameters using the first `max_iter`
+    /// boosting STAGES (a model count, not an inclusive iteration index).
+    ///
+    /// Foot-gun note: `pred_param_at(x, best_val_loss_itr())` uses `best`
+    /// stages and therefore EXCLUDES the best iteration's model (Python has
+    /// the same trap). Use [`Self::pred_param_best`] to reproduce the best
+    /// validation state.
     pub fn pred_param_at(&self, x: &Array2<f64>, max_iter: usize) -> Array2<f64> {
         self.get_params_at(x, Some(max_iter))
+    }
+
+    /// Number of boosting stages that reproduce the best validation state:
+    /// `best_val_loss_itr` is the 0-based index of the best ITERATION, whose
+    /// state includes that iteration's model — i.e. `best + 1` stages (the
+    /// same count early-stopping truncation keeps). `None` when no validation
+    /// loss was ever recorded.
+    fn best_stage_count(&self) -> Option<usize> {
+        self.best_val_loss_itr.map(|best| best + 1)
+    }
+
+    /// Predicted distribution parameters at the best validation iteration
+    /// (INCLUDING its model — unlike `pred_param_at(best_val_loss_itr())`,
+    /// which is off by one; Python's equivalent has the same foot-gun and we
+    /// deliberately deviate here). Falls back to the full model when no
+    /// validation loss was recorded.
+    pub fn pred_param_best(&self, x: &Array2<f64>) -> Array2<f64> {
+        self.get_params_at(x, self.best_stage_count())
     }
 
     pub fn pred_dist(&self, x: &Array2<f64>) -> D {
@@ -1392,19 +1436,36 @@ where
         D::from_params(&params)
     }
 
-    /// Get the predicted distribution up to a specific iteration
+    /// Get the predicted distribution using the first `max_iter` boosting
+    /// STAGES (a model count; see the foot-gun note on
+    /// [`Self::pred_param_at`] — for the best validation state use
+    /// [`Self::pred_dist_best`]).
     pub fn pred_dist_at(&self, x: &Array2<f64>, max_iter: usize) -> D {
         let params = self.get_params_at(x, Some(max_iter));
         D::from_params(&params)
+    }
+
+    /// Predicted distribution at the best validation iteration (inclusive;
+    /// see [`Self::pred_param_best`]).
+    pub fn pred_dist_best(&self, x: &Array2<f64>) -> D {
+        D::from_params(&self.pred_param_best(x))
     }
 
     pub fn predict(&self, x: &Array2<f64>) -> Array1<f64> {
         self.pred_dist(x).predict()
     }
 
-    /// Get predictions up to a specific iteration
+    /// Get predictions using the first `max_iter` boosting STAGES (a model
+    /// count; see the foot-gun note on [`Self::pred_param_at`] — for the
+    /// best validation state use [`Self::predict_best`]).
     pub fn predict_at(&self, x: &Array2<f64>, max_iter: usize) -> Array1<f64> {
         self.pred_dist_at(x, max_iter).predict()
+    }
+
+    /// Point predictions at the best validation iteration (inclusive; see
+    /// [`Self::pred_param_best`]).
+    pub fn predict_best(&self, x: &Array2<f64>) -> Array1<f64> {
+        self.pred_dist_best(x).predict()
     }
 
     /// Returns staged predictions (predictions at each boosting iteration).
@@ -1596,8 +1657,16 @@ where
         Some(importances)
     }
 
-    /// Calibrate uncertainty estimates using isotonic regression on validation data
-    /// This improves the quality of probabilistic predictions by adjusting the variance estimates
+    /// Calibrate uncertainty by rescaling every predicted scale so the mean
+    /// predicted variance on validation data matches the empirical squared
+    /// error of the point predictions (which folds in bias — a biased model
+    /// gets wider intervals, as it should).
+    ///
+    /// Only meaningful for location-scale distributions whose second internal
+    /// parameter is a log-scale (Normal, Laplace, LogNormal, Cauchy, ...):
+    /// the shift to `init_params[1]` multiplies every predicted scale by a
+    /// constant factor. For other parameterizations (e.g. Gamma's log-rate)
+    /// this would distort the predicted mean instead — do not use it there.
     pub fn calibrate_uncertainty(
         &mut self,
         x_val: &Array2<f64>,
@@ -1618,14 +1687,26 @@ where
         // Calculate empirical variance
         let empirical_var = errors.mapv(|e| e * e).mean().unwrap_or(1.0);
 
-        // For normal distribution (2 parameters), adjust the scale parameter
         if let Some(init_params) = self.init_params.as_mut() {
             if init_params.len() >= 2 {
-                // The second parameter is log(scale), so variance = exp(2*log(scale))
-                let current_var = (2.0 * init_params[1]).exp();
-                let target_var = empirical_var;
-                let calibration_factor = (target_var / current_var).sqrt();
-                init_params[1] += calibration_factor.ln();
+                // Mean PREDICTED variance on x_val under the log-scale
+                // assumption: sigma_i^2 = exp(2 * params[i, 1]). Using the
+                // init (marginal-fit) variance here instead was a bug: the
+                // boosted model's scale has moved since init, so the ratio
+                // was taken against the wrong baseline and could make
+                // calibration drastically worse (e.g. an overconfident model
+                // becoming 4x more overconfident).
+                let current_var = params
+                    .column(1)
+                    .mapv(|p| (2.0 * p).exp())
+                    .mean()
+                    .unwrap_or(1.0);
+                let calibration_factor = (empirical_var / current_var).sqrt();
+                // Shifting the init log-scale multiplies every predicted
+                // scale by the factor (log-scale contributions are additive).
+                if calibration_factor.is_finite() && calibration_factor > 0.0 {
+                    init_params[1] += calibration_factor.ln();
+                }
             }
         }
 
@@ -2237,6 +2318,20 @@ impl NGBRegressor {
         self.model.best_val_loss_itr
     }
 
+    /// Point predictions at the best validation iteration, INCLUDING its
+    /// model (`predict_at(best_val_loss_itr())` excludes it — a mirrored
+    /// Python off-by-one we deliberately deviate from). Falls back to the
+    /// full model when no validation loss was recorded.
+    pub fn predict_best(&self, x: &Array2<f64>) -> Array1<f64> {
+        self.model.predict_best(x)
+    }
+
+    /// Predicted distribution at the best validation iteration (inclusive;
+    /// see [`Self::predict_best`]).
+    pub fn pred_dist_best(&self, x: &Array2<f64>) -> Normal {
+        self.model.pred_dist_best(x)
+    }
+
     /// Get early stopping rounds
     pub fn early_stopping_rounds(&self) -> Option<u32> {
         self.model.early_stopping_rounds
@@ -2560,6 +2655,20 @@ impl<const K: usize> NGBMultiClassifier<K> {
         self.model.best_val_loss_itr
     }
 
+    /// Point predictions at the best validation iteration, INCLUDING its
+    /// model (`predict_at(best_val_loss_itr())` excludes it — a mirrored
+    /// Python off-by-one we deliberately deviate from). Falls back to the
+    /// full model when no validation loss was recorded.
+    pub fn predict_best(&self, x: &Array2<f64>) -> Array1<f64> {
+        self.model.predict_best(x)
+    }
+
+    /// Predicted distribution at the best validation iteration (inclusive;
+    /// see [`Self::predict_best`]).
+    pub fn pred_dist_best(&self, x: &Array2<f64>) -> Categorical<K> {
+        self.model.pred_dist_best(x)
+    }
+
     /// Get early stopping rounds.
     pub fn early_stopping_rounds(&self) -> Option<u32> {
         self.model.early_stopping_rounds
@@ -2859,6 +2968,20 @@ impl NGBClassifier {
     /// Get the best validation iteration
     pub fn best_val_loss_itr(&self) -> Option<usize> {
         self.model.best_val_loss_itr
+    }
+
+    /// Point predictions at the best validation iteration, INCLUDING its
+    /// model (`predict_at(best_val_loss_itr())` excludes it — a mirrored
+    /// Python off-by-one we deliberately deviate from). Falls back to the
+    /// full model when no validation loss was recorded.
+    pub fn predict_best(&self, x: &Array2<f64>) -> Array1<f64> {
+        self.model.predict_best(x)
+    }
+
+    /// Predicted distribution at the best validation iteration (inclusive;
+    /// see [`Self::predict_best`]).
+    pub fn pred_dist_best(&self, x: &Array2<f64>) -> Bernoulli {
+        self.model.pred_dist_best(x)
     }
 
     /// Get early stopping rounds

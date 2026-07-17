@@ -73,8 +73,8 @@ impl<const K: usize> Distribution for Categorical<K> {
     }
 
     fn fit(y: &Array1<f64>) -> Array1<f64> {
-        // Count occurrences of each class
-        let n = y.len();
+        // Count occurrences of each class (labels outside 0..K are ignored,
+        // and excluded from n so frequencies still sum to 1)
         let mut counts = vec![0usize; K];
         for &y_i in y.iter() {
             let class = y_i as usize;
@@ -82,9 +82,21 @@ impl<const K: usize> Distribution for Categorical<K> {
                 counts[class] += 1;
             }
         }
+        let n: usize = counts.iter().sum();
 
-        // Convert to probabilities (no smoothing, matching Python)
-        let probs: Vec<f64> = counts.iter().map(|&c| c as f64 / n as f64).collect();
+        // Convert to probabilities (no smoothing when every class is observed,
+        // matching Python). Unobserved classes get a floor of 1/(n+1) instead
+        // of p = 0: ln(0) would make that init logit -inf (unrecoverable —
+        // boosting only adds finite updates), and if class 0 is the absent one
+        // the +inf/NaN logits poison every probability from iteration 0.
+        // Python's np.unique-based init is differently broken here (misaligned
+        // counts) — deliberate deviation. No-op when all classes are observed
+        // (every empirical p_k >= 1/n > 1/(n+1)).
+        let floor = 1.0 / (n as f64 + 1.0);
+        let probs: Vec<f64> = counts
+            .iter()
+            .map(|&c| (c as f64 / n as f64).max(floor))
+            .collect();
 
         // Return logits relative to class 0: log(p_k) - log(p_0)
         let log_p0 = probs[0].ln();
@@ -415,6 +427,43 @@ pub type Categorical10 = Categorical<10>;
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn test_fit_absent_classes_finite() {
+        // Unobserved classes used to yield ln(0) = -inf logits (and +inf/NaN
+        // when class 0 was the absent one, poisoning every probability from
+        // iteration 0). The 1/(n+1) floor keeps all init params finite.
+
+        // Class 2 absent
+        let y = Array1::from_vec(vec![0.0, 0.0, 1.0, 1.0]);
+        let init = Categorical::<3>::fit(&y);
+        assert!(init.iter().all(|v| v.is_finite()));
+        // p = [0.5, 0.5, 0.2(floored)] -> params = [ln(p1/p0), ln(p2/p0)]
+        assert_relative_eq!(init[0], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(init[1], (0.2_f64 / 0.5).ln(), epsilon = 1e-12);
+
+        // Class 0 absent (the worst case: used to make ALL params +inf)
+        let y = Array1::from_vec(vec![1.0, 1.0, 2.0, 2.0]);
+        let init = Categorical::<3>::fit(&y);
+        assert!(init.iter().all(|v| v.is_finite()));
+        let dist = Categorical::<3>::from_params(
+            &init.clone().insert_axis(ndarray::Axis(0)).to_owned(),
+        );
+        // probabilities must be finite, positive, and sum to 1
+        let p = &dist.probs;
+        let total: f64 = p.column(0).sum();
+        assert_relative_eq!(total, 1.0, epsilon = 1e-12);
+        assert!(p.column(0).iter().all(|v| v.is_finite() && *v > 0.0));
+        // observed classes should dominate the absent one
+        assert!(p[[1, 0]] > p[[0, 0]]);
+        assert!(p[[2, 0]] > p[[0, 0]]);
+
+        // All classes observed: floor is a no-op (bit-identical to raw ratios)
+        let y = Array1::from_vec(vec![0.0, 1.0, 1.0, 2.0]);
+        let init = Categorical::<3>::fit(&y);
+        assert_relative_eq!(init[0], 2.0_f64.ln(), epsilon = 1e-15);
+        assert_relative_eq!(init[1], 0.0, epsilon = 1e-15);
+    }
 
     #[test]
     fn test_categorical_crpscore_bernoulli() {

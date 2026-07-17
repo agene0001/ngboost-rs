@@ -501,6 +501,79 @@ fn test_partial_fit_after_early_stopped_fit_is_not_truncated() {
     assert_eq!(ngb.best_val_loss_itr(), Some(best_after_fit));
 }
 
+/// `predict_best`/`pred_dist_best` must reproduce the state INCLUDING the
+/// best iteration's model — i.e. `pred_param_at(best + 1)`, not the
+/// off-by-one `pred_param_at(best)` that mirrors Python's foot-gun.
+#[test]
+fn test_predict_best_includes_best_iteration() {
+    let (x, y) = generate_regression_data(400, 4);
+    let (x_train, x_val, y_train, y_val) = train_test_split(x, y, 0.25);
+
+    // No early stopping: nothing is truncated, so the best iteration can sit
+    // strictly inside the model and the foot-gun is observable.
+    let mut ngb = NGBRegressor::with_options(
+        30, 0.3, true, 1.0, 1.0, false, 100.0, 1e-12, None, 0.0, false,
+    );
+    ngb.fit_with_validation(&x_train, &y_train, Some(&x_val), Some(&y_val))
+        .expect("fit should succeed");
+    let best = ngb.best_val_loss_itr().expect("validation ran");
+
+    let best_params = ngb.pred_dist_best(&x_val).params();
+    let inclusive = ngb.pred_dist_at(&x_val, best + 1).params();
+    let footgun = ngb.pred_dist_at(&x_val, best).params();
+
+    // pred_dist_best == the state AFTER applying the best iteration's model
+    for (a, b) in best_params.iter().zip(inclusive.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "best != at(best+1)");
+    }
+    // ... which differs from the off-by-one call whenever best >= 1
+    if best >= 1 {
+        let identical = best_params
+            .iter()
+            .zip(footgun.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(!identical, "at(best) should exclude the best model");
+    }
+
+    // predict_best consistency with the distribution path
+    let preds = ngb.predict_best(&x_val);
+    let dist_preds = ngb.pred_dist_best(&x_val).predict();
+    for (a, b) in preds.iter().zip(dist_preds.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+}
+
+/// `pred_dist_at(x, 0)` must be the INIT-ONLY distribution (0 stages means
+/// 0 stages), not the full model (Python's falsy-zero foot-gun, deliberately
+/// deviated from).
+#[test]
+fn test_pred_dist_at_zero_is_init_only() {
+    let (x, y) = generate_regression_data(200, 4);
+    let mut ngb = NGBRegressor::new(20, 0.1);
+    ngb.fit(&x, &y).expect("fit should succeed");
+
+    let at0 = ngb.pred_dist_at(&x, 0).params();
+    // every row must equal the init params (marginal fit), i.e. all rows equal
+    for r in 1..at0.nrows() {
+        for c in 0..at0.ncols() {
+            assert_eq!(
+                at0[[r, c]].to_bits(),
+                at0[[0, c]].to_bits(),
+                "init-only params must be identical across rows"
+            );
+        }
+    }
+    // and differ from the fully boosted model
+    let full = ngb.pred_dist(&x).params();
+    assert!(
+        at0.iter().zip(full.iter()).any(|(a, b)| a != b),
+        "0-stage params should differ from the full model"
+    );
+    // one stage differs from zero stages
+    let at1 = ngb.pred_dist_at(&x, 1).params();
+    assert!(at0.iter().zip(at1.iter()).any(|(a, b)| a != b));
+}
+
 /// best_val_loss_itr is a GLOBAL model index (Python parity: its loop counter
 /// starts at len(col_idxs)), so after a partial_fit with validation it must
 /// point past the models from the first fit.

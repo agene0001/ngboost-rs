@@ -46,6 +46,9 @@ impl CalibrationResult {
 /// A `CalibrationResult` containing predicted percentiles, observed proportions,
 /// and the fitted calibration line parameters.
 ///
+/// If `y` contains NaN, the observed proportions, slope, and intercept are NaN.
+/// If `bins == 0`, an empty result with NaN slope/intercept is returned.
+///
 /// # Example
 /// ```ignore
 /// use ngboost_rs::evaluation::calibration_regression;
@@ -69,8 +72,29 @@ pub fn calibration_regression<F>(
 where
     F: Fn(f64) -> Array1<f64>,
 {
+    if bins == 0 {
+        return CalibrationResult {
+            predicted: Array1::zeros(0),
+            observed: Array1::zeros(0),
+            slope: f64::NAN,
+            intercept: f64::NAN,
+        };
+    }
+    if y.iter().any(|v| v.is_nan()) {
+        let pctles: Vec<f64> = (0..bins)
+            .map(|i| eps + (1.0 - 2.0 * eps) * (i as f64) / ((bins.max(2) - 1) as f64))
+            .collect();
+        return CalibrationResult {
+            predicted: Array1::from_vec(pctles),
+            observed: Array1::from_elem(bins, f64::NAN),
+            slope: f64::NAN,
+            intercept: f64::NAN,
+        };
+    }
+    // bins.max(2) keeps bins == 1 from dividing by zero (yields [eps], like
+    // np.linspace(eps, 1-eps, 1)).
     let pctles: Vec<f64> = (0..bins)
-        .map(|i| eps + (1.0 - 2.0 * eps) * (i as f64) / ((bins - 1) as f64))
+        .map(|i| eps + (1.0 - 2.0 * eps) * (i as f64) / ((bins.max(2) - 1) as f64))
         .collect();
 
     let mut observed = Vec::with_capacity(bins);
@@ -109,10 +133,26 @@ where
 ///
 /// # Returns
 /// A `CalibrationResult` containing the calibration analysis.
+///
+/// If `cdf_at_t` contains NaN, the observed proportions, slope, and intercept
+/// are NaN.
 pub fn calibration_time_to_event(
     cdf_at_t: &Array1<f64>,
     event: &Array1<bool>,
 ) -> CalibrationResult {
+    if cdf_at_t.iter().any(|v| v.is_nan()) {
+        let n_points = 11;
+        let predicted: Vec<f64> = (0..n_points)
+            .map(|i| i as f64 / (n_points - 1) as f64)
+            .collect();
+        return CalibrationResult {
+            predicted: Array1::from_vec(predicted),
+            observed: Array1::from_elem(n_points, f64::NAN),
+            slope: f64::NAN,
+            intercept: f64::NAN,
+        };
+    }
+
     // Compute Kaplan-Meier estimate on the CDF values
     // The idea: if well-calibrated, CDF(T) should be uniform on [0,1] for uncensored
     let km_result = kaplan_meier(cdf_at_t, event);
@@ -186,15 +226,31 @@ pub struct PITHistogramData {
 ///
 /// # Returns
 /// PIT histogram data including bin edges and densities.
+///
+/// NaN entries in `cdf_values` are skipped; densities are normalized over the
+/// non-NaN count (all-NaN or empty input yields NaN densities). `n_bins == 0`
+/// returns an empty histogram.
 pub fn pit_histogram(cdf_values: &Array1<f64>, n_bins: usize) -> PITHistogramData {
+    if n_bins == 0 {
+        return PITHistogramData {
+            bin_edges: Array1::zeros(0),
+            densities: Array1::zeros(0),
+            expected_density: 1.0,
+        };
+    }
+
     let bin_edges: Vec<f64> = (0..=n_bins).map(|i| i as f64 / n_bins as f64).collect();
 
     let mut counts = vec![0usize; n_bins];
-    let n = cdf_values.len();
+    let mut n = 0usize;
 
     for &cdf in cdf_values.iter() {
+        if cdf.is_nan() {
+            continue;
+        }
         let bin_idx = ((cdf * n_bins as f64).floor() as usize).min(n_bins - 1);
         counts[bin_idx] += 1;
+        n += 1;
     }
 
     let densities: Vec<f64> = counts
@@ -270,12 +326,14 @@ pub fn calibration_curve_data(
 ///
 /// # Returns
 /// The concordance index in [0, 1]. A value of 0.5 indicates random predictions,
-/// while 1.0 indicates perfect concordance.
+/// while 1.0 indicates perfect concordance. Returns NaN if `predictions` or
+/// `times` contain NaN.
 ///
 /// # Algorithm
 /// This implementation uses a sorting-based approach that is O(n log n) for uncensored
-/// data. For censored data, it falls back to a more efficient O(n²) loop that processes
-/// only comparable pairs.
+/// data. The general (censored) path is also O(n log n), using a Fenwick tree over
+/// prediction ranks while sweeping observations in descending time order; it produces
+/// counts identical to the naive pairwise definition.
 pub fn concordance_index(
     predictions: &Array1<f64>,
     times: &Array1<f64>,
@@ -286,6 +344,12 @@ pub fn concordance_index(
         return 0.5;
     }
 
+    // NaN times/predictions make pair comparability and concordance undefined;
+    // surface that instead of silently counting NaN pairs as discordant.
+    if times.iter().chain(predictions.iter()).any(|v| v.is_nan()) {
+        return f64::NAN;
+    }
+
     // Check if all observations are uncensored - allows for optimized algorithm
     let all_uncensored = events.iter().all(|&e| e);
 
@@ -293,64 +357,171 @@ pub fn concordance_index(
         // Use optimized O(n log n) algorithm for uncensored data.
         // Returns None when times contain ties, which the inversion-counting
         // algorithm cannot exclude from the comparable-pair total; fall through
-        // to the general loop in that case so both paths agree.
+        // to the general path in that case so both paths agree.
         if let Some(c) = concordance_index_uncensored_fast(predictions, times) {
             return c;
         }
     }
 
-    // For censored data, use optimized O(n²) algorithm with early pruning
-    // Sort indices by time to enable early termination
+    let (concordant, ties, comparable) =
+        concordance_counts_censored_fenwick(predictions, times, events);
+
+    if comparable == 0 {
+        return 0.5;
+    }
+
+    // Both counts are well below 2^53, and 0.5 * ties is a multiple of 0.5,
+    // so this sum (and hence the division) is exact and bit-identical to the
+    // pairwise accumulation of 1.0 / 0.5 increments.
+    (concordant as f64 + 0.5 * ties as f64) / comparable as f64
+}
+
+/// General-path concordance counts via a Fenwick (binary indexed) tree: O(n log n).
+///
+/// Semantics are exactly those of the naive pairwise loop over time-sorted pairs
+/// (i earlier, j later):
+/// - comparable iff `events[i] && times[i] < times[j]` (exact f64 `<`)
+/// - concordant (+1) iff `p_i > p_j`
+/// - tie credit (+0.5) iff `!(p_i > p_j) && (p_i - p_j).abs() < 1e-10`
+///
+/// Observations are swept in descending time order; each equal-time group (f64 `==`,
+/// so -0.0 and +0.0 group together, matching `<`) is fully queried before being
+/// inserted, so tied-time pairs never count. Predicates on prediction values are
+/// evaluated verbatim on the sorted unique prediction values via `partition_point`
+/// (they are monotone in v), so the epsilon window `(p_i - v).abs() < 1e-10` is
+/// reproduced with the exact same floating-point subtraction as the pairwise loop.
+///
+/// Returns `(concordant_pairs, tie_credit_pairs, comparable_pairs)` as raw counts.
+/// Callers must reject NaN inputs first.
+fn concordance_counts_censored_fenwick(
+    predictions: &Array1<f64>,
+    times: &Array1<f64>,
+    events: &Array1<bool>,
+) -> (u64, u64, u64) {
+    let n = times.len();
+
+    // Sort indices by time (ascending), as the pairwise loop does.
     let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_by(|&a, &b| times[a].partial_cmp(&times[b]).unwrap());
+    indices.sort_by(|&a, &b| times[a].total_cmp(&times[b]));
+
+    // Sorted unique prediction values. total_cmp ordering is consistent with `<`
+    // once `==`-equal values (only -0.0 vs +0.0) are collapsed by dedup.
+    let mut uniq: Vec<f64> = predictions.iter().copied().collect();
+    uniq.sort_unstable_by(f64::total_cmp);
+    uniq.dedup_by(|a, b| a == b);
+
+    // Fenwick tree over prediction ranks (1-based internally).
+    let mut tree = vec![0u64; uniq.len() + 1];
+    let bit_prefix = |tree: &[u64], mut i: usize| -> u64 {
+        // Count of inserted values with rank < i.
+        let mut s = 0u64;
+        while i > 0 {
+            s += tree[i];
+            i &= i - 1;
+        }
+        s
+    };
+
+    let mut inserted: u64 = 0;
+    let mut concordant: u64 = 0;
+    let mut ties: u64 = 0;
+    let mut comparable: u64 = 0;
+
+    // Sweep groups of `==`-equal times in descending time order. The BIT holds
+    // exactly the observations with strictly later time (`times[i] < times[j]`).
+    let mut pos = n;
+    while pos > 0 {
+        let t = times[indices[pos - 1]];
+        let mut start = pos - 1;
+        while start > 0 && times[indices[start - 1]] == t {
+            start -= 1;
+        }
+
+        // Query phase: every already-inserted j is comparable with each event i here.
+        for &i in &indices[start..pos] {
+            if events[i] {
+                let p_i = predictions[i];
+                comparable += inserted;
+
+                // Concordant: p_j < p_i (identical to p_i > p_j).
+                let lo = uniq.partition_point(|&v| v < p_i);
+                // Tie credit: p_j >= p_i within the epsilon window. The predicate is
+                // the verbatim pairwise test and is monotone in v, so partition_point
+                // finds the exact boundary.
+                let hi = uniq.partition_point(|&v| v < p_i || (p_i - v).abs() < 1e-10);
+
+                let below = bit_prefix(&tree, lo);
+                concordant += below;
+                ties += bit_prefix(&tree, hi) - below;
+            }
+        }
+
+        // Insert phase: the whole group enters the BIT only after all its queries,
+        // so tied-time pairs are never counted.
+        for &j in &indices[start..pos] {
+            let mut rank = uniq.partition_point(|&v| v < predictions[j]) + 1;
+            while rank < tree.len() {
+                tree[rank] += 1;
+                rank += rank & rank.wrapping_neg();
+            }
+            inserted += 1;
+        }
+
+        pos = start;
+    }
+
+    (concordant, ties, comparable)
+}
+
+/// The original O(n²) pairwise loop, kept verbatim as the differential-test
+/// reference for `concordance_counts_censored_fenwick`.
+///
+/// Returns `(concordant, total_comparable)` accumulated exactly as the old
+/// `concordance_index` general path did.
+#[cfg(test)]
+fn concordance_counts_censored_bruteforce(
+    predictions: &Array1<f64>,
+    times: &Array1<f64>,
+    events: &Array1<bool>,
+) -> (f64, f64) {
+    let n = times.len();
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by(|&a, &b| times[a].total_cmp(&times[b]));
 
     let mut concordant = 0.0;
     let mut total_comparable = 0.0;
 
-    // Process pairs in sorted order - this allows some optimizations
     for (idx_i, &i) in indices.iter().enumerate() {
         let e_i = events[i];
         let t_i = times[i];
         let p_i = predictions[i];
 
-        // Only need to compare with observations that have later times
         for &j in indices.iter().skip(idx_i + 1) {
             let e_j = events[j];
             let t_j = times[j];
             let p_j = predictions[j];
 
-            // Since we sorted by time, t_j >= t_i always
-            // Determine if this pair is comparable
             let comparable = if e_i && e_j {
-                // Both uncensored: always comparable (and t_i < t_j due to sort)
-                t_i < t_j // Only if different times
+                t_i < t_j
             } else if e_i && !e_j {
-                // i uncensored, j censored: comparable if i's event time < j's censoring time
                 t_i < t_j
             } else {
-                // i censored: not comparable with later observations
                 false
             };
 
             if comparable {
                 total_comparable += 1.0;
 
-                // For survival: earlier event should have higher risk score
                 if p_i > p_j {
                     concordant += 1.0;
                 } else if (p_i - p_j).abs() < 1e-10 {
-                    // Tie in predictions
                     concordant += 0.5;
                 }
             }
         }
     }
 
-    if total_comparable == 0.0 {
-        return 0.5;
-    }
-
-    concordant / total_comparable
+    (concordant, total_comparable)
 }
 
 /// Fast concordance index for fully uncensored data using O(n log n) algorithm.
@@ -372,7 +543,7 @@ fn concordance_index_uncensored_fast(predictions: &Array1<f64>, times: &Array1<f
         .map(|(i, (&t, &p))| (t, p, i))
         .collect();
 
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     if pairs.windows(2).any(|w| w[0].0 == w[1].0) {
         return None;
@@ -434,7 +605,7 @@ fn count_concordant_pairs(predictions: &[f64]) -> (f64, f64, f64) {
 
         // Count ties separately (merge sort doesn't handle ties well)
         // This is still O(n log n) with a sorted array
-        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut i = 0;
         while i < n {
             let mut j = i + 1;
@@ -536,7 +707,8 @@ fn merge_count(
 /// * `events` - Event indicators (true = event occurred, false = censored).
 ///
 /// # Returns
-/// The concordance index computed only on uncensored pairs.
+/// The concordance index computed only on uncensored pairs. Returns NaN if any
+/// uncensored observation has a NaN prediction or time.
 pub fn concordance_index_uncensored_only(
     predictions: &Array1<f64>,
     times: &Array1<f64>,
@@ -553,6 +725,14 @@ pub fn concordance_index_uncensored_only(
     let n = uncensored_indices.len();
     if n < 2 {
         return 0.5;
+    }
+
+    // NaN comparisons would silently count as discordant; surface them instead.
+    if uncensored_indices
+        .iter()
+        .any(|&i| times[i].is_nan() || predictions[i].is_nan())
+    {
+        return f64::NAN;
     }
 
     let mut concordant = 0.0;
@@ -710,10 +890,13 @@ struct KaplanMeierResult {
 }
 
 /// Compute Kaplan-Meier survival estimate.
+///
+/// Callers must reject NaN times first (see `calibration_time_to_event`);
+/// `total_cmp` merely keeps the sort panic-free.
 fn kaplan_meier(times: &Array1<f64>, events: &Array1<bool>) -> KaplanMeierResult {
     // Sort by time
     let mut indices: Vec<usize> = (0..times.len()).collect();
-    indices.sort_by(|&a, &b| times[a].partial_cmp(&times[b]).unwrap());
+    indices.sort_by(|&a, &b| times[a].total_cmp(&times[b]));
 
     let mut unique_times = Vec::new();
     let mut survival_probs = Vec::new();
@@ -981,6 +1164,252 @@ mod tests {
         assert_relative_eq!(interpolate_km(&km, 1.5), 0.5, epsilon = 1e-10);
         assert_relative_eq!(interpolate_km(&km, 2.0), 0.0, epsilon = 1e-10);
         assert_relative_eq!(interpolate_km(&km, 3.0), 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_nan_inputs_yield_nan_not_panic() {
+        // concordance_index: NaN time (uncensored fast path) and NaN prediction
+        let preds = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+        let times_nan = Array1::from_vec(vec![1.0, f64::NAN, 3.0]);
+        let events = Array1::from_vec(vec![true, true, true]);
+        assert!(concordance_index(&preds, &times_nan, &events).is_nan());
+
+        let preds_nan = Array1::from_vec(vec![1.0, f64::NAN, 3.0]);
+        let times = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+        assert!(concordance_index(&preds_nan, &times, &events).is_nan());
+
+        // censored path (sorts by time) must not panic either
+        let events_cens = Array1::from_vec(vec![true, false, true]);
+        assert!(concordance_index(&preds, &times_nan, &events_cens).is_nan());
+
+        // uncensored_only: NaN on an uncensored row -> NaN; NaN only on a
+        // censored row is ignored (that row never enters a pair)
+        assert!(concordance_index_uncensored_only(&preds_nan, &times, &events).is_nan());
+        let preds_nan_censored_row = Array1::from_vec(vec![3.0, f64::NAN, 1.0]);
+        let c = concordance_index_uncensored_only(&preds_nan_censored_row, &times, &events_cens);
+        assert_relative_eq!(c, 1.0, epsilon = 1e-10);
+
+        // calibration_time_to_event: NaN CDF values -> NaN slope, no panic
+        let cdf_nan = Array1::from_vec(vec![0.2, f64::NAN, 0.8]);
+        let result = calibration_time_to_event(&cdf_nan, &events);
+        assert!(result.slope.is_nan());
+        assert!(result.intercept.is_nan());
+        assert!(result.observed.iter().all(|v| v.is_nan()));
+        assert_eq!(result.predicted.len(), 11);
+
+        // calibration_regression: NaN y -> NaN observed/slope, percentile grid intact
+        let y_nan = Array1::from_vec(vec![1.0, f64::NAN]);
+        let result = calibration_regression(|_p| Array1::zeros(2), &y_nan, 11, 1e-3);
+        assert!(result.slope.is_nan());
+        assert!(result.observed.iter().all(|v| v.is_nan()));
+        assert_eq!(result.predicted.len(), 11);
+        assert_relative_eq!(result.predicted[0], 1e-3, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_degenerate_bin_counts() {
+        let y = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+
+        // bins == 0: empty result, no usize underflow
+        let result = calibration_regression(|_p| Array1::zeros(3), &y, 0, 1e-3);
+        assert_eq!(result.predicted.len(), 0);
+        assert!(result.slope.is_nan());
+
+        // bins == 1: [eps] like np.linspace(eps, 1-eps, 1), not NaN
+        let result = calibration_regression(|_p| Array1::zeros(3), &y, 1, 1e-3);
+        assert_eq!(result.predicted.len(), 1);
+        assert_relative_eq!(result.predicted[0], 1e-3, epsilon = 1e-12);
+
+        // pit_histogram n_bins == 0: empty, no underflow
+        let cdf = Array1::from_vec(vec![0.1, 0.5, 0.9]);
+        let hist = pit_histogram(&cdf, 0);
+        assert_eq!(hist.densities.len(), 0);
+        assert_eq!(hist.bin_edges.len(), 0);
+    }
+
+    #[test]
+    fn test_pit_histogram_skips_nan() {
+        // NaN used to be cast to bin 0 (`NaN as usize` == 0), inflating it.
+        let cdf = Array1::from_vec(vec![0.95, f64::NAN, 0.95, f64::NAN]);
+        let hist = pit_histogram(&cdf, 10);
+        // both valid values in the last bin: density = 2/2 * 10
+        assert_relative_eq!(hist.densities[9], 10.0, epsilon = 1e-10);
+        assert_relative_eq!(hist.densities[0], 0.0, epsilon = 1e-10);
+
+        // all-NaN input: densities NaN, no panic
+        let cdf = Array1::from_vec(vec![f64::NAN, f64::NAN]);
+        let hist = pit_histogram(&cdf, 4);
+        assert!(hist.densities.iter().all(|v| v.is_nan()));
+    }
+
+    /// Minimal deterministic RNG (LCG, MMIX constants) so the differential test
+    /// needs no external dependencies and is reproducible.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // xorshift the high bits down to decorrelate low bits of an LCG
+            let x = self.0;
+            (x ^ (x >> 33)).wrapping_mul(0xff51afd7ed558ccd) >> 11
+        }
+
+        fn next_f64(&mut self) -> f64 {
+            // 53 random bits in [0, 1)
+            (self.next_u64() & ((1u64 << 53) - 1)) as f64 / (1u64 << 53) as f64
+        }
+
+        fn gen_range(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    /// C-index exactly as the Fenwick counts define it (mirrors concordance_index's
+    /// final arithmetic).
+    fn c_from_fenwick_counts(concordant: u64, ties: u64, comparable: u64) -> f64 {
+        if comparable == 0 {
+            0.5
+        } else {
+            (concordant as f64 + 0.5 * ties as f64) / comparable as f64
+        }
+    }
+
+    #[test]
+    fn test_concordance_censored_fenwick_differential() {
+        // 240 randomized trials engineered to stress every exactness hazard:
+        // - epsilon-window prediction deltas straddling the 1e-10 boundary
+        // - exact prediction ties (delta = 0) and grid-valued predictions
+        // - exact time ties (grid times and copied times)
+        // - censoring rates 0%, 30%, 70%, 100%
+        // The Fenwick path must reproduce the O(n^2) loop BIT-FOR-BIT.
+        let deltas = [0.0, 1e-11, 9.9e-11, 1.00001e-10, 2e-10, -5e-11];
+
+        for trial in 0u64..240 {
+            let mut rng = Lcg(0x9E3779B97F4A7C15u64.wrapping_mul(trial + 1) ^ 0xD1B54A32D192ED03);
+            let n = 5 + rng.gen_range(296);
+            let censor_rate = [0.0, 0.3, 0.7, 1.0][(trial % 4) as usize];
+
+            // Times: every third trial draws from a tiny grid (many exact ties);
+            // otherwise continuous, with ~n/5 exact ties injected by copying.
+            let mut times: Vec<f64> = if trial % 3 == 0 {
+                let grid = 2 + rng.gen_range(8);
+                (0..n).map(|_| rng.gen_range(grid) as f64).collect()
+            } else {
+                (0..n).map(|_| rng.next_f64() * 10.0).collect()
+            };
+            for _ in 0..n / 5 {
+                let a = rng.gen_range(n);
+                let b = rng.gen_range(n);
+                if a != b {
+                    times[b] = times[a];
+                }
+            }
+
+            // Predictions: base draw (continuous, or coarse grid every fourth trial
+            // to force exact equality ties), then engineer epsilon-window pairs.
+            let mut preds: Vec<f64> = if trial % 4 == 1 {
+                (0..n).map(|_| (rng.gen_range(7) as f64) * 0.1).collect()
+            } else {
+                (0..n).map(|_| rng.next_f64()).collect()
+            };
+            for _ in 0..n / 3 {
+                let i = rng.gen_range(n);
+                let j = rng.gen_range(n);
+                if i != j {
+                    preds[j] = preds[i] + deltas[rng.gen_range(deltas.len())];
+                }
+            }
+
+            let events: Vec<bool> = (0..n).map(|_| rng.next_f64() >= censor_rate).collect();
+
+            let predictions = Array1::from_vec(preds);
+            let times = Array1::from_vec(times);
+            let events = Array1::from_vec(events);
+
+            let (old_conc, old_comp) =
+                concordance_counts_censored_bruteforce(&predictions, &times, &events);
+            let (fc, ft, fp) =
+                concordance_counts_censored_fenwick(&predictions, &times, &events);
+
+            // Raw counts must match exactly (float accumulation of multiples of
+            // 0.5 below 2^53 is exact, so f64 == is a legitimate exact check).
+            let new_conc = fc as f64 + 0.5 * ft as f64;
+            assert_eq!(
+                new_conc.to_bits(),
+                old_conc.to_bits(),
+                "trial {trial}: concordant mismatch (fenwick {new_conc} vs brute {old_conc})"
+            );
+            assert_eq!(
+                (fp as f64).to_bits(),
+                old_comp.to_bits(),
+                "trial {trial}: comparable mismatch (fenwick {fp} vs brute {old_comp})"
+            );
+
+            // Final C-index must be bit-identical.
+            let old_c = if old_comp == 0.0 { 0.5 } else { old_conc / old_comp };
+            let new_c = c_from_fenwick_counts(fc, ft, fp);
+            assert_eq!(
+                new_c.to_bits(),
+                old_c.to_bits(),
+                "trial {trial}: C-index mismatch (fenwick {new_c} vs brute {old_c})"
+            );
+
+            // The public function must agree too whenever it takes the general
+            // path (any censoring, or any exact time tie).
+            let has_censoring = events.iter().any(|&e| !e);
+            let mut ts: Vec<f64> = times.to_vec();
+            ts.sort_by(f64::total_cmp);
+            let has_time_ties = ts.windows(2).any(|w| w[0] == w[1]);
+            if has_censoring || has_time_ties {
+                let public_c = concordance_index(&predictions, &times, &events);
+                assert_eq!(
+                    public_c.to_bits(),
+                    old_c.to_bits(),
+                    "trial {trial}: public concordance_index mismatch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_concordance_censored_fenwick_edge_cases() {
+        // -0.0 and +0.0 times are equal under `<`, so they form a tied group:
+        // zero comparable pairs -> 0.5. The brute-force loop must agree.
+        let predictions = Array1::from_vec(vec![2.0, 1.0]);
+        let times = Array1::from_vec(vec![-0.0, 0.0]);
+        let events = Array1::from_vec(vec![true, false]);
+        let (fc, ft, fp) = concordance_counts_censored_fenwick(&predictions, &times, &events);
+        assert_eq!((fc, ft, fp), (0, 0, 0));
+        let (bc, bp) = concordance_counts_censored_bruteforce(&predictions, &times, &events);
+        assert_eq!((bc, bp), (0.0, 0.0));
+        assert_eq!(concordance_index(&predictions, &times, &events), 0.5);
+
+        // Epsilon-boundary trap: p_j = p_i + 1e-10 exactly (as rounded). The tie
+        // predicate is (p_i - p_j).abs() < 1e-10 via subtraction, which is NOT
+        // p_j < p_i + 1e-10. Check both sides of the window, plus exact tie.
+        let p_i = 0.1;
+        for (p_j, _label) in [
+            (p_i, "exact tie"),
+            (p_i + 1e-11, "inside window"),
+            (p_i + 9.9e-11, "near upper edge"),
+            (p_i + 1e-10, "at nominal boundary"),
+            (p_i + 1.00001e-10, "just outside"),
+            (p_i - 5e-11, "concordant within window"),
+        ] {
+            let predictions = Array1::from_vec(vec![p_i, p_j, 0.5]);
+            let times = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+            let events = Array1::from_vec(vec![true, false, true]);
+            let (fc, ft, fp) =
+                concordance_counts_censored_fenwick(&predictions, &times, &events);
+            let (bc, bp) =
+                concordance_counts_censored_bruteforce(&predictions, &times, &events);
+            let new_conc = fc as f64 + 0.5 * ft as f64;
+            assert_eq!(new_conc.to_bits(), bc.to_bits(), "p_j offset {:e}", p_j - p_i);
+            assert_eq!((fp as f64).to_bits(), bp.to_bits());
+        }
     }
 
     #[test]

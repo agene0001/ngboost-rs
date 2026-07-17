@@ -235,11 +235,15 @@ fn solve_small_natural_gradient(
             let h = metric_i[[2, 1]];
             let i = metric_i[[2, 2]] + reg;
 
-            // Cofactors (det = a·A00 + b·A10 + c·A20 along the first column)
+            // Adjugate first column = row-0 cofactors: a00 = C00, a10 = C01,
+            // a20 = C02. Expansion along the first ROW pairs them with a, b, c:
+            // det = a·C00 + b·C01 + c·C02. (Pairing them with the first
+            // COLUMN's d, g instead is an alien cofactor expansion that only
+            // equals det(M) when M is symmetric.)
             let a00 = e * i - f * h;
             let a10 = -(d * i - f * g);
             let a20 = d * h - e * g;
-            let det = a * a00 + d * a10 + g * a20;
+            let det = a * a00 + b * a10 + c * a20;
             if det == 0.0 {
                 return None;
             }
@@ -530,6 +534,33 @@ mod natgrad_tests {
                 }
             }
         }
+    }
+
+    /// The 3×3 determinant must be a true first-row cofactor expansion, not the
+    /// alien expansion (column elements × row cofactors) that only works for
+    /// symmetric matrices. All in-tree Fisher metrics are symmetric, so this
+    /// guards the generic contract for future/rounding-asymmetric metrics.
+    #[test]
+    fn closed_form_correct_for_asymmetric_3x3() {
+        // det = -3; the alien expansion gives -11 and a wrong solution.
+        let m = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 10.0]];
+        let g = array![1.0, 2.0, 3.0];
+        let expected = m.solve_into(g.clone()).unwrap(); // [-1/3, 2/3, 0]
+        let got = solve_small_natural_gradient(&g.view(), &m.view(), 0.0, 3).unwrap();
+        for j in 0..3 {
+            assert!(
+                (got[j] - expected[j]).abs() < 1e-12,
+                "asymmetric mismatch at {j}: {} vs {}",
+                got[j],
+                expected[j]
+            );
+        }
+
+        // Exactly singular asymmetric matrix (row1 = 2*row0): the alien
+        // expansion computed det = 4 and returned a bogus finite solution
+        // instead of deferring to pinv.
+        let singular = array![[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [1.0, 1.0, 1.0]];
+        assert!(solve_small_natural_gradient(&g.view(), &singular.view(), 0.0, 3).is_none());
     }
 
     /// A singular matrix returns None so the caller routes to the pinv fallback,

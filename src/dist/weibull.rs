@@ -405,13 +405,30 @@ impl Scorable<CRPScore> for Weibull {
     }
 
     fn metric(&self) -> Array3<f64> {
-        // Deterministic quadrature for E[g * g^T].
-        // Uses probability integral transform: u = F(y), y = F^{-1}(u)
-        // so E[h(Y)] = ∫_0^1 h(F^{-1}(u)) du, computed via midpoint rule.
+        // Deterministic quadrature for E[g * g^T] over Y ~ Weibull(k, λ).
+        //
+        // Exponential transform (same log-domain machinery as the Gamma CRPS
+        // metric at α = 1): W = (Y/λ)^k ~ Exp(1), so with s = ln w
+        //   E[h(Y)] = ∫ h(λ e^{s/k}) · exp(s − e^s) ds,
+        // midpoint rule uniform in s on [ln 1e-13, ln 53]. The integrand
+        // needs s ∈ [−19.4, 3.7] for 1e-8 relative support over k ∈ [0.05, 5]
+        // (tail-profiled), so these bounds are comfortable.
+        //
+        // Replaces the 200-pt PIT midpoint rule, whose implicit right-tail
+        // truncation at u = 0.9975 failed to converge for small shapes
+        // (rel err 3e-2 @ k=0.3, 0.87 @ k=0.1, det off 200× @ k=0.1).
+        // This rule's rel err vs 2M-pt log-domain references (self-converged,
+        // adaptive-quad cross-checked): ≤ 6.2e-5 over k ∈ [0.05, 5] ×
+        // λ ∈ {0.5, 1, 10}, better than the old rule at every point.
+        // Validated via a pure-Python replica of this kernel (the repo's
+        // method of record for quadrature changes).
         let n_obs = self.shape.len();
         let n_params = 2;
         let n_points = 200;
         let eps = 1e-5;
+        let s_lo = 1e-13_f64.ln();
+        let s_hi = 53.0_f64.ln();
+        let ds = (s_hi - s_lo) / n_points as f64;
 
         let mut fi = Array3::zeros((n_obs, n_params, n_params));
 
@@ -420,11 +437,14 @@ impl Scorable<CRPScore> for Weibull {
             let lam = self.scale[i];
 
             for j in 0..n_points {
-                let u = (j as f64 + 0.5) / n_points as f64;
-                // Weibull inverse CDF: y = lam * (-ln(1-u))^(1/k)
-                let y_i = lam * (-(1.0 - u).ln()).powf(1.0 / k);
+                let s = s_lo + (j as f64 + 0.5) * ds;
+                let w = s.exp();
+                // y = λ w^{1/k}, computed in log space for stability
+                let y_i = lam * (s / k).exp();
+                // node weight: Exp(1) density in s (e^{s - e^s}) × Δs
+                let wt = (s - w).exp() * ds;
 
-                // Gradient via finite differences
+                // Gradient via the same central FD in log-params as d_score
                 let k_plus = k * (1.0 + eps);
                 let k_minus = k * (1.0 - eps);
                 let g0 = (Self::crps_single_static(y_i, k_plus, lam)
@@ -440,13 +460,12 @@ impl Scorable<CRPScore> for Weibull {
                 let grads = [g0, g1];
                 for a in 0..n_params {
                     for b in 0..n_params {
-                        fi[[i, a, b]] += grads[a] * grads[b];
+                        fi[[i, a, b]] += wt * grads[a] * grads[b];
                     }
                 }
             }
         }
 
-        fi.mapv_inplace(|x| x / n_points as f64);
         fi
     }
 }
@@ -760,6 +779,38 @@ mod tests {
         assert_eq!(metric.shape(), &[1, 2, 2]);
         assert!(metric[[0, 0, 0]] > 0.0);
         assert!(metric[[0, 1, 1]] > 0.0);
+    }
+
+    /// Pins 2M-point self-converged log-domain reference values of
+    /// E[g gᵀ] (scipy, adaptive-quad cross-checked). The old 200-pt PIT rule
+    /// fails these decisively: rel err 0.87 @ k=0.1, 3.1e-2 @ k=0.3,
+    /// 6.7e-4 @ k=2; the log-domain rule is ≤ 6.6e-9 at these points.
+    #[test]
+    fn test_weibull_crps_metric_matches_reference() {
+        // (k, lam, m00, m01, m11, rel_tol)
+        let cases: [(f64, f64, f64, f64, f64, f64); 4] = [
+            (0.1, 1.0, 1.073860249e12, -5.512753360e10, 2.853733470e9, 1e-3),
+            (0.3, 1.0, 5.091011903e1, -1.498577875e1, 4.705218019, 1e-3),
+            (2.0, 1.0, 9.938415446e-3, 1.186709855e-2, 2.554984474e-1, 3e-4),
+            // entries scale as lam^2
+            (0.3, 10.0, 5.091011903e3, -1.498577875e3, 4.705218019e2, 1e-3),
+        ];
+        for (k, lam, m00, m01, m11, tol) in cases {
+            let params = Array2::from_shape_vec((1, 2), vec![k.ln(), lam.ln()]).unwrap();
+            let dist = Weibull::from_params(&params);
+            let m = Scorable::<CRPScore>::metric(&dist);
+            for (got, expect, name) in [
+                (m[[0, 0, 0]], m00, "m00"),
+                (m[[0, 0, 1]], m01, "m01"),
+                (m[[0, 1, 0]], m01, "m10"),
+                (m[[0, 1, 1]], m11, "m11"),
+            ] {
+                assert!(
+                    ((got - expect) / expect).abs() < tol,
+                    "k={k} lam={lam} {name}: got {got:e}, expected {expect:e}"
+                );
+            }
+        }
     }
 
     // ========================================================================

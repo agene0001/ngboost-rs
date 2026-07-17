@@ -1,7 +1,6 @@
 use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, Zip, array};
-use rand::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal as NormalDist};
 use statrs::function::erf::erf;
 
@@ -130,18 +129,33 @@ impl DistributionMethods for HalfNormal {
         result
     }
 
+    fn interval(&self, alpha: f64) -> (Array1<f64>, Array1<f64>) {
+        // Hoisted quantiles: one standard-normal inverse-CDF call per bound
+        // instead of one per row per bound. Bit-identical to the default
+        // ppf-based path (same clamp, same inverse_cdf argument, same
+        // scale * z product).
+        let std_normal = NormalDist::new(0.0, 1.0).unwrap();
+        let q_lo = (alpha / 2.0).clamp(0.0, 1.0 - 1e-15);
+        let q_hi = (1.0 - alpha / 2.0).clamp(0.0, 1.0 - 1e-15);
+        let z_lo = std_normal.inverse_cdf((1.0 + q_lo) / 2.0);
+        let z_hi = std_normal.inverse_cdf((1.0 + q_hi) / 2.0);
+        (
+            self.scale.mapv(|s| s * z_lo),
+            self.scale.mapv(|s| s * z_hi),
+        )
+    }
+
     fn sample(&self, n_samples: usize) -> Array2<f64> {
+        // Direct draws scale*|z|: no per-draw inverse-erf (statrs inverse_cdf).
         let n_obs = self.scale.len();
         let mut samples = Array2::zeros((n_samples, n_obs));
         let mut rng = rand::rng();
+        let mut z = crate::vmath::StdNormalSampler::new();
 
         for i in 0..n_obs {
-            let std_normal = NormalDist::new(0.0, 1.0).unwrap();
+            let scale = self.scale[i];
             for s in 0..n_samples {
-                // Sample from normal and take absolute value
-                let u: f64 = rng.random();
-                let z = std_normal.inverse_cdf(u);
-                samples[[s, i]] = self.scale[i] * z.abs();
+                samples[[s, i]] = scale * z.next(&mut rng).abs();
             }
         }
         samples
@@ -299,6 +313,42 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
     use statrs::distribution::Continuous; // for std_normal.pdf in reference checks
+
+    /// The hoisted-quantile interval() override must be bit-identical to the
+    /// default trait path (ppf(alpha/2), ppf(1 - alpha/2)), clamp included.
+    #[test]
+    fn test_interval_override_matches_ppf_path() {
+        let params = Array2::from_shape_vec((2, 1), vec![0.0, 2.0_f64.ln()]).unwrap();
+        let dist = HalfNormal::from_params(&params);
+        for alpha in [0.5, 0.1, 0.05, 0.01, 1e-6] {
+            let (lo, hi) = dist.interval(alpha);
+            let lo_ref = dist.ppf(&Array1::from_elem(2, alpha / 2.0));
+            let hi_ref = dist.ppf(&Array1::from_elem(2, 1.0 - alpha / 2.0));
+            for i in 0..2 {
+                assert_eq!(lo[i].to_bits(), lo_ref[i].to_bits(), "alpha={alpha} lo[{i}]");
+                assert_eq!(hi[i].to_bits(), hi_ref[i].to_bits(), "alpha={alpha} hi[{i}]");
+            }
+        }
+    }
+
+    /// Distributional sanity for the Box-Muller sample() path:
+    /// mean = scale*sqrt(2/pi), var = scale^2*(1 - 2/pi).
+    #[test]
+    fn test_sample_moments() {
+        let params = Array2::from_shape_vec((1, 1), vec![2.0_f64.ln()]).unwrap();
+        let dist = HalfNormal::from_params(&params);
+        let samples = dist.sample(100_000);
+        let col = samples.column(0);
+        let n = col.len() as f64;
+        let mean = col.sum() / n;
+        let var = col.mapv(|v| (v - mean) * (v - mean)).sum() / n;
+        let scale = 2.0f64;
+        let expect_mean = scale * (2.0 / std::f64::consts::PI).sqrt();
+        let expect_var = scale * scale * (1.0 - 2.0 / std::f64::consts::PI);
+        assert!((mean - expect_mean).abs() < 0.03, "mean {mean}");
+        assert!((var - expect_var).abs() < 0.05, "var {var}");
+        assert!(col.iter().all(|&v| v >= 0.0));
+    }
 
     #[test]
     fn test_halfnormal_distribution_methods() {

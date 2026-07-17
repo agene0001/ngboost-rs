@@ -53,7 +53,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde_json::Value;
 use std::collections::HashMap;
-use tpe::{TpeOptimizer, parzen_estimator, range};
+use tpe::{TpeOptimizer, categorical_range, histogram_estimator, parzen_estimator, range};
 
 // ============================================================================
 // Hyperparameter specifications
@@ -339,34 +339,8 @@ where
     let mut optimizers: HashMap<String, TpeOptimizer> = HashMap::new();
 
     for spec in &specs {
-        match &spec.param_type {
-            HyperParamType::Float { low, high, log } => {
-                let (lo, hi) = if *log { (low.ln(), high.ln()) } else { (*low, *high) };
-                optimizers.insert(
-                    spec.name.clone(),
-                    TpeOptimizer::new(parzen_estimator(), range(lo, hi)?),
-                );
-            }
-            HyperParamType::Int { low, high, log } => {
-                let (lo, hi) = if *log {
-                    ((*low as f64).ln(), (*high as f64).ln())
-                } else {
-                    (*low as f64, *high as f64)
-                };
-                optimizers.insert(
-                    spec.name.clone(),
-                    TpeOptimizer::new(parzen_estimator(), range(lo, hi)?),
-                );
-            }
-            HyperParamType::Categorical { choices } => {
-                if !choices.is_empty() {
-                    let optimizer = TpeOptimizer::new(
-                        parzen_estimator(),
-                        range(0.0, choices.len() as f64 - 0.01)?,
-                    );
-                    optimizers.insert(spec.name.clone(), optimizer);
-                }
-            }
+        if let Some(optimizer) = make_optimizer(&spec.param_type)? {
+            optimizers.insert(spec.name.clone(), optimizer);
         }
     }
 
@@ -400,26 +374,7 @@ where
             if let Some(optimizer) = optimizers.get_mut(&spec.name) {
                 let raw_value = optimizer.ask(&mut rng)?;
                 sampled_params.insert(spec.name.clone(), raw_value);
-
-                let param_value = match &spec.param_type {
-                    HyperParamType::Float { log, .. } => {
-                        let v = if *log { raw_value.exp() } else { raw_value };
-                        Value::from(v)
-                    }
-                    HyperParamType::Int { log, .. } => {
-                        let v = if *log {
-                            raw_value.exp().round() as i64
-                        } else {
-                            raw_value.round() as i64
-                        };
-                        Value::from(v)
-                    }
-                    HyperParamType::Categorical { choices } => {
-                        let idx = (raw_value.floor() as usize).min(choices.len() - 1);
-                        choices[idx].clone()
-                    }
-                };
-                trial_params.insert(spec.name.clone(), param_value);
+                trial_params.insert(spec.name.clone(), raw_to_value(&spec.param_type, raw_value));
             }
         }
 
@@ -526,6 +481,76 @@ where
         ..Default::default()
     };
     hyper_opt_with_config(features, labels, hp_dict, config, builder)
+}
+
+// ============================================================================
+// TPE per-parameter construction and value conversion
+// ============================================================================
+
+/// Construct the single-dimension TPE optimizer for one hyperparameter.
+///
+/// * `Float` / `Int` — parzen (kernel-density) estimator over a continuous
+///   range; log-scaled params get a log-space range and are exponentiated in
+///   [`raw_to_value`].
+/// * `Categorical` — histogram (multinomial) estimator over category *indices*
+///   via `tpe::categorical_range`. This treats the choices as genuinely
+///   unordered: each index gets an independent probability mass, so no fake
+///   ordering/distance is imposed and probability cannot leak between
+///   adjacent indices (which is what the previous continuous-range rounding
+///   hack did). Empty choice lists get no optimizer (`Ok(None)`).
+fn make_optimizer(
+    param_type: &HyperParamType,
+) -> Result<Option<TpeOptimizer>, Box<dyn std::error::Error>> {
+    let optimizer = match param_type {
+        HyperParamType::Float { low, high, log } => {
+            let (lo, hi) = if *log { (low.ln(), high.ln()) } else { (*low, *high) };
+            Some(TpeOptimizer::new(parzen_estimator(), range(lo, hi)?))
+        }
+        HyperParamType::Int { low, high, log } => {
+            let (lo, hi) = if *log {
+                ((*low as f64).ln(), (*high as f64).ln())
+            } else {
+                (*low as f64, *high as f64)
+            };
+            Some(TpeOptimizer::new(parzen_estimator(), range(lo, hi)?))
+        }
+        HyperParamType::Categorical { choices } => {
+            if choices.is_empty() {
+                None
+            } else {
+                Some(TpeOptimizer::new(
+                    histogram_estimator(),
+                    categorical_range(choices.len())?,
+                ))
+            }
+        }
+    };
+    Ok(optimizer)
+}
+
+/// Convert a raw sampled value from the TPE optimizer into the caller-facing
+/// JSON value. For categorical params the raw value is the category index
+/// (the histogram estimator samples exact integer indices in `[0, K)`); the
+/// floor+clamp is defensive only.
+fn raw_to_value(param_type: &HyperParamType, raw_value: f64) -> Value {
+    match param_type {
+        HyperParamType::Float { log, .. } => {
+            let v = if *log { raw_value.exp() } else { raw_value };
+            Value::from(v)
+        }
+        HyperParamType::Int { log, .. } => {
+            let v = if *log {
+                raw_value.exp().round() as i64
+            } else {
+                raw_value.round() as i64
+            };
+            Value::from(v)
+        }
+        HyperParamType::Categorical { choices } => {
+            let idx = (raw_value.floor() as usize).min(choices.len() - 1);
+            choices[idx].clone()
+        }
+    }
 }
 
 // ============================================================================
@@ -899,5 +924,134 @@ mod tests {
 
         assert!(!result.best_params.is_empty());
         assert_eq!(result.trials.len(), 3);
+    }
+
+    /// Drive the production categorical sampler (same `make_optimizer` /
+    /// `raw_to_value` path as `hyper_opt_with_config`) on a synthetic
+    /// objective: score 0.0 for `best_label`, 1.0 for everything else.
+    /// Returns (modal label over the last `rounds / 2` picks, its count).
+    fn run_categorical_tpe(
+        labels: &[&str],
+        best_label: &str,
+        seed: u64,
+        rounds: usize,
+    ) -> (String, usize) {
+        let choices: Vec<Value> = labels.iter().map(|l| json!(l)).collect();
+        let param_type = HyperParamType::Categorical { choices };
+        let mut opt = make_optimizer(&param_type)
+            .expect("categorical optimizer construction")
+            .expect("non-empty choices must yield an optimizer");
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+
+        for round in 0..rounds {
+            let raw = opt.ask(&mut rng).expect("ask");
+            // The histogram estimator samples exact category indices.
+            assert_eq!(raw, raw.floor(), "raw sample must be an integer index");
+            assert!(
+                raw >= 0.0 && raw < labels.len() as f64,
+                "index {} out of [0, {})",
+                raw,
+                labels.len()
+            );
+            let label = raw_to_value(&param_type, raw)
+                .as_str()
+                .expect("categorical value is a string")
+                .to_string();
+            let score = if label == best_label { 0.0 } else { 1.0 };
+            opt.tell(raw, score).expect("tell");
+            if round >= rounds / 2 {
+                *counts.entry(label).or_insert(0) += 1;
+            }
+        }
+
+        counts
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .expect("at least one pick recorded")
+    }
+
+    /// K=4 categorical with one clearly-best category: after 100 ask/tell
+    /// rounds the histogram-estimator TPE must spend the majority of the
+    /// second half exploiting the best category. Deterministic (fixed seed).
+    #[test]
+    fn test_categorical_tpe_converges_to_best() {
+        let (modal, count) =
+            run_categorical_tpe(&["alpha", "best", "gamma", "delta"], "best", 7, 100);
+        assert_eq!(modal, "best");
+        // Majority of the last 50 picks (strictly more than half).
+        assert!(count > 25, "best picked only {}/50 times in second half", count);
+    }
+
+    /// Unordered-sensitivity: the same objective with category labels
+    /// permuted must converge to the same best label regardless of where it
+    /// sits in the choice list. The old ordinal-continuous hack violated
+    /// this — parzen kernels leaked probability mass onto indices adjacent
+    /// to good ones, so the winner could depend on the (meaningless)
+    /// ordering. With the histogram estimator the index is a pure label.
+    #[test]
+    fn test_categorical_permutation_invariance() {
+        let permutations: [[&str; 4]; 3] = [
+            ["best", "sgd", "rmsprop", "lbfgs"],  // best first
+            ["sgd", "rmsprop", "lbfgs", "best"],  // best last
+            ["sgd", "best", "rmsprop", "lbfgs"],  // best mid-list
+        ];
+        for (i, perm) in permutations.iter().enumerate() {
+            let (modal, count) = run_categorical_tpe(perm, "best", 1234, 80);
+            assert_eq!(
+                modal, "best",
+                "permutation {} ({:?}) converged to {:?} instead of \"best\"",
+                i, perm, modal
+            );
+            assert!(
+                count > 20,
+                "permutation {}: best picked only {}/40 times in second half",
+                i,
+                count
+            );
+        }
+    }
+
+    /// End-to-end: a categorical hyperparameter routed through
+    /// `hyper_opt_with_config` must materialize as one of the declared
+    /// choices in every trial and in `best_params`.
+    #[test]
+    fn test_hyper_opt_categorical_end_to_end() {
+        let n = 60;
+        let x = Array::from_shape_fn((n, 2), |(i, j)| (i as f64) * 0.01 + (j as f64) * 0.1);
+        let y = Array::from_shape_fn(n, |i| (i as f64) * 0.05);
+
+        let choices = ["a", "b", "c", "d"];
+        let mut hp = HashMap::new();
+        hp.insert("mode".to_string(), json!({ "choices": choices }));
+
+        let cfg = HyperOptConfig {
+            n_trials: 4,
+            n_folds: 1, // single 80/20 holdout — one fit per trial
+            cv_scheme: CvScheme::KFold,
+            seed: 0,
+            hp_seed: None,
+            pruning: PruningStrategy::None,
+            max_minutes: None,
+            verbose: false,
+        };
+
+        let result = hyper_opt_with_config::<Normal, LogScore, StumpLearner, _>(
+            &x,
+            &y,
+            &hp,
+            cfg,
+            |_p| NGBoost::<Normal, LogScore, StumpLearner>::new(10, 0.05, StumpLearner),
+        )
+        .expect("hyper_opt with categorical param should succeed");
+
+        let is_valid_choice = |v: &Value| v.as_str().is_some_and(|s| choices.contains(&s));
+        assert_eq!(result.trials.len(), 4);
+        for trial in &result.trials {
+            let v = trial.params.get("mode").expect("mode sampled every trial");
+            assert!(is_valid_choice(v), "sampled invalid choice {:?}", v);
+        }
+        let best = result.best_params.get("mode").expect("mode in best_params");
+        assert!(is_valid_choice(best), "best choice {:?} not in declared set", best);
     }
 }

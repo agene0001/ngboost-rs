@@ -4,7 +4,6 @@ use crate::scores::{
     SurvivalData,
 };
 use ndarray::{Array1, Array2, Array3, Zip, array};
-use rand::prelude::*;
 use statrs::distribution::{
     Continuous, ContinuousCDF, LogNormal as LogNormalDist, Normal as NormalDist,
 };
@@ -143,16 +142,21 @@ impl DistributionMethods for LogNormal {
     }
 
     fn sample(&self, n_samples: usize) -> Array2<f64> {
+        // Direct draws exp(mu + sigma*z): no per-draw inverse-erf (statrs
+        // inverse_cdf). Same validity guard as the old LogNormalDist::new
+        // path — invalid params leave that column zeroed.
         let n_obs = self.loc.len();
         let mut samples = Array2::zeros((n_samples, n_obs));
         let mut rng = rand::rng();
+        let mut z = crate::vmath::StdNormalSampler::new();
 
         for i in 0..n_obs {
-            if let Ok(d) = LogNormalDist::new(self.loc[i], self.scale[i]) {
-                for s in 0..n_samples {
-                    let u: f64 = rng.random();
-                    samples[[s, i]] = d.inverse_cdf(u);
-                }
+            let (loc, scale) = (self.loc[i], self.scale[i]);
+            if !(loc.is_finite() && scale.is_finite() && scale > 0.0) {
+                continue;
+            }
+            for s in 0..n_samples {
+                samples[[s, i]] = (loc + scale * z.next(&mut rng)).exp();
             }
         }
         samples
@@ -331,6 +335,44 @@ impl Scorable<CRPScore> for LogNormal {
 // Censored LogScore for survival analysis
 // ============================================================================
 
+/// The asymptotic/erfc crossover for the stable normal tail helpers below:
+/// erfc(z/√2) is accurate up to its underflow near z ≈ 37.5; the 4-term Mills
+/// expansion is ≤2e-13 relative from z = 37 up. Validated vs 50-digit mpmath
+/// over z ∈ [−3, 1000] (worst 2e-13 at the boundary, ≤1e-14 elsewhere).
+const NORM_TAIL_Z_SWITCH: f64 = 37.0;
+
+/// ln S(z) = ln(1 − Φ(z)) for the standard normal, stable for all z.
+///
+/// Naive `1 − cdf(z)` cancels to exactly 0 near z ≈ 8.3, which is why the old
+/// censored score needed the `+1e-5` ridge — that ridge saturated the score
+/// at ln(1e5) ≈ 11.5 from z ≈ 4.26 on (11% wrong at z = 4.5, ~100% in the
+/// tail). Python has the same construction; deliberate deviation.
+fn norm_ln_sf(z: f64) -> f64 {
+    if z < NORM_TAIL_Z_SWITCH {
+        // S = 0.5·erfc(z/√2): no cancellation, exact down to ~1e-300
+        (0.5 * statrs::function::erf::erfc(z / std::f64::consts::SQRT_2)).ln()
+    } else {
+        // Mills expansion: S(z) = φ(z)/z · (1 − 1/z² + 3/z⁴ − 15/z⁶ + 105/z⁸ …)
+        let z2 = z * z;
+        let series = -1.0 / z2 + 3.0 / (z2 * z2) - 15.0 / (z2 * z2 * z2)
+            + 105.0 / (z2 * z2 * z2 * z2);
+        -0.5 * z2 - z.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln() + series.ln_1p()
+    }
+}
+
+/// Standard-normal hazard h(z) = φ(z)/S(z), stable for all z (h(z) → z as
+/// z → ∞; the naive ratio is 0/0 past φ's underflow).
+fn norm_hazard(z: f64) -> f64 {
+    if z < NORM_TAIL_Z_SWITCH {
+        let phi = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        phi / (0.5 * statrs::function::erf::erfc(z / std::f64::consts::SQRT_2))
+    } else {
+        let z2 = z * z;
+        z / (1.0 - 1.0 / z2 + 3.0 / (z2 * z2) - 15.0 / (z2 * z2 * z2)
+            + 105.0 / (z2 * z2 * z2 * z2))
+    }
+}
+
 impl CensoredScorable<LogScoreCensored> for LogNormal {
     fn is_diagonal_censored_metric(&self) -> bool {
         true
@@ -350,29 +392,28 @@ impl CensoredScorable<LogScoreCensored> for LogNormal {
     }
 
     fn censored_score(&self, y: &SurvivalData) -> Array1<f64> {
-        let eps = 1e-5;
         let mut scores = Array1::zeros(y.len());
 
         for i in 0..y.len() {
             let t = y.time[i];
             let e = y.event[i];
-            let d = LogNormalDist::new(self.loc[i], self.scale[i]).unwrap();
 
             if e {
                 // Uncensored: -log(pdf(t))
+                let d = LogNormalDist::new(self.loc[i], self.scale[i]).unwrap();
                 scores[i] = -d.ln_pdf(t);
             } else {
-                // Censored: -log(1 - cdf(t))
-                let survival = 1.0 - d.cdf(t) + eps;
-                scores[i] = -survival.ln();
+                // Censored: -ln S(t) = -ln(1 - Φ(z)), computed stably (the
+                // old `-ln(1 - cdf(t) + 1e-5)` saturated from z ≈ 4.26 on;
+                // see norm_ln_sf).
+                let z = (t.ln() - self.loc[i]) / self.scale[i];
+                scores[i] = -norm_ln_sf(z);
             }
         }
         scores
     }
 
     fn censored_d_score(&self, y: &SurvivalData) -> Array2<f64> {
-        let eps = 1e-5;
-        let std_normal = NormalDist::new(0.0, 1.0).unwrap();
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 2));
 
@@ -382,19 +423,20 @@ impl CensoredScorable<LogScoreCensored> for LogNormal {
             let log_t = t.ln();
             let z = (log_t - self.loc[i]) / self.scale[i];
             let var = self.scale[i].powi(2);
-            let d = LogNormalDist::new(self.loc[i], self.scale[i]).unwrap();
 
             if e {
                 // Uncensored gradient (same as regular LogScore)
                 d_params[[i, 0]] = (self.loc[i] - log_t) / var;
                 d_params[[i, 1]] = 1.0 - ((self.loc[i] - log_t).powi(2)) / var;
             } else {
-                // Censored gradient
-                let survival = 1.0 - d.cdf(t) + eps;
-                let norm_pdf = std_normal.pdf(z);
-
-                d_params[[i, 0]] = -norm_pdf / (self.scale[i] * survival);
-                d_params[[i, 1]] = -z * norm_pdf / survival;
+                // Censored gradient via the stable hazard h(z) = φ(z)/S(z):
+                //   d(-ln S)/dμ       = -h(z)/σ
+                //   d(-ln S)/d(log σ) = -z·h(z)
+                // (the old code divided φ by the eps'd survival, so the
+                // gradient vanished wherever the score saturated).
+                let h = norm_hazard(z);
+                d_params[[i, 0]] = -h / self.scale[i];
+                d_params[[i, 1]] = -z * h;
             }
         }
         d_params
@@ -529,6 +571,64 @@ impl CensoredScorable<CRPScoreCensored> for LogNormal {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// Pinned 50-digit mpmath truths for the censored LogScore in the tail:
+    /// with μ=0, σ=1, t=e^z the score is −ln S(z), d/dμ = −h(z),
+    /// d/d(log σ) = −z·h(z). The old `-ln(S + 1e-5)` construction saturated
+    /// at ln(1e5) ≈ 11.513 from z ≈ 4.26 with vanishing gradients (at z=10:
+    /// score 11.513, d/dμ = −7.7e-18 vs true 53.23 / −10.098).
+    #[test]
+    fn test_censored_log_score_stable_tail() {
+        let cases: [(f64, f64, f64, f64); 4] = [
+            (2.0, 3.7831843336820319, -2.3732155328228409, -4.7464310656456817),
+            (6.0, 20.736768949974706, -6.1584826045445989, -36.950895627267594),
+            (10.0, 53.231285150512471, -10.098093233962512, -100.98093233962512),
+            (40.0, 804.60844201375379, -40.024968847207264, -1600.9987538882905),
+        ];
+        let params = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+        let dist = LogNormal::from_params(&params);
+        for (z, score_t, dmu_t, dls_t) in cases {
+            let y = SurvivalData {
+                time: Array1::from_vec(vec![z.exp()]),
+                event: Array1::from_vec(vec![false]),
+            };
+            let s = CensoredScorable::<LogScoreCensored>::censored_score(&dist, &y);
+            let d = CensoredScorable::<LogScoreCensored>::censored_d_score(&dist, &y);
+            assert_relative_eq!(s[0], score_t, max_relative = 1e-10);
+            assert_relative_eq!(d[[0, 0]], dmu_t, max_relative = 1e-10);
+            assert_relative_eq!(d[[0, 1]], dls_t, max_relative = 1e-10);
+        }
+    }
+
+    /// The censored gradient must be the true derivative of the censored
+    /// score (FD self-consistency — the repo's standard check). The old code
+    /// satisfied this only because BOTH sides shared the eps'd survival; the
+    /// stable pair must satisfy it exactly.
+    #[test]
+    fn test_censored_log_score_gradient_matches_fd() {
+        let h = 1e-6;
+        for z in [-1.5_f64, 0.5, 3.0, 6.0] {
+            let t = z.exp(); // mu=0, sigma=1 => standardized z
+            let y = SurvivalData {
+                time: Array1::from_vec(vec![t]),
+                event: Array1::from_vec(vec![false]),
+            };
+            let score_at = |mu: f64, log_sigma: f64| -> f64 {
+                let params =
+                    Array2::from_shape_vec((1, 2), vec![mu, log_sigma]).unwrap();
+                let dist = LogNormal::from_params(&params);
+                CensoredScorable::<LogScoreCensored>::censored_score(&dist, &y)[0]
+            };
+            let params = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+            let dist = LogNormal::from_params(&params);
+            let d = CensoredScorable::<LogScoreCensored>::censored_d_score(&dist, &y);
+
+            let fd_mu = (score_at(h, 0.0) - score_at(-h, 0.0)) / (2.0 * h);
+            let fd_ls = (score_at(0.0, h) - score_at(0.0, -h)) / (2.0 * h);
+            assert_relative_eq!(d[[0, 0]], fd_mu, max_relative = 1e-4);
+            assert_relative_eq!(d[[0, 1]], fd_ls, max_relative = 1e-4);
+        }
+    }
 
     #[test]
     fn test_lognormal_distribution_methods() {

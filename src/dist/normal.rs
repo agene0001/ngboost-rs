@@ -159,19 +159,45 @@ impl DistributionMethods for Normal {
     }
 
     fn sample(&self, n_samples: usize) -> Array2<f64> {
+        // Direct polar Box-Muller draws: no per-draw inverse-erf (statrs
+        // inverse_cdf). Same guard as the old NormalDist::new path — invalid
+        // params leave that column zeroed.
         let n_obs = self.loc.len();
         let mut samples = Array2::zeros((n_samples, n_obs));
         let mut rng = rand::rng();
+        let mut z = crate::vmath::StdNormalSampler::new();
 
         for i in 0..n_obs {
-            if let Ok(d) = NormalDist::new(self.loc[i], self.scale[i]) {
-                for s in 0..n_samples {
-                    let u: f64 = rng.random();
-                    samples[[s, i]] = d.inverse_cdf(u);
-                }
+            let (loc, scale) = (self.loc[i], self.scale[i]);
+            if !(loc.is_finite() && scale.is_finite() && scale > 0.0) {
+                continue;
+            }
+            for s in 0..n_samples {
+                samples[[s, i]] = loc + scale * z.next(&mut rng);
             }
         }
         samples
+    }
+
+    fn interval(&self, alpha: f64) -> (Array1<f64>, Array1<f64>) {
+        // Hoisted quantiles: one standard-normal inverse-CDF call per bound
+        // instead of one per row per bound. Bit-identical to the default
+        // ppf-based path (same inverse_cdf argument, same loc + scale*z).
+        let std_normal = NormalDist::new(0.0, 1.0).unwrap();
+        let z_lo = std_normal.inverse_cdf(alpha / 2.0);
+        let z_hi = std_normal.inverse_cdf(1.0 - alpha / 2.0);
+        let n = self.loc.len();
+        let mut lower = Array1::zeros(n);
+        let mut upper = Array1::zeros(n);
+        Zip::from(&mut lower)
+            .and(&mut upper)
+            .and(&self.loc)
+            .and(&self.scale)
+            .for_each(|lo, hi, &loc, &scale| {
+                *lo = loc + scale * z_lo;
+                *hi = loc + scale * z_hi;
+            });
+        (lower, upper)
     }
 
     fn mode(&self) -> Array1<f64> {
@@ -840,6 +866,46 @@ impl Scorable<CRPScore> for NormalFixedMean {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// The hoisted-quantile interval() override must be bit-identical to the
+    /// default trait path (ppf(alpha/2), ppf(1 - alpha/2)).
+    #[test]
+    fn test_interval_override_matches_ppf_path() {
+        let params = Array2::from_shape_vec(
+            (3, 2),
+            vec![0.0, 0.0, -2.5, 1.3, 40.0, (0.01_f64).ln()],
+        )
+        .unwrap();
+        let dist = Normal::from_params(&params);
+        for alpha in [0.5, 0.1, 0.05, 0.01, 1e-6] {
+            let (lo, hi) = dist.interval(alpha);
+            let lo_ref = dist.ppf(&Array1::from_elem(3, alpha / 2.0));
+            let hi_ref = dist.ppf(&Array1::from_elem(3, 1.0 - alpha / 2.0));
+            for i in 0..3 {
+                assert_eq!(lo[i].to_bits(), lo_ref[i].to_bits(), "alpha={alpha} lo[{i}]");
+                assert_eq!(hi[i].to_bits(), hi_ref[i].to_bits(), "alpha={alpha} hi[{i}]");
+            }
+        }
+    }
+
+    /// Distributional sanity for the Box-Muller sample() path.
+    #[test]
+    fn test_sample_moments() {
+        let params = Array2::from_shape_vec((2, 2), vec![3.0, 0.0, -1.0, 2.0_f64.ln()]).unwrap();
+        let dist = Normal::from_params(&params);
+        let samples = dist.sample(100_000);
+        for (i, &(loc, scale)) in [(3.0f64, 1.0f64), (-1.0, 2.0)].iter().enumerate() {
+            let col = samples.column(i);
+            let n = col.len() as f64;
+            let mean = col.sum() / n;
+            let var = col.mapv(|v| (v - mean) * (v - mean)).sum() / n;
+            assert!((mean - loc).abs() < 0.05 * scale, "col {i} mean {mean}");
+            assert!(
+                (var - scale * scale).abs() < 0.1 * scale * scale,
+                "col {i} var {var}"
+            );
+        }
+    }
 
     #[test]
     fn test_vectorized_pdf_matches_scalar() {

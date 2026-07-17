@@ -393,7 +393,9 @@ where
             // Sample data for this iteration
             let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weights_sampled) =
                 self.sample(x, &y, &params, sample_weight);
-            self.col_idxs.push(col_idxs.clone());
+            // col_idxs is recorded only after the base learners fit
+            // successfully (below), keeping col_idxs aligned with base_models
+            // on error paths (mirrors ngboost.rs).
 
             // Row-subset fast path (mirrors ngboost.rs): rows subsampled,
             // columns intact, learner has a full-X cache.
@@ -477,6 +479,9 @@ where
                 fitted_learners.push(fitted);
                 predictions_cols.push(preds);
             }
+
+            // Learner fits succeeded — record this iteration's column subset.
+            self.col_idxs.push(col_idxs.clone());
 
             let predictions = to_2d_array(predictions_cols);
 
@@ -610,11 +615,12 @@ where
             );
         }
 
-        // Sample rows (minibatch)
+        // Sample rows (minibatch). Floor to at least 1 row (mirrors
+        // ngboost.rs; Python's int() selects 0 rows and errors cryptically).
         let sample_size = if no_row_sampling {
             n_samples
         } else {
-            ((n_samples as f64) * self.minibatch_frac) as usize
+            (((n_samples as f64) * self.minibatch_frac) as usize).max(1)
         };
 
         let row_idxs: Vec<usize> = if sample_size == n_samples {
@@ -757,6 +763,50 @@ where
         params
             .outer_iter_mut()
             .for_each(|mut row| row.assign(init_params));
+
+        // Parallel path (ported from NGBoost::get_params_at): each rayon task
+        // runs a contiguous block of rows through ALL estimators — chunky
+        // work units, no synchronization, per-row arithmetic order identical
+        // to the sequential loop (bit-exact). Also avoids the per-iteration
+        // preds Array1 allocations and the x.select copy under column
+        // subsampling (predict_rows maps column indices in the walk).
+        let p = x.ncols();
+        if x.nrows() >= 2 * crate::ngboost::PAR_ROW_CHUNK {
+            const CHUNK: usize = crate::ngboost::PAR_ROW_CHUNK;
+            let base_models = &self.base_models;
+            let col_idxs = &self.col_idxs;
+            let factors: Vec<f64> = self
+                .scalings
+                .iter()
+                .map(|s| self.learning_rate * s)
+                .collect();
+            if let (Some(xs), Some(ps)) = (x.as_slice(), params.as_slice_mut()) {
+                ps.par_chunks_mut(CHUNK * n_params)
+                    .zip(xs.par_chunks(CHUNK * p))
+                    .for_each(|(p_chunk, x_chunk)| {
+                        let rows = x_chunk.len() / p;
+                        let mut buf = vec![0.0; rows];
+                        for ((learners, col_idx), &factor) in base_models
+                            .iter()
+                            .zip(col_idxs.iter())
+                            .zip(factors.iter())
+                        {
+                            let mapping = if col_idx.len() == p {
+                                None
+                            } else {
+                                Some(col_idx.as_slice())
+                            };
+                            for (j, learner) in learners.iter().enumerate() {
+                                learner.predict_rows(x_chunk, p, mapping, &mut buf);
+                                for (r, &b) in buf.iter().enumerate() {
+                                    p_chunk[r * n_params + j] -= factor * b;
+                                }
+                            }
+                        }
+                    });
+                return params;
+            }
+        }
 
         for (i, (learners, col_idx)) in self
             .base_models

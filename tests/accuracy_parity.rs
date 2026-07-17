@@ -466,14 +466,14 @@ fn histogram_parity_survival_exponential() {
 #[test]
 fn histogram_parity_survival_weibull_crps() {
     // NOTE: the CRPS-censored Weibull pipeline (a Rust-only extension; Python
-    // ngboost has no Weibull CRPS) is numerically fragile — on some seeds
-    // training drifts parameters to log-overflow for BOTH learners equally
-    // (e.g. seed 105 at 200 estimators). Seeds/sizes here are chosen so
-    // training stays finite; the finiteness asserts make any future
-    // divergence visible instead of silently passing.
-    // KNOWN ISSUE: seeds 17 and 105 diverge for BOTH learners (the survival
-    // loop has no tikhonov_reg escape hatch like the main NGBoost loop);
-    // tracked as a stability follow-up, orthogonal to learner choice.
+    // ngboost has no Weibull CRPS) is numerically fragile at reg = 0 — the
+    // near-singular quadrature metric can produce enormous natural-gradient
+    // leaf values (seeds 17/105 always diverged; seed 61 joined them when the
+    // metric quadrature was corrected in July 2026 — the old rule's small-k
+    // truncation error had masked the near-singularity there). Both arms
+    // therefore use tikhonov_reg = 1e-6, the shipped default of
+    // NGBSurvival::weibull_crps(), which fully rescues these seeds (~1% CRPS
+    // cost on healthy ones — see tikhonov_reg_rescues_diverging_weibull_crps).
     use ngboost_rs::scores::CRPScoreCensored;
     let mut e_scores = Vec::new();
     let mut h_scores = Vec::new();
@@ -488,7 +488,8 @@ fn histogram_parity_survival_weibull_crps() {
                     100,
                     0.05,
                     DecisionTreeLearner::default_sklearn(),
-                );
+                )
+                .with_tikhonov_reg(1e-6);
                 m.fit(&x_tr, &t_tr, &e_tr).unwrap();
                 CensoredScorable::<CRPScoreCensored>::total_censored_score(
                     &m.pred_dist(&x_te),
@@ -500,7 +501,8 @@ fn histogram_parity_survival_weibull_crps() {
                     100,
                     0.05,
                     HistogramLearner::new(3),
-                );
+                )
+                .with_tikhonov_reg(1e-6);
                 m.fit(&x_tr, &t_tr, &e_tr).unwrap();
                 CensoredScorable::<CRPScoreCensored>::total_censored_score(
                     &m.pred_dist(&x_te),

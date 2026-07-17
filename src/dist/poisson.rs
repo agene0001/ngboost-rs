@@ -101,14 +101,40 @@ impl DistributionMethods for Poisson {
     }
 
     fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
-        // Inverse CDF (quantile function) for Poisson
-        // Returns the smallest integer k such that CDF(k) >= q
+        // Inverse CDF (quantile function) for Poisson: the smallest integer k
+        // such that CDF(k) >= q.
+        //
+        // Seeded search: normal-approximation seed k0 = λ + z√λ, then an
+        // exact walk on statrs cdf evaluations to the smallest satisfying k.
+        // Satisfies the same defining condition as statrs' inverse_cdf (same
+        // cdf) in ~2-4 incomplete-gamma evals instead of ~2·log2(λ) — AND
+        // does not panic where statrs does: its doubling search unwraps a
+        // checked subtraction whenever the answer is k = 0 with q > 0, so
+        // the old ppf/median crashed on any low-rate Poisson (median(λ) = 0
+        // for λ < ln 2). Termination: the down-walk stops at k = 0; the
+        // up-walk stops because q ≤ 1−1e-15 and the float cdf reaches 1.
+        let std_normal = statrs::distribution::Normal::new(0.0, 1.0).unwrap();
         let mut result = Array1::zeros(q.len());
         for i in 0..q.len() {
             let q_clamped = q[i].clamp(0.0, 1.0 - 1e-15);
             if let Ok(d) = PoissonDist::new(self.rate[i]) {
-                // Use inverse_cdf which returns the smallest k where P(X <= k) >= q
-                result[i] = d.inverse_cdf(q_clamped) as f64;
+                let rate = self.rate[i];
+                let z = statrs::distribution::ContinuousCDF::inverse_cdf(&std_normal, q_clamped);
+                let seed = (rate + z * rate.sqrt()).floor().max(0.0);
+                let mut k = if seed.is_finite() { seed as u64 } else { 0 };
+
+                if d.cdf(k) >= q_clamped {
+                    // walk down to the smallest satisfying k
+                    while k > 0 && d.cdf(k - 1) >= q_clamped {
+                        k -= 1;
+                    }
+                } else {
+                    while d.cdf(k) < q_clamped {
+                        k += 1;
+                    }
+                }
+
+                result[i] = k as f64;
             }
         }
         result
@@ -401,6 +427,42 @@ impl Scorable<CRPScore> for Poisson {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// The seeded quantile walk must satisfy the defining condition exactly:
+    /// k = smallest integer with CDF(k) >= q. Checked definitionally rather
+    /// than against statrs' inverse_cdf because the statrs default PANICS
+    /// (checked-arithmetic unwrap in its doubling search) whenever the answer
+    /// is k = 0 with q > 0 — which is also why the OLD ppf/median crashed on
+    /// low-rate Poissons (median(λ < ln 2) = 0).
+    #[test]
+    fn test_ppf_seeded_search_definitional() {
+        for &rate in &[0.05_f64, 0.5, 3.0, 30.0, 300.0, 800.0] {
+            let params = Array2::from_shape_vec((1, 1), vec![rate.ln()]).unwrap();
+            let dist = Poisson::from_params(&params);
+            let d = PoissonDist::new(rate).unwrap();
+            for &q in &[1e-9_f64, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0 - 1e-9, 0.0, 1.0] {
+                let got = dist.ppf(&Array1::from_vec(vec![q]))[0];
+                let q_clamped = q.clamp(0.0, 1.0 - 1e-15);
+                let k = got as u64;
+                assert_eq!(got, k as f64, "rate={rate} q={q}: non-integer {got}");
+                assert!(
+                    d.cdf(k) >= q_clamped,
+                    "rate={rate} q={q}: CDF({k}) < q"
+                );
+                assert!(
+                    k == 0 || d.cdf(k - 1) < q_clamped,
+                    "rate={rate} q={q}: {k} not the smallest satisfying k"
+                );
+            }
+        }
+
+        // Regression: the old statrs-based ppf PANICKED here (answer k=0,
+        // q>0). median of a low-rate Poisson is the everyday trigger.
+        let params = Array2::from_shape_vec((1, 1), vec![0.5_f64.ln()]).unwrap();
+        let dist = Poisson::from_params(&params);
+        assert_eq!(dist.ppf(&Array1::from_vec(vec![0.5]))[0], 0.0);
+        assert_eq!(dist.median()[0], 0.0);
+    }
 
     #[test]
     fn test_poisson_distribution_methods() {

@@ -1,7 +1,6 @@
 use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, Zip, array};
-use rand::prelude::*;
 use statrs::distribution::{ContinuousCDF, Gamma as GammaDist};
 use statrs::function::gamma::digamma;
 
@@ -129,31 +128,59 @@ impl DistributionMethods for Gamma {
     }
 
     fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
-        // Vectorized PPF using statrs library for accuracy
-        let mut result = Array1::zeros(q.len());
+        // PPF using statrs for accuracy. statrs' Gamma inverse_cdf costs
+        // ~15-30 incomplete-gamma evaluations per element (doubling +
+        // bisection + Newton), so large batches are rayon-parallelized —
+        // values are bit-identical to the sequential path (same per-element
+        // statrs call; Err leaves 0.0 exactly as the Zip path did).
+        let compute = |q_i: f64, shape: f64, rate: f64| -> f64 {
+            if let Ok(d) = GammaDist::new(shape, rate) {
+                let q_clamped = q_i.clamp(1e-15, 1.0 - 1e-15);
+                d.inverse_cdf(q_clamped)
+            } else {
+                0.0
+            }
+        };
+
+        const PAR_MIN: usize = 512;
+        let n = q.len();
+        if n >= PAR_MIN {
+            use rayon::prelude::*;
+            let out: Vec<f64> = (0..n)
+                .into_par_iter()
+                .map(|i| compute(q[i], self.shape[i], self.rate[i]))
+                .collect();
+            return Array1::from_vec(out);
+        }
+
+        let mut result = Array1::zeros(n);
         Zip::from(&mut result)
             .and(q)
             .and(&self.shape)
             .and(&self.rate)
             .for_each(|r, &q_i, &shape, &rate| {
-                if let Ok(d) = GammaDist::new(shape, rate) {
-                    let q_clamped = q_i.clamp(1e-15, 1.0 - 1e-15);
-                    *r = d.inverse_cdf(q_clamped);
-                }
+                *r = compute(q_i, shape, rate);
             });
         result
     }
 
     fn sample(&self, n_samples: usize) -> Array2<f64> {
+        // Marsaglia–Tsang (2000) rejection sampler (see vmath) instead of
+        // per-draw statrs `inverse_cdf` (~15-30 incomplete-gamma evaluations
+        // each, ~100× slower). `sample_gamma_rate1` returns a rate-1 deviate;
+        // scale by 1/rate. `GammaDist::new` keeps the old parameter-validity
+        // guard: invalid (shape, rate) leave the column zeroed.
         let n_obs = self.shape.len();
         let mut samples = Array2::zeros((n_samples, n_obs));
         let mut rng = rand::rng();
+        let mut normal = crate::vmath::StdNormalSampler::new();
 
         for i in 0..n_obs {
-            if let Ok(d) = GammaDist::new(self.shape[i], self.rate[i]) {
+            let (shape, rate) = (self.shape[i], self.rate[i]);
+            if GammaDist::new(shape, rate).is_ok() {
                 for s in 0..n_samples {
-                    let u: f64 = rng.random();
-                    samples[[s, i]] = d.inverse_cdf(u);
+                    samples[[s, i]] =
+                        crate::vmath::sample_gamma_rate1(&mut rng, &mut normal, shape) / rate;
                 }
             }
         }
@@ -545,6 +572,61 @@ mod tests {
         // Check that sample mean is close to shape/rate = 2/0.5 = 4
         let sample_mean: f64 = samples.column(0).mean().unwrap();
         assert!((sample_mean - 4.0).abs() < 0.5);
+    }
+
+    /// Moment check for the Marsaglia–Tsang sampler through `Gamma::sample`:
+    /// mean ≈ α/β, var ≈ α/β², and the shape-sensitive E[ln X] = ψ(α) − ln β
+    /// (catches shape errors that mean/var alone would miss). Covers the
+    /// boosted α < 1 branch, the squeeze-dominated α ≥ 1 branch, and a large
+    /// α. Bounds are 5σ of the estimators at n = 200_000, so failures mean a
+    /// real bug, not noise. Python prototype of the same algorithm was
+    /// validated vs scipy (moments within 4 SE + KS p > 1e-4) over
+    /// α ∈ {0.05, 0.3, 0.9, 1, 2.5, 30, 500} × rate ∈ {0.5, 3}.
+    #[test]
+    fn test_sample_moments() {
+        let n = 200_000usize;
+        let cases = [(0.3f64, 2.0f64), (2.5, 0.5), (30.0, 3.0)];
+        let mut flat = Vec::with_capacity(cases.len() * 2);
+        for &(shape, rate) in &cases {
+            flat.push(shape.ln());
+            flat.push(rate.ln());
+        }
+        let params = Array2::from_shape_vec((cases.len(), 2), flat).unwrap();
+        let dist = Gamma::from_params(&params);
+        let samples = dist.sample(n);
+
+        for (i, &(shape, rate)) in cases.iter().enumerate() {
+            let col = samples.column(i);
+            assert!(
+                col.iter().all(|&x| x.is_finite() && x >= 0.0),
+                "col {i} has invalid draws"
+            );
+            let nf = n as f64;
+            let mean = col.sum() / nf;
+            let var = col.mapv(|v| (v - mean) * (v - mean)).sum() / nf;
+            let mean_ln = col.mapv(|v| v.max(1e-300).ln()).sum() / nf;
+
+            let true_mean = shape / rate;
+            let true_var = shape / (rate * rate);
+            let true_mean_ln = digamma(shape) - rate.ln();
+            // SE(mean) = √(var/n); SE(var̂) = var·√((2 + 6/α)/n) (gamma
+            // excess kurtosis 6/α); SE(E[ln X]) = √(ψ′(α)/n).
+            let se_mean = (true_var / nf).sqrt();
+            let se_var = true_var * ((2.0 + 6.0 / shape) / nf).sqrt();
+            let se_mean_ln = (trigamma(shape) / nf).sqrt();
+            assert!(
+                (mean - true_mean).abs() < 5.0 * se_mean,
+                "col {i} mean {mean} vs {true_mean}"
+            );
+            assert!(
+                (var - true_var).abs() < 5.0 * se_var,
+                "col {i} var {var} vs {true_var}"
+            );
+            assert!(
+                (mean_ln - true_mean_ln).abs() < 5.0 * se_mean_ln,
+                "col {i} E[ln X] {mean_ln} vs {true_mean_ln}"
+            );
+        }
     }
 
     #[test]

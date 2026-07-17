@@ -331,7 +331,11 @@ impl TrainedBaseLearner for TrainedStumpLearner {
             return Array1::from_elem(x.nrows(), self.left_value);
         }
         x.column(self.feature_index).mapv(|val| {
-            if val < self.threshold {
+            // f32-quantized comparison, matching the fit-time partition (and
+            // sklearn, which casts X to float32 at predict): a raw f64 equal
+            // to the f64 midpoint of two adjacent f32s could otherwise be
+            // partitioned left at fit but routed right at predict.
+            if ((val as f32) as f64) < self.threshold {
                 self.left_value
             } else {
                 self.right_value
@@ -1824,7 +1828,10 @@ impl TreeNode {
                 right,
                 ..
             } => {
-                if x[[row_idx, *feature_index]] < *threshold {
+                // f32-quantized comparison, matching the fit-time partition
+                // (and sklearn's float32 predict-time cast); see
+                // TrainedStumpLearner::predict.
+                if ((x[[row_idx, *feature_index]] as f32) as f64) < *threshold {
                     left.predict_row(x, row_idx)
                 } else {
                     right.predict_row(x, row_idx)
@@ -1917,7 +1924,9 @@ impl ArenaDecisionTree {
             if node.is_leaf() {
                 return node.threshold_or_value;
             }
-            let feature_val = x[[row_idx, node.feature_index as usize]];
+            // f32-quantized comparison, matching the fit-time partition (and
+            // sklearn's float32 predict-time cast); see TrainedStumpLearner.
+            let feature_val = (x[[row_idx, node.feature_index as usize]] as f32) as f64;
             if feature_val < node.threshold_or_value {
                 node_idx = node.left as usize;
             } else {
@@ -2030,6 +2039,12 @@ impl BaseLearner for ArenaDecisionTreeLearner {
     ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
         if x.nrows() == 0 {
             return Err("Cannot fit to empty dataset");
+        }
+        // ArenaTreeNode stores the split feature as u16 (wire-format
+        // compatibility); `feature_index as u16` would silently wrap for
+        // wider matrices, splitting on the wrong column.
+        if x.ncols() > u16::MAX as usize + 1 {
+            return Err("ArenaDecisionTreeLearner supports at most 65536 features");
         }
 
         let indices: Vec<usize> = (0..x.nrows()).collect();
@@ -2909,6 +2924,39 @@ mod presort_tests {
             (sum - 1.0).abs() < 1e-12,
             "count-fallback importances must normalize to 1, got {sum}"
         );
+    }
+
+    /// A raw f64 exactly at the f64 midpoint of two adjacent f32 values casts
+    /// DOWN across the threshold (ties-to-even): the fit-time partition (f32
+    /// compare) put it in the LEFT leaf, so predict must route it left too.
+    /// Before the predict-time f32 cast, predict compared the raw f64 and
+    /// routed it right — returning a leaf the row never contributed to.
+    #[test]
+    fn exact_tree_fit_predict_f32_consistent() {
+        let eps24 = (2.0f64).powi(-24); // half of the f32 ULP at 1.0
+        let adversarial = 1.0 + eps24; // f32 cast = 1.0 (ties-to-even)
+        let x = Array2::from_shape_vec(
+            (3, 1),
+            vec![1.0, adversarial, 1.0 + 2.0 * eps24],
+        )
+        .unwrap();
+        let y = Array1::from_vec(vec![0.0, 0.0, 10.0]);
+        // Split lands between f32 groups {1.0, 1.0} and {1 + 2^-23}:
+        // threshold = 1 + 2^-24 == adversarial exactly.
+
+        let tree = DecisionTreeLearner::new(1).fit(&x, &y).unwrap();
+        let p = tree.predict(&x);
+        assert_eq!(p[1], 0.0, "depth-1 tree routed the tie value to the wrong leaf");
+        assert_eq!(p[0], 0.0);
+        assert_eq!(p[2], 10.0);
+
+        let stump = StumpLearner.fit(&x, &y).unwrap();
+        let p = stump.predict(&x);
+        assert_eq!(p[1], 0.0, "stump routed the tie value to the wrong leaf");
+
+        let arena = ArenaDecisionTreeLearner::new(1).fit(&x, &y).unwrap();
+        let p = arena.predict(&x);
+        assert_eq!(p[1], 0.0, "arena tree routed the tie value to the wrong leaf");
     }
 
     /// A stump is a depth-1 tree: both must pick the same split and produce
