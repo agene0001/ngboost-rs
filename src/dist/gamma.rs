@@ -1,7 +1,7 @@
 use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, Zip, array};
-use statrs::distribution::{ContinuousCDF, Gamma as GammaDist};
+use statrs::distribution::{ContinuousCDF, Gamma as GammaDist, Normal as NormalDist};
 use statrs::function::gamma::digamma;
 
 /// The Gamma distribution.
@@ -55,6 +55,14 @@ impl Distribution for Gamma {
 
     fn n_params(&self) -> usize {
         2
+    }
+
+    fn validate_targets(y: &Array1<f64>) -> Result<(), &'static str> {
+        // Support is (0, inf): y <= 0 sends ln(y) terms to -inf/NaN.
+        if y.iter().any(|&v| !(v > 0.0)) {
+            return Err("Gamma targets must be strictly positive");
+        }
+        Ok(())
     }
 
     fn predict(&self) -> Array1<f64> {
@@ -128,15 +136,19 @@ impl DistributionMethods for Gamma {
     }
 
     fn ppf(&self, q: &Array1<f64>) -> Array1<f64> {
-        // PPF using statrs for accuracy. statrs' Gamma inverse_cdf costs
-        // ~15-30 incomplete-gamma evaluations per element (doubling +
-        // bisection + Newton), so large batches are rayon-parallelized —
-        // values are bit-identical to the sequential path (same per-element
-        // statrs call; Err leaves 0.0 exactly as the Zip path did).
+        // Bounded quantile (see gamma_ppf_unit): statrs 0.18's Gamma
+        // `inverse_cdf` returns NaN/inf or silently wrong values over a
+        // large ordinary-parameter region (2026-07-23 audit: 166/528 grid
+        // points — median NaN for shape ≤ 0.05, +inf at shape = 1e6, up to
+        // 52× rel err; its 8 bisection + 4 unsafeguarded Newton iterations
+        // overshoot to x < 0 where pdf = 0). Large batches are
+        // rayon-parallelized — values are bit-identical to the sequential
+        // path (same per-element call; invalid params leave 0.0 exactly as
+        // the Zip path did).
         let compute = |q_i: f64, shape: f64, rate: f64| -> f64 {
-            if let Ok(d) = GammaDist::new(shape, rate) {
+            if GammaDist::new(shape, rate).is_ok() {
                 let q_clamped = q_i.clamp(1e-15, 1.0 - 1e-15);
-                d.inverse_cdf(q_clamped)
+                gamma_ppf_unit(shape, q_clamped) / rate
             } else {
                 0.0
             }
@@ -205,6 +217,114 @@ impl DistributionMethods for Gamma {
     }
 }
 
+/// Bounded unit-rate Gamma quantile: the smallest x with P(a, x) ≥ q, found
+/// by safeguarded Newton on statrs' own regularized incomplete gamma
+/// (`gamma_lr`), so the result is the numerical inverse of the exact cdf
+/// users evaluate. Replaces statrs `inverse_cdf` (see ppf above). Seeds:
+/// Wilson–Hilferty for moderate/large shape, the small-x asymptote
+/// F(x) → x^a/Γ(1+a) (exact as x → 0, indispensable for shape < 1 where the
+/// root can be ~1e-300); Newton is bracket-safeguarded with geometric
+/// expansion/bisection (the bracket can span hundreds of decades), exits on
+/// a repeated residual (below cdf resolution), and returns the best iterate
+/// seen on exhaustion — never an unevaluated midpoint.
+pub(crate) fn gamma_ppf_unit(a: f64, q: f64) -> f64 {
+    use statrs::function::gamma::{gamma_lr, ln_gamma};
+    debug_assert!(a > 0.0 && q > 0.0 && q < 1.0);
+
+    let cdf = |x: f64| -> f64 {
+        if x <= 0.0 {
+            0.0
+        } else {
+            gamma_lr(a, x)
+        }
+    };
+    let pdf = |x: f64| -> f64 { ((a - 1.0) * x.ln() - x - ln_gamma(a)).exp() };
+
+    // Seed A: Wilson–Hilferty cube approximation.
+    let z = NormalDist::new(0.0, 1.0).unwrap().inverse_cdf(q);
+    let c = 1.0 - 1.0 / (9.0 * a) + z / (3.0 * a.sqrt());
+    let wh = a * c * c * c;
+    // Seed B: small-x asymptote inverse, x = exp((ln q + ln Γ(1+a)) / a).
+    let asym = ((q.ln() + ln_gamma(a + 1.0)) / a).exp();
+
+    let wh_ok = wh.is_finite() && wh > 0.0;
+    let asym_ok = asym.is_finite() && asym > 0.0;
+    // statrs' gamma_lr has an absolute dead zone: it returns exactly 0.0 for
+    // x ≤ ~1.1e-15 (its almost_eq(x, 0) guard), so a tiny root cannot be
+    // resolved by inverting it — Newton would land on the dead-zone edge
+    // (~2.7× off at shape = 0.02). A tiny asymptote solution implies the
+    // true root is equally tiny, where the x^a/Γ(1+a) form is exact to
+    // O(x) ≤ 1e-10 relative — return it directly.
+    if asym_ok && asym < 1e-10 {
+        return asym;
+    }
+    let mut x = match (wh_ok, asym_ok) {
+        (true, true) => {
+            if (cdf(asym) - q).abs() < (cdf(wh) - q).abs() {
+                asym
+            } else {
+                wh
+            }
+        }
+        (true, false) => wh,
+        (false, true) => asym,
+        (false, false) => a, // mean; the safeguards take it from here
+    };
+
+    let eps4 = 4.0 * f64::EPSILON;
+    let mut lo = 0.0_f64;
+    let mut hi = f64::INFINITY;
+    let mut best_x = x;
+    let mut best_af = f64::INFINITY;
+    let mut prev_f = f64::NAN;
+    for _ in 0..200 {
+        let f = cdf(x) - q;
+        if f == 0.0 {
+            return x;
+        }
+        if f.abs() < best_af {
+            best_af = f.abs();
+            best_x = x;
+        }
+        if f == prev_f {
+            return best_x;
+        }
+        prev_f = f;
+        if f > 0.0 {
+            hi = x;
+        } else {
+            lo = x;
+        }
+        let d = pdf(x);
+        let mut xn = if d > 0.0 && d.is_finite() {
+            x - f / d
+        } else {
+            f64::NAN
+        };
+        if xn.is_finite() && (xn - x).abs() <= eps4 * xn.abs() {
+            return xn;
+        }
+        if !(xn > lo && xn < hi) {
+            // NaN or outside the bracket: expand geometrically while one
+            // side is unknown, else geometric-mean bisection (an arithmetic
+            // midpoint would need ~1000 steps to cross the decades a
+            // shape < 1 root can live in).
+            xn = if hi.is_infinite() {
+                x * 4.0
+            } else if lo == 0.0 {
+                x * 0.25
+            } else {
+                (lo * hi).sqrt()
+            };
+            if xn == x {
+                return x; // bracket collapsed to adjacent floats
+            }
+        }
+        x = xn;
+    }
+    best_x
+}
+
 impl Scorable<LogScore> for Gamma {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         // Vectorized -ln_pdf: -(k*ln(β) + (k-1)*ln(y) - β*y - ln_gamma(k))
@@ -230,8 +350,12 @@ impl Scorable<LogScore> for Gamma {
             .and(&self.shape)
             .and(&self.rate)
             .for_each(|mut row, &y_i, &shape_i, &rate_i| {
-                // d/d(log(shape)) - matches Python: log(eps + beta * Y) with eps=1e-10
-                row[0] = shape_i * (digamma(shape_i) - (1e-10 + y_i * rate_i).ln());
+                // d/d(log(shape)). Python adds eps = 1e-10 inside the log,
+                // which saturates the gradient exactly where the score keeps
+                // diverging — an inconsistent pair with real mass at small
+                // shapes (P(βY < 1e-10) ≈ 32% at k = 0.05). Deliberate
+                // deviation: floor only against ln(0) = -inf, like score.
+                row[0] = shape_i * (digamma(shape_i) - (y_i * rate_i).max(1e-300).ln());
                 // d/d(log(rate))
                 row[1] = y_i * rate_i - shape_i;
             });
@@ -493,6 +617,48 @@ fn beta(a: f64, b: f64) -> f64 {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// 2026-07-23 audit regression: statrs 0.18's Gamma `inverse_cdf` fails
+    /// on 166/528 ordinary-parameter grid points — NaN median for
+    /// shape ≤ 0.05, +inf at shape = 1e6, silent errors up to 52× — so ppf
+    /// now uses the bounded `gamma_ppf_unit`. Pins scipy.stats.gamma.ppf
+    /// truths across the statrs failure envelope (every listed case was NaN,
+    /// inf, or wrong through statrs).
+    #[test]
+    fn test_gamma_ppf_statrs_failure_envelope() {
+        let cases: [(f64, f64, f64, f64); 12] = [
+            (0.05, 1.0, 0.5, 5.573878440746256e-7),
+            (0.05, 10.0, 0.75, 0.00018567356838462777),
+            (0.02, 0.5, 0.5, 1.0137335312960264e-15),
+            (0.2, 10.0, 0.5, 0.002074633919282486),
+            (0.5, 1.0, 0.01, 7.854392895485092e-5),
+            (1.0, 1.0, 1e-9, 1.0000000004999997e-9),
+            (2.0, 10.0, 1e-9, 4.472202623032766e-6),
+            (1e6, 1.0, 0.5, 999999.6666666864),
+            (1e6, 2.0, 0.999999, 502380.3123567339),
+            (0.05, 1.0, 1e-12, 5.8446320572868056e-241),
+            (100.0, 0.5, 0.25, 186.17166767424348),
+            (3.0, 2.5, 0.9999, 5.571268247202834),
+        ];
+        for (shape, rate, q, truth) in cases {
+            let dist = Gamma {
+                shape: array![shape],
+                rate: array![rate],
+            };
+            let got = dist.ppf(&array![q])[0];
+            let rel = ((got - truth) / truth).abs();
+            assert!(
+                rel < 1e-8,
+                "gamma ppf(q={q}, shape={shape}, rate={rate}) = {got:e}, scipy = {truth:e}, rel = {rel:e}"
+            );
+        }
+        // Median (the most common statrs NaN case) routes through ppf(0.5).
+        let dist = Gamma {
+            shape: array![0.05],
+            rate: array![1.0],
+        };
+        assert_relative_eq!(dist.median()[0], 5.573878440746256e-7, max_relative = 1e-8);
+    }
 
     /// CRPS metric E[ggᵀ] pinned to 2M-point PIT-quadrature references
     /// (scipy, dumped 2026-07-09). Covers the hybrid small-shape branch

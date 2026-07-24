@@ -41,6 +41,17 @@ pub trait Distribution: Sized + Clone + Debug {
     /// Fits the distribution to the data `y` and returns the initial parameters.
     fn fit(y: &Array1<f64>) -> Array1<f64>;
 
+    /// Validate that targets lie inside the distribution's support before
+    /// fitting. The default accepts anything (non-finite values are already
+    /// rejected by the training entry points); distributions with restricted
+    /// support override this so out-of-support targets fail loudly instead
+    /// of silently corrupting training (2026-07-23 audit: negative class
+    /// labels trained as class 0 via `as usize` saturation, labels >= K
+    /// panicked mid-fit, LogNormal y = 0 NaN'd training immediately).
+    fn validate_targets(_y: &Array1<f64>) -> Result<(), &'static str> {
+        Ok(())
+    }
+
     /// Returns the number of parameters for this distribution.
     fn n_params(&self) -> usize;
 

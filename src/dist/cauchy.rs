@@ -60,7 +60,7 @@ impl Distribution for Cauchy {
             (mad * 1.4826).max(1e-6) // MAD to std conversion factor
         };
 
-        // IRLS iterations for t(df=3) MLE
+        // IRLS iterations for Cauchy (t with df=1) MLE
         for _ in 0..100 {
             // E-step: compute weights w_i = (df + 1) / (df + ((y_i - loc) / scale)^2)
             let weights: Vec<f64> = y
@@ -316,7 +316,7 @@ impl Distribution for CauchyFixedVar {
             sorted[n / 2]
         };
 
-        // IRLS iterations for t(df=3) MLE, loc only (scale fixed)
+        // IRLS iterations for Cauchy (t with df=1) MLE, loc only (scale fixed)
         for _ in 0..100 {
             let weights: Vec<f64> = y
                 .iter()

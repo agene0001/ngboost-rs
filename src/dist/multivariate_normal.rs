@@ -360,49 +360,41 @@ impl<const P: usize> crate::dist::MultivariateDistributionMethods for Multivaria
     }
 }
 
+/// Reshape flattened targets (row-major, length n_obs * P) into (n_obs, P).
+/// Any other length is a hard error: the old fallbacks scored dimensions
+/// 1..P against literal 0.0 when y.len() == n_obs, and EVERY dimension
+/// against zeros for any other length — silently turning upstream shape bugs
+/// into plausible finite scores (2026-07-23 audit).
+fn reshape_targets<const P: usize>(y: &Array1<f64>, n: usize) -> Array2<f64> {
+    assert_eq!(
+        y.len(),
+        n * P,
+        "MultivariateNormal<{P}> expects y flattened row-major to length n_obs * P = {}, got {}",
+        n * P,
+        y.len()
+    );
+    let mut y_2d = Array2::zeros((n, P));
+    for i in 0..n {
+        for j in 0..P {
+            y_2d[[i, j]] = y[i * P + j];
+        }
+    }
+    y_2d
+}
+
 impl<const P: usize> Scorable<LogScore> for MultivariateNormal<P> {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
         // Reshape y from (N*P,) to (N, P) if needed
         // For now, assume y is already (N,) where N is n_obs
         // and we need 2D y for MVN
 
-        // This is a simplification - in practice, y should be 2D
-        // We'll reshape assuming y contains all P dimensions for each observation
-        let n = self.n_obs;
-        let mut y_2d = Array2::zeros((n, P));
-
-        if y.len() == n * P {
-            for i in 0..n {
-                for j in 0..P {
-                    y_2d[[i, j]] = y[i * P + j];
-                }
-            }
-        } else if y.len() == n {
-            // Single dimension - replicate
-            for i in 0..n {
-                y_2d[[i, 0]] = y[i];
-            }
-        }
-
+        let y_2d = reshape_targets::<P>(y, self.n_obs);
         -self.logpdf(&y_2d)
     }
 
     fn d_score(&self, y: &Array1<f64>) -> Array2<f64> {
-        // Reshape y
         let n = self.n_obs;
-        let mut y_2d = Array2::zeros((n, P));
-
-        if y.len() == n * P {
-            for i in 0..n {
-                for j in 0..P {
-                    y_2d[[i, j]] = y[i * P + j];
-                }
-            }
-        } else if y.len() == n {
-            for i in 0..n {
-                y_2d[[i, 0]] = y[i];
-            }
-        }
+        let y_2d = reshape_targets::<P>(y, n);
 
         let (diff, eta) = self.summaries(&y_2d);
         let tril_len = tril_size(P);

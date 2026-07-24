@@ -77,6 +77,13 @@ impl<const K: usize> Distribution for Categorical<K> {
         // and excluded from n so frequencies still sum to 1)
         let mut counts = vec![0usize; K];
         for &y_i in y.iter() {
+            // `y_i as usize` saturates negatives and NaN to 0 — skip them
+            // explicitly or they silently count as class 0. (Training entry
+            // points reject them via validate_targets; this guards direct
+            // callers.)
+            if !(y_i >= 0.0) {
+                continue;
+            }
             let class = y_i as usize;
             if class < K {
                 counts[class] += 1;
@@ -110,6 +117,18 @@ impl<const K: usize> Distribution for Categorical<K> {
 
     fn n_params(&self) -> usize {
         K - 1
+    }
+
+    fn validate_targets(y: &Array1<f64>) -> Result<(), &'static str> {
+        // 2026-07-23 audit: a negative label silently trained as class 0
+        // ({-1, +1}-encoded data corrupted without any error) and a label
+        // >= K panicked with an index error mid-fit.
+        for &v in y.iter() {
+            if !(v >= 0.0) || v.fract() != 0.0 || v >= K as f64 {
+                return Err("class labels must be integers in [0, n_classes)");
+            }
+        }
+        Ok(())
     }
 
     fn predict(&self) -> Array1<f64> {

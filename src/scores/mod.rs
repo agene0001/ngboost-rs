@@ -225,43 +225,55 @@ fn solve_small_natural_gradient(
             ])
         }
         3 => {
-            let a = metric_i[[0, 0]] + reg;
-            let b = metric_i[[0, 1]];
-            let c = metric_i[[0, 2]];
-            let d = metric_i[[1, 0]];
-            let e = metric_i[[1, 1]] + reg;
-            let f = metric_i[[1, 2]];
-            let g = metric_i[[2, 0]];
-            let h = metric_i[[2, 1]];
-            let i = metric_i[[2, 2]] + reg;
-
-            // Adjugate first column = row-0 cofactors: a00 = C00, a10 = C01,
-            // a20 = C02. Expansion along the first ROW pairs them with a, b, c:
-            // det = a·C00 + b·C01 + c·C02. (Pairing them with the first
-            // COLUMN's d, g instead is an alien cofactor expansion that only
-            // equals det(M) when M is symmetric.)
-            let a00 = e * i - f * h;
-            let a10 = -(d * i - f * g);
-            let a20 = d * h - e * g;
-            let det = a * a00 + b * a10 + c * a20;
-            if det == 0.0 {
+            // Partial-pivoted Gaussian elimination. The previous
+            // adjugate/Cramer solve was not backward stable: on SPD matrices
+            // whose small-eigenvalue direction mixes coordinates it was up to
+            // ~1e5x less accurate than LAPACK at cond 1e10 and returned
+            // garbage at cond 1e13 (2026-07-23 audit — the StudentT CRPS
+            // quadrature metric is exactly that shape; one-step iterative
+            // refinement was tested and does NOT repair it). Elimination with
+            // row pivoting matches LAPACK's backward error at this size, with
+            // no allocation and no LAPACK call.
+            let mut m = [
+                [metric_i[[0, 0]] + reg, metric_i[[0, 1]], metric_i[[0, 2]]],
+                [metric_i[[1, 0]], metric_i[[1, 1]] + reg, metric_i[[1, 2]]],
+                [metric_i[[2, 0]], metric_i[[2, 1]], metric_i[[2, 2]] + reg],
+            ];
+            let mut x = [g_i[0], g_i[1], g_i[2]];
+            for col in 0..2 {
+                let mut p = col;
+                for r in (col + 1)..3 {
+                    if m[r][col].abs() > m[p][col].abs() {
+                        p = r;
+                    }
+                }
+                if m[p][col] == 0.0 {
+                    return None; // exactly singular -> caller's pinv fallback
+                }
+                if p != col {
+                    m.swap(p, col);
+                    x.swap(p, col);
+                }
+                for r in (col + 1)..3 {
+                    let factor = m[r][col] / m[col][col];
+                    if factor != 0.0 {
+                        for k in (col + 1)..3 {
+                            m[r][k] -= factor * m[col][k];
+                        }
+                        x[r] -= factor * x[col];
+                    }
+                }
+            }
+            if m[2][2] == 0.0 {
                 return None;
             }
-            // Adjugate (transpose of the cofactor matrix)
-            let a01 = -(b * i - c * h);
-            let a02 = b * f - c * e;
-            let a11 = a * i - c * g;
-            let a12 = -(a * f - c * d);
-            let a21 = -(a * h - b * g);
-            let a22 = a * e - b * d;
-
-            let (g0, g1, g2) = (g_i[0], g_i[1], g_i[2]);
-            let inv_det = 1.0 / det;
-            Some(ndarray::array![
-                (a00 * g0 + a01 * g1 + a02 * g2) * inv_det,
-                (a10 * g0 + a11 * g1 + a12 * g2) * inv_det,
-                (a20 * g0 + a21 * g1 + a22 * g2) * inv_det,
-            ])
+            let x2 = x[2] / m[2][2];
+            let x1 = (x[1] - m[1][2] * x2) / m[1][1];
+            let x0 = (x[0] - m[0][1] * x1 - m[0][2] * x2) / m[0][0];
+            if !(x0.is_finite() && x1.is_finite() && x2.is_finite()) {
+                return None; // overflowed near-singular solve -> pinv
+            }
+            Some(ndarray::array![x0, x1, x2])
         }
         _ => None,
     }
@@ -561,6 +573,38 @@ mod natgrad_tests {
         // instead of deferring to pinv.
         let singular = array![[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [1.0, 1.0, 1.0]];
         assert!(solve_small_natural_gradient(&g.view(), &singular.view(), 0.0, 3).is_none());
+    }
+
+    /// 2026-07-23 audit regression: the adjugate/Cramer 3×3 solve was not
+    /// backward stable — on SPD matrices whose small-eigenvalue direction
+    /// mixes coordinates it was ~1e5x less accurate than LAPACK at cond 1e10
+    /// (rel err 9.5e-3, fails the 1e-4 bound decisively) and returned garbage
+    /// (rel err ~3.7e2) at cond 1e13. The partial-pivoted elimination must
+    /// stay inside the cond*eps forward-error envelope.
+    #[test]
+    fn ill_conditioned_rotated_spd_3x3() {
+        let rot = |i: usize, j: usize, th: f64| {
+            let mut q = Array2::<f64>::eye(3);
+            q[[i, i]] = th.cos();
+            q[[j, j]] = th.cos();
+            q[[i, j]] = -th.sin();
+            q[[j, i]] = th.sin();
+            q
+        };
+        let q = rot(0, 1, 0.6).dot(&rot(0, 2, 1.1)).dot(&rot(1, 2, 0.3));
+        for (small, tol) in [(1e-10, 1e-4), (1e-13, 5e-2)] {
+            let d = Array2::from_diag(&array![1.0, 1e-5, small]);
+            let m = q.dot(&d).dot(&q.t());
+            let x_true = array![1.0, -2.0, 0.5];
+            let b = m.dot(&x_true);
+            let got = solve_small_natural_gradient(&b.view(), &m.view(), 0.0, 3).unwrap();
+            let err = (0..3)
+                .map(|j| (got[j] - x_true[j]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+                / (1.0f64 + 4.0 + 0.25).sqrt();
+            assert!(err < tol, "cond {:e}: rel err {err:e}", 1.0 / small);
+        }
     }
 
     /// A singular matrix returns None so the caller routes to the pinv fallback,

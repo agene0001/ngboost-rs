@@ -538,31 +538,35 @@ fn tikhonov_reg_rescues_diverging_weibull_crps() {
     let (x_te, t_te, e_te) = make_weibull_survival(400, seed.wrapping_mul(7919).wrapping_add(1));
     let y_te = SurvivalData::from_arrays(&t_te, &e_te);
 
-    let crps_with_reg = |reg: f64| -> f64 {
+    let crps_with_reg = |reg: f64| -> Result<f64, &'static str> {
         let mut m = NGBSurvival::<Weibull, CRPScoreCensored, HistogramLearner>::new(
             100,
             0.05,
             HistogramLearner::new(3),
         )
         .with_tikhonov_reg(reg);
-        m.fit(&x_tr, &t_tr, &e_tr).unwrap();
-        CensoredScorable::<CRPScoreCensored>::total_censored_score(
+        m.fit(&x_tr, &t_tr, &e_tr)?;
+        Ok(CensoredScorable::<CRPScoreCensored>::total_censored_score(
             &m.pred_dist(&x_te),
             &y_te,
             None,
-        )
+        ))
     };
 
-    // Unregularized: documents the divergence this guards against. If this
-    // ever starts converging, the seed choice should be revisited.
-    let unregularized = crps_with_reg(0.0);
-    assert!(
-        !unregularized.is_finite(),
-        "seed 17 unexpectedly converged at reg=0 ({unregularized}); pick a new diverging seed"
-    );
+    // Unregularized: documents the divergence this guards against. Since the
+    // 2026-07-23 fit-loop gradient guard, the diverging fit fails LOUDLY
+    // with a divergence error instead of silently returning a NaN model. If
+    // this ever starts succeeding with a finite score, revisit the seed.
+    match crps_with_reg(0.0) {
+        Err(e) => assert!(e.contains("diverged"), "unexpected fit error: {e}"),
+        Ok(v) => assert!(
+            !v.is_finite(),
+            "seed 17 unexpectedly converged at reg=0 ({v}); pick a new diverging seed"
+        ),
+    }
 
     // Regularized: must converge to a healthy CRPS (healthy seeds sit ~0.35)
-    let regularized = crps_with_reg(1e-6);
+    let regularized = crps_with_reg(1e-6).expect("tikhonov_reg=1e-6 fit must succeed");
     assert!(
         regularized.is_finite() && regularized < 0.5,
         "tikhonov_reg=1e-6 failed to stabilize seed 17: CRPS={regularized}"

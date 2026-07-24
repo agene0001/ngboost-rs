@@ -38,6 +38,15 @@ impl Distribution for HalfNormal {
         1
     }
 
+    fn validate_targets(y: &Array1<f64>) -> Result<(), &'static str> {
+        // Negative y previously scored as |y| (LogScore folds the sign) —
+        // silently wrong by |y| against the true infinite score.
+        if y.iter().any(|&v| !(v >= 0.0)) {
+            return Err("HalfNormal targets must be non-negative");
+        }
+        Ok(())
+    }
+
     fn predict(&self) -> Array1<f64> {
         // Mean of half-normal is scale * sqrt(2/pi)
         let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();

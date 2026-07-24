@@ -28,12 +28,28 @@ impl Distribution for LogNormal {
         }
         let log_y: Array1<f64> = y.mapv(|v| v.ln());
         let mean = log_y.mean().unwrap_or(0.0);
-        let std_dev = log_y.std(0.0);
+        let mut std_dev = log_y.std(0.0);
+        // Same degenerate-data guard as Normal::fit: constant y (or n = 1)
+        // gives std = 0, and ln(0) = -inf would make every z = 0/0 = NaN
+        // from iteration 0.
+        if std_dev <= 0.0 || !std_dev.is_finite() {
+            std_dev = 1.0;
+        }
         array![mean, std_dev.ln()]
     }
 
     fn n_params(&self) -> usize {
         2
+    }
+
+    fn validate_targets(y: &Array1<f64>) -> Result<(), &'static str> {
+        // y = 0 gave an inconsistent score/gradient pair (finite clamped
+        // score, ±inf gradient); y < 0 is ln(negative) = NaN, which poisons
+        // tree fits even for weight-0 rows.
+        if y.iter().any(|&v| !(v > 0.0)) {
+            return Err("LogNormal targets must be strictly positive");
+        }
+        Ok(())
     }
 
     fn predict(&self) -> Array1<f64> {
@@ -219,7 +235,11 @@ impl Scorable<LogScore> for LogNormal {
             .and(&self.loc)
             .and(&self.scale)
             .for_each(|mut row, &y_i, &loc, &scale| {
-                let log_y = y_i.ln();
+                // Same y-floor as score(): without it, score(0) was finite
+                // while d_score(0) was ±inf — an inconsistent pair. (Training
+                // entry points reject y <= 0 via validate_targets; this
+                // guards direct callers.)
+                let log_y = y_i.max(1e-300).ln();
                 let var = scale * scale;
                 let err = loc - log_y;
                 row[0] = err / var;
@@ -337,8 +357,13 @@ impl Scorable<CRPScore> for LogNormal {
 
 /// The asymptotic/erfc crossover for the stable normal tail helpers below:
 /// erfc(z/√2) is accurate up to its underflow near z ≈ 37.5; the 4-term Mills
-/// expansion is ≤2e-13 relative from z = 37 up. Validated vs 50-digit mpmath
-/// over z ∈ [−3, 1000] (worst 2e-13 at the boundary, ≤1e-14 elsewhere).
+/// expansion is ≤2e-13 relative from z = 37 up. In-binary accuracy on the
+/// erfc branch is bounded by statrs 0.18's erfc itself (~5e-11 relative;
+/// worst measured 1.6e-10 for norm_ln_sf at z = −5, 9.6e-11 for norm_hazard
+/// at z ≈ 0.8 — 2026-07-23 audit probe of the real statrs binary). The Mills
+/// branch and the formulas themselves are ≤2e-13 vs 50-digit mpmath; an
+/// earlier claim of ≤1e-14 end-to-end was validated against scipy's erfc,
+/// not statrs's, and overstated by ~4 orders.
 const NORM_TAIL_Z_SWITCH: f64 = 37.0;
 
 /// ln S(z) = ln(1 − Φ(z)) for the standard normal, stable for all z.

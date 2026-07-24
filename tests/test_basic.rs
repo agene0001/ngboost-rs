@@ -718,3 +718,101 @@ fn test_minibatch_histogram_subset_path_learns() {
         );
     }
 }
+
+// ============================================================================
+// 2026-07-23 audit regressions
+// ============================================================================
+
+/// Constant targets used to hang forever: Normal::fit floors sigma to 1.0,
+/// the NLL is then unbounded below on zero-residual rows, boosting drives
+/// log-scale to ~-383 where sigma^2 underflows to 0.0, gradients become NaN,
+/// and the line-search down phase had no exit for non-finite residuals
+/// (100% CPU, never returns). Training must now fail loudly instead.
+#[test]
+fn test_constant_target_errors_instead_of_hanging() {
+    let x = Array2::random((200, 4), Uniform::new(0.0, 1.0).unwrap());
+    let y = Array1::from_elem(200, 3.0);
+
+    let mut model = NGBRegressor::new(500, 0.1);
+    let result = model.fit(&x, &y);
+    let err = result.expect_err("constant-y fit must diverge with an error, not hang");
+    assert!(
+        err.contains("diverged"),
+        "expected a divergence error, got: {err}"
+    );
+}
+
+/// Degenerate hyperparameters / weights must be rejected up front instead of
+/// silently corrupting training (audit findings F4/F5/F6).
+#[test]
+fn test_degenerate_config_rejected() {
+    let x = Array2::random((50, 4), Uniform::new(0.0, 1.0).unwrap());
+    let (_, y) = generate_regression_data(50, 4);
+
+    // early_stopping_rounds = 0 silently trained exactly 1 estimator
+    let mut m = NGBRegressor::with_options(
+        20, 0.1, true, 1.0, 1.0, false, 100.0, 1e-4, Some(0), 0.1, false,
+    );
+    assert!(m.fit(&x, &y).is_err());
+
+    // early stopping with no possible validation data silently disabled it
+    let mut m = NGBRegressor::with_options(
+        20, 0.1, true, 1.0, 1.0, false, 100.0, 1e-4, Some(5), 0.0, false,
+    );
+    assert!(m.fit(&x, &y).is_err());
+
+    // all-zero weights produced NaN losses reported as Ok
+    let mut m = NGBRegressor::new(20, 0.1);
+    let w = Array1::zeros(50);
+    assert!(m.fit_with_weights(&x, &y, Some(&w)).is_err());
+
+    // negative weights
+    let mut m = NGBRegressor::new(20, 0.1);
+    let mut w = Array1::ones(50);
+    w[0] = -1.0;
+    assert!(m.fit_with_weights(&x, &y, Some(&w)).is_err());
+}
+
+/// Predicting on an empty batch panicked (get_params_at returned shape
+/// (0, 0) and from_params indexed column 0 of a 0-column array).
+#[test]
+fn test_empty_batch_predict() {
+    let (x, y) = generate_regression_data(80, 4);
+    let mut model = NGBRegressor::new(10, 0.1);
+    model.fit(&x, &y).unwrap();
+
+    let empty = Array2::<f64>::zeros((0, 4));
+    let preds = model.predict(&empty);
+    assert_eq!(preds.len(), 0);
+    let dist = model.pred_dist(&empty);
+    assert_eq!(dist.params().nrows(), 0);
+}
+
+/// 2026-07-23 audit regression: classifier label validation. A -1.0 label
+/// silently trained as class 0 ({-1,+1}-encoded data corrupted with no
+/// error); a label >= n_classes PANICKED with an index error mid-fit. Both
+/// must be clean errors now.
+#[test]
+fn test_classifier_label_validation() {
+    let x = Array2::random((40, 3), Uniform::new(0.0, 1.0).unwrap());
+
+    // negative labels (SVM-style {-1, +1})
+    let y_neg = Array1::from_vec((0..40).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect());
+    let mut m = NGBClassifier::new(10, 0.1);
+    assert!(m.fit(&x, &y_neg).is_err());
+
+    // label >= K (binary classifier fed a 2.0) — used to panic
+    let y_big = Array1::from_vec((0..40).map(|i| f64::from(u8::from(i % 3 == 0)) + 1.0).collect());
+    let mut m = NGBClassifier::new(10, 0.1);
+    assert!(m.fit(&x, &y_big).is_err());
+
+    // non-integer labels
+    let y_frac = Array1::from_vec((0..40).map(|i| if i % 2 == 0 { 0.5 } else { 1.0 }).collect());
+    let mut m = NGBClassifier::new(10, 0.1);
+    assert!(m.fit(&x, &y_frac).is_err());
+
+    // valid labels still fit
+    let y_ok = Array1::from_vec((0..40).map(|i| f64::from(u8::from(i % 2 == 0))).collect());
+    let mut m = NGBClassifier::new(10, 0.1);
+    assert!(m.fit(&x, &y_ok).is_ok());
+}

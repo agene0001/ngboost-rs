@@ -120,10 +120,12 @@ pub struct HyperOptResult {
     pub best_params: HashMap<String, Value>,
     /// Best CV score (mean fold loss) achieved.
     pub best_score: f64,
-    /// `n_estimators` from the best trial (carried through verbatim — NGBoost
-    /// has its own early-stopping; we surface what was configured, not what the
-    /// best-val-loss iteration found, since fold-level early stopping isn't
-    /// inspectable through the public API yet).
+    /// Boosting rounds that actually won CV for the best trial: the mean
+    /// early-stopped iteration count across its folds (or the sampled
+    /// `n_estimators` where early stopping never triggered). `best_score` was
+    /// achieved WITH fold-level early stopping active, so refitting on full
+    /// data at the raw sampled `n_estimators` (the pre-2026-07-23 value of
+    /// this field) could badly overshoot the capacity that won.
     pub opt_rounds: usize,
     /// History of all trials, including pruned ones.
     pub trials: Vec<TrialResult>,
@@ -333,6 +335,21 @@ where
     let mut rng = StdRng::seed_from_u64(hp_seed);
     let start_time = Instant::now();
 
+    // TimeSeries CV silently fell back to KFold when there were too few rows
+    // to segment — training on future rows, exactly what the caller asked to
+    // prevent. Reject instead.
+    if matches!(config.cv_scheme, CvScheme::TimeSeries)
+        && config.n_folds > 1
+        && features.nrows() / (config.n_folds + 1) == 0
+    {
+        return Err(format!(
+            "TimeSeries CV needs at least n_folds + 1 = {} samples (got {}); a silent KFold fallback would leak future rows into training",
+            config.n_folds + 1,
+            features.nrows()
+        )
+        .into());
+    }
+
     // Build one TPE optimizer per hyperparameter dimension. Log-scaled params
     // are sampled in log-space and exponentiated when materializing the trial.
     let specs = parse_hp_specs(hp_dict)?;
@@ -378,7 +395,7 @@ where
             }
         }
 
-        let (cv_score, pruned, intermediate_scores) = cv_with_pruning(
+        let (cv_score, pruned, intermediate_scores, mean_stopped_rounds) = cv_with_pruning(
             features,
             labels,
             config.n_folds,
@@ -392,9 +409,15 @@ where
         );
 
         // Feed score back to TPE regardless of pruning so the surrogate
-        // still learns from the early-terminated region.
+        // still learns from the early-terminated region. Pruned trials report
+        // the running MEAN of the folds they completed — the same statistic
+        // completed trials report — not the last raw fold score.
         let report_score = if pruned {
-            intermediate_scores.last().copied().unwrap_or(f64::INFINITY)
+            if intermediate_scores.is_empty() {
+                f64::INFINITY
+            } else {
+                intermediate_scores.iter().sum::<f64>() / intermediate_scores.len() as f64
+            }
         } else {
             cv_score
         };
@@ -407,13 +430,16 @@ where
         if !pruned && cv_score < best_score {
             best_score = cv_score;
             best_params = trial_params.clone();
-            // Surface n_estimators from the winning trial so the caller can
-            // refit at exactly the size that won CV.
-            best_rounds = trial_params
-                .get("n_estimators")
-                .and_then(|v| v.as_i64())
-                .map(|n| n as usize)
-                .unwrap_or(0);
+            // Surface the rounds that actually won CV (mean early-stopped
+            // iteration across folds) so a refit reproduces the winning
+            // capacity; fall back to the sampled n_estimators.
+            best_rounds = mean_stopped_rounds.unwrap_or_else(|| {
+                trial_params
+                    .get("n_estimators")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n as usize)
+                    .unwrap_or(0)
+            });
         }
 
         if !pruned {
@@ -581,7 +607,7 @@ fn cv_with_pruning<D, S, B, F>(
     pruner_state: &PrunerState,
     n_completed_trials: usize,
     trial_seed: u64,
-) -> (f64, bool, Vec<f64>)
+) -> (f64, bool, Vec<f64>, Option<usize>)
 where
     D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
     S: Score + 'static,
@@ -599,6 +625,9 @@ where
     let time_series =
         matches!(cv_scheme, CvScheme::TimeSeries) && !single_holdout && ts_seg > 0;
     let mut fold_scores = Vec::with_capacity(n_iters);
+    // Boosting rounds each fold actually used (early-stopped best iteration
+    // + 1, or the full sampled count when early stopping never fired).
+    let mut fold_rounds: Vec<usize> = Vec::with_capacity(n_iters);
     let mut pruned = false;
 
     for i in 0..n_iters {
@@ -622,10 +651,15 @@ where
             let (test_start, test_end) = if single_holdout {
                 // Last 20% is the held-out validation/scoring fold.
                 (((n_samples as f64) * 0.8) as usize, n_samples)
-            } else if i == n_iters - 1 {
-                (i * fold_size, n_samples)
             } else {
-                (i * fold_size, (i + 1) * fold_size)
+                // sklearn-style sizes: the first n % k folds take one extra
+                // row so fold sizes differ by at most 1. (The old code gave
+                // the whole remainder to the last fold — up to k-1 rows of
+                // imbalance, underweighted by the unweighted fold-score mean.)
+                let rem = n_samples % n_iters;
+                let start = i * fold_size + i.min(rem);
+                let end = start + fold_size + usize::from(i < rem);
+                (start, end)
             };
 
             let test_features = features.slice(s![test_start..test_end, ..]).to_owned();
@@ -657,8 +691,14 @@ where
 
         let mut model = builder(trial_params);
         // Override the model's RNG so identical trial_params on different
-        // trial indices still get distinct fold-level randomness.
-        model.set_random_state(trial_seed.wrapping_add(i as u64));
+        // trial indices still get distinct fold-level randomness. The seed is
+        // spread splitmix-style: plain `trial_seed + i` collided across
+        // adjacent (trial, fold) pairs (trial t fold i+1 == trial t+1 fold i).
+        model.set_random_state(
+            trial_seed
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                .wrapping_add(i as u64),
+        );
 
         // Early stopping during CV: monitor the held-out fold so a trial whose
         // model converges well before its sampled `n_estimators` stops there
@@ -682,6 +722,12 @@ where
         let score = if fit_result.is_err() {
             f64::INFINITY
         } else {
+            fold_rounds.push(
+                model
+                    .best_val_loss_itr()
+                    .map(|b| b + 1)
+                    .unwrap_or(model.n_estimators as usize),
+            );
             let s = model.score(&test_features, &test_labels);
             if s.is_finite() { s } else { f64::INFINITY }
         };
@@ -706,8 +752,16 @@ where
     } else {
         fold_scores.iter().sum::<f64>() / fold_scores.len() as f64
     };
+    let mean_rounds = if fold_rounds.is_empty() {
+        None
+    } else {
+        Some(
+            (fold_rounds.iter().sum::<usize>() as f64 / fold_rounds.len() as f64).round()
+                as usize,
+        )
+    };
 
-    (final_score, pruned, fold_scores)
+    (final_score, pruned, fold_scores, mean_rounds)
 }
 
 // ============================================================================
@@ -726,6 +780,10 @@ pub fn parse_hp_specs(
 ) -> Result<Vec<HyperParamSpec>, String> {
     let mut specs = Vec::with_capacity(hp_dict.len());
 
+    // NOTE: sorted by name below — HashMap iteration order is per-process
+    // random, and every per-parameter `TpeOptimizer::ask` draws from one
+    // shared RNG in spec order, so an unsorted order made identical seeds
+    // produce different trial sequences run-to-run (2026-07-23 audit).
     for (name, value) in hp_dict {
         let spec = match value {
             Value::Array(arr) if arr.len() == 2 => {
@@ -778,6 +836,8 @@ pub fn parse_hp_specs(
         specs.push(spec);
     }
 
+    // Deterministic spec order => reproducible seeded trial sequences.
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(specs)
 }
 

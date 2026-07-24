@@ -252,25 +252,18 @@ impl StudentT {
 
 impl Scorable<LogScore> for StudentT {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
-        // Inlined Student-t log-PDF to avoid per-element StudentsTDist construction
-        use statrs::function::gamma::ln_gamma;
+        // TLogPdf inlines the same formula (same per-row ln_gamma cost) and
+        // adds the df ≥ 1e8 normal-limit branch — without it score() drifted
+        // from -logpdf() by ~2e-4 at df = 1e12 (ln_gamma cancellation).
         let mut scores = Array1::zeros(y.len());
 
         Zip::from(&mut scores)
             .and(y)
             .and(&self.loc)
             .and(&self.scale)
-            .and(&self.var)
             .and(&self.df)
-            .for_each(|s, &y_i, &loc, &scale, &var, &df| {
-                let half_df_plus_1 = (df + 1.0) / 2.0;
-                let log_normalizer = ln_gamma(half_df_plus_1)
-                    - ln_gamma(df / 2.0)
-                    - 0.5 * (df * std::f64::consts::PI).ln();
-                let diff = y_i - loc;
-                let z_sq = diff * diff / (df * var);
-                let log_pdf = log_normalizer - scale.ln() - half_df_plus_1 * (1.0 + z_sq).ln();
-                *s = -log_pdf;
+            .for_each(|s, &y_i, &loc, &scale, &df| {
+                *s = -TLogPdf::new(df).ln_pdf(y_i, loc, scale);
             });
         scores
     }
@@ -529,11 +522,26 @@ impl Scorable<CRPScore> for StudentT {
 /// where h(z) = CRPS_std(z) - z*(2F(z)-1) (the "scale gradient kernel")
 /// and Z ~ t_nu (standard t-distribution).
 ///
-/// Uses Gauss-Legendre quadrature on a tanh-sinh transformed domain.
-/// The result is independent of loc and scale.
+/// Quantile-free tan-rule quadrature (z = tan θ, midpoint over (−π/2, π/2)) —
+/// the same scheme as the 3-param CRPS metric. The previous PIT rule called
+/// statrs `inverse_cdf` 200× per invocation: the exact root-finding
+/// hang/latency class eliminated everywhere else (reachable here through
+/// `from_params_with_df` with a drifting custom df), and it carried a
+/// 1.1e-3 (ν=3) .. 6.4e-3 (ν=1.5) tail-truncation bias the tan rule removes.
+/// df is fixed for a TFixedDf model but metric() runs every boosting
+/// iteration, so the last (df, C_t) pair is memoized.
 fn compute_crps_scale_metric_constant(nu: f64) -> f64 {
     if nu <= 1.0 {
         return 1.0; // Fallback for Cauchy (CRPS undefined)
+    }
+
+    static CACHE: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((cached_nu, cached_c)) = *guard {
+            if cached_nu == nu {
+                return cached_c;
+            }
+        }
     }
 
     let std_t = match StudentsTDist::new(0.0, 1.0, nu) {
@@ -546,31 +554,27 @@ fn compute_crps_scale_metric_constant(nu: f64) -> f64 {
     let ln_b2 = ln_beta(0.5, nu / 2.0);
     let c_nu = 2.0 * nu.sqrt() * (ln_b1 - 2.0 * ln_b2).exp() / (nu - 1.0);
 
-    // Integrate h(z)^2 * f_nu(z) over (-inf, inf)
-    // Use substitution z = sinh(t) to map to finite domain, then Gauss-Legendre.
-    // Actually, simpler: use the t-distribution CDF to transform.
-    // Let u = F_nu(z), then z = F_nu^{-1}(u), dz = 1/f_nu(z) du
-    // Integral = ∫_0^1 h(F_nu^{-1}(u))^2 du
-    //
-    // This avoids density evaluation since f_nu(z)*dz = du.
-
     let n_points = 200;
+    let pi = std::f64::consts::PI;
     let mut integral = 0.0;
-
     for j in 0..n_points {
-        // Gauss-Legendre on [0, 1]: use midpoint rule with many points
-        let u = (j as f64 + 0.5) / n_points as f64;
-        let z = std_t.inverse_cdf(u);
+        let theta = -pi / 2.0 + pi * (j as f64 + 0.5) / n_points as f64;
+        let z = theta.tan();
         let f_z = std_t.pdf(z);
+        let w = f_z * (1.0 + z * z) * (pi / n_points as f64);
+        if w == 0.0 || !w.is_finite() {
+            continue; // underflowed tail node contributes nothing
+        }
 
         // h(z) = CRPS_std(z) - z*(2F(z)-1) = 2*f(z)*(nu+z^2)/(nu-1) - C_nu
         let h = 2.0 * f_z * (nu + z * z) / (nu - 1.0) - c_nu;
-
-        // The integrand is h(z)^2 * f_nu(z) dz = h(F^{-1}(u))^2 du
-        integral += h * h;
+        integral += w * h * h;
     }
 
-    integral / n_points as f64
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((nu, integral));
+    }
+    integral
 }
 
 /// d(CRPS)/d(log ν) for the t CRPS, = σ · d(CRPS_std)/d(log ν).
@@ -593,8 +597,17 @@ fn t_crps_dlognu(z: f64, nu: f64, sigma: f64) -> f64 {
     // Preserves the exact fp expression order of the previous inline code.
     let fd = |nu_c: f64| {
         let crps_plus = compute_t_crps_std(z, nu_c * (1.0 + eps));
-        let crps_minus = compute_t_crps_std(z, nu_c * (1.0 - eps));
-        sigma * nu_c * (crps_plus - crps_minus) / (2.0 * eps * nu_c)
+        // The lower leg must not cross the ν ≤ 1 sentinel: for
+        // ν ∈ (1, 1/(1−ε)] the central difference evaluated the 1e10 penalty
+        // and returned ≈ −5e15·σ garbage — sometimes with the wrong sign —
+        // while score() stayed finite (2026-07-23 audit). One-sided there.
+        if nu_c * (1.0 - eps) <= 1.0 {
+            let crps_at = compute_t_crps_std(z, nu_c);
+            sigma * (crps_plus - crps_at) / eps
+        } else {
+            let crps_minus = compute_t_crps_std(z, nu_c * (1.0 - eps));
+            sigma * nu_c * (crps_plus - crps_minus) / (2.0 * eps * nu_c)
+        }
     };
 
     const NU_SWITCH: f64 = 1000.0;
@@ -646,9 +659,21 @@ fn compute_t_crps_std(z: f64, nu: f64) -> f64 {
 ///     bisection bracket with downward expansion, HARD-capped at 100
 ///     iterations after which the bisection midpoint is returned.
 /// The result is therefore the numerical inverse of the exact same cdf users
-/// evaluate. Prototype validated 2026-07-16 against scipy.stats.t.ppf over
-/// ν ∈ {1.01 … 1e6} × q ∈ {1e-15 … 1−1e-12}: worst rel err 1.7e-15 on that
-/// grid (1.1e-13 over 3600 random ν ∈ [0.5, 1e7] points), ≤ 6 iterations.
+/// evaluate — with two guards added after the 2026-07-23 audit:
+///   * statrs' t cdf carries a noise floor (~1e-13 at ν≈1e3, ~1e-9 at ν≈1e6).
+///     On a one-signed noise plateau Newton micro-steps forever without ever
+///     moving the upper bracket, and the old exhaustion fallback
+///     `0.5*(lo+hi)` averaged with the untouched hi = 0.0 sentinel —
+///     silently returning HALF the (already converged) iterate. Now the
+///     iterate with the smallest |cdf(x)−p| seen is returned instead, and an
+///     exactly-repeated cdf residual exits early (the step is below cdf
+///     resolution, so no further progress is possible).
+///   * For ν ≥ 1e5 the Cornish–Fisher seed (error O(ν⁻⁵)) is already far
+///     more accurate than anything Newton against the noisy cdf can deliver
+///     (statrs cdf error ~1e-9 there) — it is returned directly.
+/// Accuracy: ≤ 6.7e-13 rel for ν ≤ 1e4 (audit grid vs scipy); above that,
+/// bounded by statrs cdf noise / pdf (≲1e-9 abs) until the ν ≥ 1e5 seed
+/// takeover restores near-machine accuracy.
 pub(crate) fn t_ppf_std(q: f64, nu: f64) -> f64 {
     let q = q.clamp(1e-15, 1.0 - 1e-15);
     if nu.is_infinite() && nu > 0.0 {
@@ -683,6 +708,14 @@ fn t_ppf_std_neg_half(p: f64, nu: f64) -> f64 {
     let inv_nu = 1.0 / nu;
     let mut x = (z + inv_nu * (g1 + inv_nu * (g2 + inv_nu * (g3 + inv_nu * g4)))).min(0.0);
 
+    // statrs' t cdf noise reaches ~1e-9 by ν≈5e5 while the CF expansion's own
+    // error is O(ν⁻⁵): beyond ν = 1e5 Newton against the noisy cdf can only
+    // damage the seed (and its noise plateaus used to burn all 100 iterations
+    // into the broken midpoint fallback — 2026-07-23 audit).
+    if nu >= 1e5 {
+        return x;
+    }
+
     // Seed 2 (tail): p ≈ (C/ν)·ν^{(ν+1)/2}·|t|^{−ν} with C the t pdf
     // normalizer ⇒ ln|t| = (ln C + ((ν−1)/2)·ln ν − ln p) / ν.
     if p < 0.25 {
@@ -715,11 +748,24 @@ fn t_ppf_std_neg_half(p: f64, nu: f64) -> f64 {
     let eps4 = 4.0 * f64::EPSILON;
     let mut lo = f64::NEG_INFINITY; // no lower bracket endpoint known yet
     let mut hi = 0.0; // F(0) = 0.5 ≥ p always
+    let mut best_x = x;
+    let mut best_af = f64::INFINITY;
+    let mut prev_f = f64::NAN;
     for _ in 0..100 {
         let f = std_t.cdf(x) - p;
         if f == 0.0 {
             return x;
         }
+        if f.abs() < best_af {
+            best_af = f.abs();
+            best_x = x;
+        }
+        // An exactly-repeated residual means the step fell below the cdf's
+        // resolution (noise plateau): no further progress is possible.
+        if f == prev_f {
+            return best_x;
+        }
+        prev_f = f;
         if f > 0.0 {
             hi = x;
         } else {
@@ -754,7 +800,14 @@ fn t_ppf_std_neg_half(p: f64, nu: f64) -> f64 {
         }
         x = xn;
     }
-    if lo.is_finite() { 0.5 * (lo + hi) } else { x }
+    // Exhaustion: the best evaluated iterate always beats an unevaluated
+    // bisection midpoint (and NEVER average with the hi = 0.0 sentinel —
+    // that returned half the true quantile on cdf-noise plateaus).
+    if std_t.cdf(x).is_finite() && (std_t.cdf(x) - p).abs() < best_af {
+        x
+    } else {
+        best_x
+    }
 }
 
 /// df-dependent constants for the inlined Student-t log-pdf: the same formula
@@ -941,7 +994,8 @@ impl RegressionDistn for TFixedDf {}
 
 impl DistributionMethods for TFixedDf {
     fn mean(&self) -> Array1<f64> {
-        // Mean is loc for df > 1; undefined (NaN, scipy convention) for df <= 1.
+        // Mean is loc for df > 1; undefined for df <= 1 — we return NaN (the
+        // mathematically honest answer; note scipy.stats.t returns inf there).
         // df=3 by default, but from_params_with_df allows any df.
         let mut result = self.loc.clone();
         for i in 0..result.len() {
@@ -954,7 +1008,7 @@ impl DistributionMethods for TFixedDf {
 
     fn variance(&self) -> Array1<f64> {
         // Variance is scale^2 * df / (df - 2) for df > 2, infinite for
-        // 1 < df <= 2, undefined (NaN, scipy convention) for df <= 1.
+        // 1 < df <= 2, undefined for df <= 1 — we return NaN (scipy returns inf).
         let mut result = Array1::zeros(self.loc.len());
         for i in 0..self.loc.len() {
             result[i] = if self.df[i] > 2.0 {
@@ -1411,7 +1465,8 @@ impl RegressionDistn for TFixedDfFixedVar {}
 
 impl DistributionMethods for TFixedDfFixedVar {
     fn mean(&self) -> Array1<f64> {
-        // Mean is loc for df > 1; undefined (NaN, scipy convention) for df <= 1.
+        // Mean is loc for df > 1; undefined for df <= 1 — we return NaN (the
+        // mathematically honest answer; note scipy.stats.t returns inf there).
         let mut result = self.loc.clone();
         for i in 0..result.len() {
             if self.df[i] <= 1.0 {
@@ -1640,6 +1695,61 @@ impl Scorable<LogScore> for TFixedDfFixedVar {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// 2026-07-23 audit regression: on statrs t-cdf noise plateaus (ν ≳ 800)
+    /// the Newton loop's upper bracket never moved off its hi = 0.0 sentinel
+    /// and the exhaustion fallback `0.5*(lo+hi)` returned HALF the true
+    /// quantile (0.10522 instead of 0.21041 at ν=806.92, q=0.5833). Near-
+    /// median quantiles at large ν were also noise-dominated (abs err 4.6e-6
+    /// at ν=1e5). Pins scipy.stats.t.ppf truths across both failing regimes
+    /// plus surrounding coverage; all previously failed, all must now agree.
+    #[test]
+    fn test_t_ppf_std_noise_plateau_regression() {
+        let cases: [(f64, f64, f64); 12] = [
+            (806.92, 0.5833, 0.21041103450421875),
+            (1713791.56, 0.29001844, -0.5533309555558769),
+            (6.8e6, 0.25, -0.6744897862747489),
+            (1e5, 0.500001, 2.5066345412842254e-6),
+            (1e6, 0.499999, -2.5066289012237065e-6),
+            (1e8, 0.4, -0.2533471038098203),
+            (1e5, 0.01, -2.3263851653552683),
+            (2e5, 0.999, 3.0902730573051986),
+            (900.0, 0.42, -0.20195185609511526),
+            (1200.0, 0.75, 0.6746942511662576),
+            (850.0, 1e-6, -4.786612562082759),
+            (5e4, 0.3, -0.5244038557675486),
+        ];
+        for (nu, q, truth) in cases {
+            let got = t_ppf_std(q, nu);
+            let rel = ((got - truth) / truth).abs();
+            assert!(
+                rel < 1e-7,
+                "t_ppf_std({q}, {nu}) = {got:e}, scipy = {truth:e}, rel = {rel:e}"
+            );
+        }
+    }
+
+    /// 2026-07-23 audit regression: for ν ∈ (1, ≈1.0000010] the central-FD
+    /// lower leg crossed the ν ≤ 1 CRPS sentinel (1e10) and the "gradient"
+    /// became ≈ −5.0e15·σ (true value ~0.35, sign sometimes flipped) while
+    /// score() stayed finite. The guarded one-sided FD must stay sane.
+    #[test]
+    fn test_studentt_crps_df_gradient_sentinel_window() {
+        for nu in [1.0000005_f64, 1.0000009, 1.0000011, 1.000002] {
+            for z in [-3.0_f64, -1.0, 0.5] {
+                let params =
+                    Array2::from_shape_vec((1, 3), vec![0.0, 0.0, nu.ln()]).unwrap();
+                let dist = StudentT::from_params(&params);
+                let y = Array1::from_vec(vec![z]);
+                let d = Scorable::<CRPScore>::d_score(&dist, &y);
+                let got = d[[0, 2]];
+                assert!(
+                    got.is_finite() && got.abs() < 10.0,
+                    "nu={nu}, z={z}: d/dlognu = {got:e} (sentinel contamination)"
+                );
+            }
+        }
+    }
 
     /// Pins 50-digit mpmath truths for d(CRPS)/d(log ν) at σ=1, z=−1.
     /// The old raw FD SIGN-FLIPS at ν=1e4 (−2.68e-7 vs true +9.71e-7) and

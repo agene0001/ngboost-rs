@@ -427,6 +427,15 @@ where
                 self.tikhonov_reg,
             );
 
+            // Same guard as NGBoost::fit_internal: non-finite gradients mean
+            // degenerate distribution parameters and would propagate silently
+            // through every downstream stage. Fail loudly.
+            if grads_sampled.iter().any(|g| !g.is_finite()) {
+                return Err(
+                    "training diverged: non-finite gradients (degenerate distribution parameters, e.g. a scale collapsing to zero on constant targets)",
+                );
+            }
+
             // Fit base learners for each parameter in parallel (matches the
             // main NGBoost training loop's rayon strategy)
             let weight_ref: Option<&Array1<f64>> = weights_sampled.as_ref().map(|w| w.as_ref());
@@ -753,12 +762,15 @@ where
     }
 
     fn get_params(&self, x: &Array2<f64>) -> Array2<f64> {
-        if x.nrows() == 0 {
-            return Array2::zeros((0, 0));
-        }
-
-        let init_params = self.init_params.as_ref().unwrap();
+        let init_params = self
+            .init_params
+            .as_ref()
+            .expect("Model has not been fitted. Call fit() before predict().");
         let n_params = init_params.len();
+        if x.nrows() == 0 {
+            // Must keep the parameter dimension: from_params indexes columns.
+            return Array2::zeros((0, n_params));
+        }
         let mut params = Array2::from_elem((x.nrows(), n_params), 0.0);
         params
             .outer_iter_mut()
@@ -869,14 +881,23 @@ where
         self.pred_dist(x).predict()
     }
 
-    /// Compute the survival function S(t) = P(T > t) at given times.
-    pub fn predict_survival(&self, x: &Array2<f64>, _times: &Array1<f64>) -> Array2<f64> {
-        // For now, just return predictions - full survival curves would need
-        // distribution-specific implementation
-        let preds = self.predict(x);
+    /// Compute the survival function S(t) = P(T > t) at the given times.
+    ///
+    /// Returns an `(n_samples, n_times)` matrix: entry `(i, j)` is
+    /// `S(times[j])` under sample `i`'s predicted distribution.
+    /// (Before 2026-07-23 this was a stub that ignored `times` and returned
+    /// the distribution means — not probabilities at all.)
+    pub fn predict_survival(&self, x: &Array2<f64>, times: &Array1<f64>) -> Array2<f64>
+    where
+        D: crate::dist::DistributionMethods,
+    {
+        let dist = self.pred_dist(x);
         let n_samples = x.nrows();
-        let mut result = Array2::zeros((n_samples, 1));
-        result.column_mut(0).assign(&preds);
+        let mut result = Array2::zeros((n_samples, times.len()));
+        for (j, &t) in times.iter().enumerate() {
+            let col = dist.sf(&Array1::from_elem(n_samples, t));
+            result.column_mut(j).assign(&col);
+        }
         result
     }
 

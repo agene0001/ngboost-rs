@@ -34,6 +34,13 @@ impl Distribution for Exponential {
         1
     }
 
+    fn validate_targets(y: &Array1<f64>) -> Result<(), &'static str> {
+        if y.iter().any(|&v| !(v >= 0.0)) {
+            return Err("Exponential targets must be non-negative");
+        }
+        Ok(())
+    }
+
     fn predict(&self) -> Array1<f64> {
         // Mean is 1/rate
         1.0 / &self.rate

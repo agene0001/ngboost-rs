@@ -1,7 +1,7 @@
 use crate::dist::{Distribution, DistributionMethods, RegressionDistn};
 use crate::scores::{CRPScore, LogScore, Scorable};
 use ndarray::{Array1, Array2, Array3, Zip, array};
-use rand::prelude::*;
+
 use statrs::distribution::{Continuous, ContinuousCDF, Normal as NormalDist};
 use statrs::statistics::Statistics;
 
@@ -487,15 +487,21 @@ impl DistributionMethods for NormalFixedVar {
     }
 
     fn sample(&self, n_samples: usize) -> Array2<f64> {
+        // Box-Muller like the full Normal's sample(): the old
+        // `inverse_cdf(rng.random())` path could draw u = 0.0 exactly
+        // (probability 2^-53 per draw) and emit a -inf sample.
         let n_obs = self.loc.len();
         let mut samples = Array2::zeros((n_samples, n_obs));
         let mut rng = rand::rng();
+        let mut z = crate::vmath::StdNormalSampler::new();
 
         for i in 0..n_obs {
-            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            let (loc, scale) = (self.loc[i], self.scale[i]);
+            if !(loc.is_finite() && scale.is_finite() && scale > 0.0) {
+                continue;
+            }
             for s in 0..n_samples {
-                let u: f64 = rng.random();
-                samples[[s, i]] = d.inverse_cdf(u);
+                samples[[s, i]] = loc + scale * z.next(&mut rng);
             }
         }
         samples
@@ -724,15 +730,21 @@ impl DistributionMethods for NormalFixedMean {
     }
 
     fn sample(&self, n_samples: usize) -> Array2<f64> {
+        // Box-Muller like the full Normal's sample(): the old
+        // `inverse_cdf(rng.random())` path could draw u = 0.0 exactly
+        // (probability 2^-53 per draw) and emit a -inf sample.
         let n_obs = self.loc.len();
         let mut samples = Array2::zeros((n_samples, n_obs));
         let mut rng = rand::rng();
+        let mut z = crate::vmath::StdNormalSampler::new();
 
         for i in 0..n_obs {
-            let d = NormalDist::new(self.loc[i], self.scale[i]).unwrap();
+            let (loc, scale) = (self.loc[i], self.scale[i]);
+            if !(loc.is_finite() && scale.is_finite() && scale > 0.0) {
+                continue;
+            }
             for s in 0..n_samples {
-                let u: f64 = rng.random();
-                samples[[s, i]] = d.inverse_cdf(u);
+                samples[[s, i]] = loc + scale * z.next(&mut rng);
             }
         }
         samples

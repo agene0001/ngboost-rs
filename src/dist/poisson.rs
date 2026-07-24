@@ -25,6 +25,15 @@ impl Distribution for Poisson {
         1
     }
 
+    fn validate_targets(y: &Array1<f64>) -> Result<(), &'static str> {
+        // ln_gamma(y + 1) is NaN for y <= -1 and the count interpretation
+        // needs y >= 0 (non-integer y is permitted, as in Python).
+        if y.iter().any(|&v| !(v >= 0.0)) {
+            return Err("Poisson targets must be non-negative");
+        }
+        Ok(())
+    }
+
     fn predict(&self) -> Array1<f64> {
         self.rate.clone()
     }
@@ -296,6 +305,15 @@ fn poisson_tables(lambda: f64, k_max: i64) -> (Vec<f64>, Vec<f64>) {
     (pmf, cdf)
 }
 
+/// Hard cap on CRPS pmf/cdf table length (~80 MB per table): a single
+/// y = 1e9 observation used to allocate two 8 GB tables, and y ≈ 1e15
+/// aborted on capacity (2026-07-23 audit). When the cap binds because y is
+/// huge, the truncated range k in (k_max, y) has F(k) saturated at ≈ 1
+/// (k_max still covers λ + 6σ), so the score handles it analytically; when
+/// it binds because λ itself exceeds the cap, results degrade gracefully
+/// instead of OOMing.
+const POISSON_CRPS_MAX_TABLE: i64 = 10_000_000;
+
 /// CRPS metric value for a single rate λ: M = Σ_y g(y)² · P(Y=y), where
 /// g(y) = λ · dCRPS/dλ = 2λ·(Σ_{k≥y} pmf(k) − Σ_k F(k)·pmf(k)).
 ///
@@ -303,9 +321,13 @@ fn poisson_tables(lambda: f64, k_max: i64) -> (Vec<f64>, Vec<f64>) {
 /// replacing the previous O(k_max²) nested loop with per-element cdf calls.
 fn poisson_crps_metric_value(lambda: f64) -> f64 {
     let std_dev = lambda.sqrt();
-    let y_max = ((lambda + 8.0 * std_dev).ceil() as i64).max(5);
+    let y_max = ((lambda + 8.0 * std_dev).ceil() as i64)
+        .max(5)
+        .min(POISSON_CRPS_MAX_TABLE - 10);
     // Largest inner truncation over all y: max(λ+6σ, y_max+10)
-    let k_total = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_max + 10);
+    let k_total = ((lambda + 6.0 * std_dev).ceil() as i64)
+        .max(y_max + 10)
+        .min(POISSON_CRPS_MAX_TABLE);
 
     let (pmf, cdf) = poisson_tables(lambda, k_total);
     let len = pmf.len();
@@ -371,7 +393,9 @@ impl Scorable<CRPScore> for Poisson {
 
             // Cover most of the probability mass: mean + 6σ (>99.99%)
             let std_dev = lambda.sqrt();
-            let k_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_i + 10);
+            let k_max = ((lambda + 6.0 * std_dev).ceil() as i64)
+                .max(y_i + 10)
+                .min(POISSON_CRPS_MAX_TABLE);
             let (_, cdf) = poisson_tables(lambda, k_max);
 
             let mut crps = 0.0;
@@ -379,6 +403,13 @@ impl Scorable<CRPScore> for Poisson {
                 let indicator = if y_i <= k as i64 { 1.0 } else { 0.0 };
                 let diff = f_k - indicator;
                 crps += diff * diff;
+            }
+            // Capped-table tail: for k_max < k < y the cdf has saturated at
+            // ≈ 1 (guard: k_max still covers λ + 6σ), so each (F(k) − 0)²
+            // term contributes ≈ 1. Bit-identical to the old code whenever
+            // the cap doesn't bind (then k_max ≥ y + 10 > y - 1).
+            if y_i - 1 > k_max && (k_max as f64) >= lambda + 6.0 * std_dev {
+                crps += (y_i - 1 - k_max) as f64;
             }
             scores[i] = crps;
         }
@@ -397,7 +428,11 @@ impl Scorable<CRPScore> for Poisson {
             let y_i = y[i].round() as i64;
 
             let std_dev = lambda.sqrt();
-            let k_max = ((lambda + 6.0 * std_dev).ceil() as i64).max(y_i + 10);
+            // Same cap as score(); the truncated tail's gradient terms carry
+            // pmf(k) ≤ pmf(k_max) ≈ 0, so no analytic correction is needed.
+            let k_max = ((lambda + 6.0 * std_dev).ceil() as i64)
+                .max(y_i + 10)
+                .min(POISSON_CRPS_MAX_TABLE);
             let (pmf, cdf) = poisson_tables(lambda, k_max);
 
             let mut d_crps = 0.0;

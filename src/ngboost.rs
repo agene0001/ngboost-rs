@@ -553,6 +553,12 @@ where
         self.val_loss_monitor = Some(monitor);
     }
 
+    /// Best validation iteration observed during the last fit with early
+    /// stopping (global index across partial fits), if any.
+    pub fn best_val_loss_itr(&self) -> Option<usize> {
+        self.best_val_loss_itr
+    }
+
     pub fn fit(&mut self, x: &Array2<f64>, y: &Array1<f64>) -> Result<(), &'static str> {
         self.fit_with_validation(x, y, None, None, None, None)
     }
@@ -611,8 +617,13 @@ where
         if self.col_sample <= 0.0 || self.col_sample > 1.0 {
             return Err("col_sample must be in (0, 1]");
         }
-        if self.tol < 0.0 {
+        if !(self.tol >= 0.0) {
             return Err("tol must be non-negative");
+        }
+        if self.early_stopping_rounds == Some(0) {
+            // rounds = 0 would make the sliding-window minimum fold over an
+            // empty slice (INFINITY) and stop after exactly one iteration.
+            return Err("early_stopping_rounds must be > 0");
         }
         if self.validation_fraction < 0.0 || self.validation_fraction >= 1.0 {
             return Err("validation_fraction must be in [0, 1)");
@@ -689,6 +700,25 @@ where
         if y.iter().any(|&v| !v.is_finite()) {
             return Err("Input y contains NaN or infinite values");
         }
+        D::validate_targets(y)?;
+        if let Some(yv) = y_val {
+            D::validate_targets(yv)?;
+        }
+        // Degenerate weights silently poison every weighted mean downstream
+        // (0/0 = NaN losses reported as Ok, dead line search); reject up front.
+        for (w, n) in [(sample_weight, y.len()), (val_sample_weight, y_val.map_or(0, |v| v.len()))] {
+            if let Some(w) = w {
+                if w.len() != n {
+                    return Err("sample_weight length must match the number of samples");
+                }
+                if w.iter().any(|&v| !v.is_finite() || v < 0.0) {
+                    return Err("sample_weight contains negative or non-finite values");
+                }
+                if w.sum() <= 0.0 {
+                    return Err("sample_weight must have a positive sum");
+                }
+            }
+        }
 
         // Match Python: with early stopping on explicit validation data, the
         // weighting of train and validation losses must be consistent —
@@ -718,6 +748,22 @@ where
         // holds the most recent run's loss curves, not a cumulative history.
         self.evals_result = EvalsResult::default();
         self.n_features = Some(x.ncols());
+
+        // A full fit with early stopping but no possible validation data
+        // would silently train all n_estimators with best_val_loss_itr =
+        // None. Only rejected for `fit` (reset_state): a partial_fit without
+        // validation after an early-stopped fit is a legitimate incremental
+        // workflow — early stopping simply doesn't run on that call.
+        if reset_state
+            && self.early_stopping_rounds.is_some()
+            && x_val.is_none()
+            && y_val.is_none()
+            && self.validation_fraction <= 0.0
+        {
+            return Err(
+                "early_stopping_rounds is set but there is no validation data: pass a validation set or validation_fraction > 0",
+            );
+        }
 
         // Handle automatic validation split if early stopping is enabled
         let (x_train, y_train, x_val_auto, y_val_auto, train_weight_auto, val_weight_auto) = if self
@@ -922,6 +968,17 @@ where
             } else {
                 Scorable::grad(&batch_dist, y_sampled_ref, self.natural_gradient)
             };
+
+            // A non-finite gradient means the distribution parameters have
+            // degenerated (e.g. a scale driven to 0 on constant targets);
+            // every downstream stage propagates it silently and the line
+            // search can then never find a finite score (2026-07-23 audit:
+            // reproducible infinite hang on constant-y fits). Fail loudly.
+            if grads.iter().any(|g| !g.is_finite()) {
+                return Err(
+                    "training diverged: non-finite gradients (degenerate distribution parameters, e.g. a scale collapsing to zero on constant targets)",
+                );
+            }
 
             // Fit base learners for each parameter in parallel using rayon
             let grad_cols: Vec<Array1<f64>> =
@@ -1311,15 +1368,15 @@ where
     }
 
     fn get_params_at(&self, x: &Array2<f64>, max_iter: Option<usize>) -> Array2<f64> {
-        if x.nrows() == 0 {
-            return Array2::zeros((0, 0));
-        }
-
         let init_params = self
             .init_params
             .as_ref()
             .expect("Model has not been fitted. Call fit() before predict().");
         let n_params = init_params.len();
+        if x.nrows() == 0 {
+            // Must keep the parameter dimension: from_params indexes columns.
+            return Array2::zeros((0, n_params));
+        }
         let mut params = Array2::from_elem((x.nrows(), n_params), 0.0);
         params
             .outer_iter_mut()
@@ -1431,6 +1488,13 @@ where
         self.get_params_at(x, self.best_stage_count())
     }
 
+    /// Predict the full distribution for each row.
+    ///
+    /// NaN policy: `fit` rejects NaN in X, but prediction accepts it — a NaN
+    /// feature value fails every `value < threshold` test and deterministically
+    /// routes to the RIGHT child at each split (LightGBM-style default
+    /// direction). Serving pipelines that need strictness should validate
+    /// inputs themselves.
     pub fn pred_dist(&self, x: &Array2<f64>) -> D {
         let params = self.get_params(x);
         D::from_params(&params)
@@ -1658,15 +1722,21 @@ where
     }
 
     /// Calibrate uncertainty by rescaling every predicted scale so the mean
-    /// predicted variance on validation data matches the empirical squared
-    /// error of the point predictions (which folds in bias — a biased model
-    /// gets wider intervals, as it should).
+    /// predicted `exp(2·params[:,1])` on validation data matches the
+    /// empirical squared error of the point predictions (which folds in
+    /// bias — a biased model gets wider intervals, as it should).
     ///
-    /// Only meaningful for location-scale distributions whose second internal
-    /// parameter is a log-scale (Normal, Laplace, LogNormal, Cauchy, ...):
-    /// the shift to `init_params[1]` multiplies every predicted scale by a
-    /// constant factor. For other parameterizations (e.g. Gamma's log-rate)
-    /// this would distort the predicted mean instead — do not use it there.
+    /// The identity "post-shift mean predicted variance = validation MSE" is
+    /// exact only for NORMAL-type fits, where the predictive variance is
+    /// `exp(2·params[:,1])` in the same space as y. It is approximate (and
+    /// systematically off) elsewhere: Laplace variance is 2b², so calibrated
+    /// intervals land √2 too wide; LogNormal's `exp(2·params[:,1])` is the
+    /// LOG-space variance, dimensionally mismatched with the y-space MSE;
+    /// Cauchy has no variance and its MSE is outlier-dominated. The shift is
+    /// still a pure multiplicative scale recalibration for any log-scale
+    /// second parameter, but only Normal hits the stated target exactly. For
+    /// non-scale parameterizations (e.g. Gamma's log-rate) it would distort
+    /// the predicted mean instead — do not use it there.
     pub fn calibrate_uncertainty(
         &mut self,
         x_val: &Array2<f64>,
@@ -1812,7 +1882,14 @@ where
             .map(|row| row.iter().map(|&x| x * x).sum::<f64>().sqrt())
             .sum();
 
-        // Scale down phase: find a step that actually reduces loss
+        // Scale down phase: find a step that actually reduces loss. Bounded:
+        // with non-finite resids `norm` is NaN/Inf forever (NaN < tol is
+        // false; at scale = 0.0, 0.0·inf = NaN) and no score is ever finite,
+        // so an unbounded loop hangs (2026-07-23 audit: reproduced on
+        // constant-y fits before the fit-loop gradient guard existed). Cap
+        // the halvings — 2⁻¹²⁸ is far below any meaningful step, and normal
+        // runs use fewer than 20.
+        let mut halvings = 0;
         loop {
             let norm = if n_rows == 0 {
                 0.0
@@ -1829,6 +1906,11 @@ where
                 .map(|&(_, sc)| sc)
                 .unwrap_or_else(|| compute_score_at_scale(&mut next_params, scale));
             if score.is_finite() && score < initial_score {
+                break;
+            }
+            halvings += 1;
+            if halvings > 128 {
+                scale = 0.0;
                 break;
             }
             scale *= 0.5;

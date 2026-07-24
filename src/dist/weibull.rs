@@ -88,6 +88,13 @@ impl Distribution for Weibull {
         2
     }
 
+    fn validate_targets(y: &Array1<f64>) -> Result<(), &'static str> {
+        if y.iter().any(|&v| !(v >= 0.0)) {
+            return Err("Weibull targets must be non-negative");
+        }
+        Ok(())
+    }
+
     fn predict(&self) -> Array1<f64> {
         // Mean of Weibull is scale * Gamma(1 + 1/shape)
         let mut means = Array1::zeros(self.shape.len());
@@ -305,7 +312,10 @@ impl Scorable<LogScore> for Weibull {
             .and(&self.shape)
             .and(&self.scale)
             .for_each(|s, &y_i, &k, &lam| {
-                let ratio = y_i / lam;
+                // Same y-floor as the censored branch and CRPS: at y = 0 the
+                // raw formula gives 0·ln(0) = NaN when k = 1 and ±inf
+                // otherwise, with an inf gradient below.
+                let ratio = y_i.max(1e-10) / lam;
                 let log_pdf = k.ln() - lam.ln() + (k - 1.0) * ratio.ln() - ratio.powf(k);
                 *s = -log_pdf;
             });
@@ -321,7 +331,8 @@ impl Scorable<LogScore> for Weibull {
             .and(&self.shape)
             .and(&self.scale)
             .for_each(|mut row, &y_i, &k, &lam| {
-                let ratio = y_i / lam;
+                // y-floor consistent with score (see above).
+                let ratio = y_i.max(1e-10) / lam;
                 let ratio_k = ratio.powf(k);
                 let shared_term = k * (ratio_k - 1.0);
 

@@ -489,3 +489,40 @@ fn test_survival_early_stopping_weight_mismatch_is_an_error() {
         "train weights without val weights under early stopping must error (Python parity)"
     );
 }
+
+/// 2026-07-23 audit regression: predict_survival was a stub that ignored the
+/// times argument and returned distribution MEANS under an S(t) docstring.
+/// It must return (n_samples, n_times) probabilities, monotone
+/// non-increasing in t, matching 1 - cdf.
+#[test]
+fn test_predict_survival_is_a_survival_function() {
+    let (x, time, event) = generate_survival_data(150, 4, 0.3, 42);
+    let mut model =
+        NGBSurvival::<LogNormal, LogScoreCensored, _>::new(30, 0.1, default_tree_learner());
+    model.fit(&x, &time, &event).unwrap();
+
+    let times = Array1::from_vec(vec![0.1, 0.5, 1.0, 2.0, 5.0, 20.0]);
+    let surv = model.predict_survival(&x, &times);
+    assert_eq!(surv.shape(), &[x.nrows(), times.len()]);
+
+    for i in 0..x.nrows() {
+        for j in 0..times.len() {
+            let s = surv[[i, j]];
+            assert!((0.0..=1.0).contains(&s), "S out of [0,1]: {s}");
+            if j > 0 {
+                assert!(
+                    s <= surv[[i, j - 1]] + 1e-12,
+                    "S must be non-increasing in t (row {i})"
+                );
+            }
+        }
+    }
+
+    // Spot-check against the distribution's own sf at one time.
+    let dist = model.pred_dist(&x);
+    use ngboost_rs::dist::DistributionMethods;
+    let sf1 = dist.sf(&Array1::from_elem(x.nrows(), 1.0));
+    for i in 0..x.nrows() {
+        assert!((surv[[i, 2]] - sf1[i]).abs() < 1e-12);
+    }
+}

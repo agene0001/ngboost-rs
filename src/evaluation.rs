@@ -211,7 +211,8 @@ pub struct PITHistogramData {
     pub bin_edges: Array1<f64>,
     /// Density values for each bin.
     pub densities: Array1<f64>,
-    /// Expected uniform density (1 / (n_bins)).
+    /// Expected density under uniformity: 1.0, since densities are normalized
+    /// as count/n * n_bins (not the raw per-bin probability 1/n_bins).
     pub expected_density: f64,
 }
 
@@ -312,15 +313,22 @@ pub fn calibration_curve_data(
 /// Calculate Harrell's C-statistic (concordance index) with censoring support.
 ///
 /// The concordance index measures the ability of a model to correctly rank
-/// pairs of observations by their predicted risk/time.
+/// pairs of observations by their predicted risk.
 ///
-/// # Comparable Pairs
-/// - Both uncensored: can compare
-/// - One censored, one not: can compare if censored time > uncensored time
-/// - Both censored: cannot compare
+/// # Comparable Pairs (standard Harrell, matches lifelines)
+/// - Both uncensored: comparable iff times differ.
+/// - One censored, one not: comparable if the censored time is > the event
+///   time, or equal to it (the event is known to precede the censoring).
+/// - Both censored: never comparable.
+///
+/// A comparable pair is concordant (credit 1.0) when the earlier-event
+/// observation has the strictly higher prediction; exactly-equal predictions
+/// (f64 `==`) receive 0.5 credit.
 ///
 /// # Arguments
-/// * `predictions` - Predicted risk scores or times (higher = higher risk).
+/// * `predictions` - Predicted risk scores (higher = higher risk). Predicted
+///   survival TIMES (e.g. `NGBSurvival::predict`) have the opposite
+///   orientation — negate them before calling, or the result is ≈ 1 − C.
 /// * `times` - Observed times to event or censoring.
 /// * `events` - Event indicators (true = event occurred, false = censored).
 ///
@@ -378,18 +386,20 @@ pub fn concordance_index(
 
 /// General-path concordance counts via a Fenwick (binary indexed) tree: O(n log n).
 ///
-/// Semantics are exactly those of the naive pairwise loop over time-sorted pairs
-/// (i earlier, j later):
-/// - comparable iff `events[i] && times[i] < times[j]` (exact f64 `<`)
+/// Standard Harrell semantics over pairs (event i, other j):
+/// - comparable iff `events[i] && (times[i] < times[j] ||
+///   (times[i] == times[j] && !events[j]))` (exact f64 comparisons) —
+///   an event at t precedes a censoring at the same t
 /// - concordant (+1) iff `p_i > p_j`
-/// - tie credit (+0.5) iff `!(p_i > p_j) && (p_i - p_j).abs() < 1e-10`
+/// - tie credit (+0.5) iff `p_i == p_j` (exact equality; the pre-2026-07-23
+///   1e-10 window was non-transitive and deviated from Harrell/lifelines)
 ///
-/// Observations are swept in descending time order; each equal-time group (f64 `==`,
-/// so -0.0 and +0.0 group together, matching `<`) is fully queried before being
-/// inserted, so tied-time pairs never count. Predicates on prediction values are
-/// evaluated verbatim on the sorted unique prediction values via `partition_point`
-/// (they are monotone in v), so the epsilon window `(p_i - v).abs() < 1e-10` is
-/// reproduced with the exact same floating-point subtraction as the pairwise loop.
+/// Observations are swept in descending time order. Each equal-time group is
+/// queried against the already-inserted (strictly later) observations first;
+/// then its censored members are inserted and each event in the group is
+/// counted against exactly those same-time censored members (as the delta of
+/// a second query), then the event members are inserted — so tied-time
+/// event/event pairs never count.
 ///
 /// Returns `(concordant_pairs, tie_credit_pairs, comparable_pairs)` as raw counts.
 /// Callers must reject NaN inputs first.
@@ -427,8 +437,22 @@ fn concordance_counts_censored_fenwick(
     let mut ties: u64 = 0;
     let mut comparable: u64 = 0;
 
-    // Sweep groups of `==`-equal times in descending time order. The BIT holds
-    // exactly the observations with strictly later time (`times[i] < times[j]`).
+    let bit_insert = |tree: &mut Vec<u64>, p: f64, uniq: &[f64]| {
+        let mut rank = uniq.partition_point(|&v| v < p) + 1;
+        while rank < tree.len() {
+            tree[rank] += 1;
+            rank += rank & rank.wrapping_neg();
+        }
+    };
+
+    // Per-group scratch: (lo, hi, prefix_lo, prefix_hi) for each event in the
+    // current time group, so the same-time-censored contribution can be taken
+    // as a query delta.
+    let mut event_queries: Vec<(usize, usize, u64, u64)> = Vec::new();
+
+    // Sweep groups of `==`-equal times in descending time order (-0.0 and
+    // +0.0 group together, matching `<`). The BIT holds exactly the
+    // observations with strictly later time.
     let mut pos = n;
     while pos > 0 {
         let t = times[indices[pos - 1]];
@@ -436,35 +460,59 @@ fn concordance_counts_censored_fenwick(
         while start > 0 && times[indices[start - 1]] == t {
             start -= 1;
         }
+        let group = &indices[start..pos];
 
-        // Query phase: every already-inserted j is comparable with each event i here.
-        for &i in &indices[start..pos] {
+        // Phase 1: every already-inserted j (strictly later time) is
+        // comparable with each event i here.
+        event_queries.clear();
+        for &i in group {
             if events[i] {
                 let p_i = predictions[i];
                 comparable += inserted;
 
                 // Concordant: p_j < p_i (identical to p_i > p_j).
                 let lo = uniq.partition_point(|&v| v < p_i);
-                // Tie credit: p_j >= p_i within the epsilon window. The predicate is
-                // the verbatim pairwise test and is monotone in v, so partition_point
-                // finds the exact boundary.
-                let hi = uniq.partition_point(|&v| v < p_i || (p_i - v).abs() < 1e-10);
+                // Tie credit: p_j == p_i (exact equality; monotone in v).
+                let hi = uniq.partition_point(|&v| v <= p_i);
 
                 let below = bit_prefix(&tree, lo);
+                let upto = bit_prefix(&tree, hi);
                 concordant += below;
-                ties += bit_prefix(&tree, hi) - below;
+                ties += upto - below;
+                event_queries.push((lo, hi, below, upto));
             }
         }
 
-        // Insert phase: the whole group enters the BIT only after all its queries,
-        // so tied-time pairs are never counted.
-        for &j in &indices[start..pos] {
-            let mut rank = uniq.partition_point(|&v| v < predictions[j]) + 1;
-            while rank < tree.len() {
-                tree[rank] += 1;
-                rank += rank & rank.wrapping_neg();
+        // Phase 2: insert the group's censored members, then count each event
+        // in the group against exactly them (an event at t precedes a
+        // censoring at the same t — standard Harrell comparability). The
+        // delta against the phase-1 prefixes isolates the same-time censored
+        // contribution.
+        let mut censored_here: u64 = 0;
+        for &j in group {
+            if !events[j] {
+                bit_insert(&mut tree, predictions[j], &uniq);
+                inserted += 1;
+                censored_here += 1;
             }
-            inserted += 1;
+        }
+        if censored_here > 0 && !event_queries.is_empty() {
+            for &(lo, hi, below1, upto1) in &event_queries {
+                comparable += censored_here;
+                let below2 = bit_prefix(&tree, lo);
+                let upto2 = bit_prefix(&tree, hi);
+                concordant += below2 - below1;
+                ties += (upto2 - upto1) - (below2 - below1);
+            }
+        }
+
+        // Phase 3: event members enter the BIT only now, so tied-time
+        // event/event pairs are never counted.
+        for &j in group {
+            if events[j] {
+                bit_insert(&mut tree, predictions[j], &uniq);
+                inserted += 1;
+            }
         }
 
         pos = start;
@@ -501,22 +549,23 @@ fn concordance_counts_censored_bruteforce(
             let t_j = times[j];
             let p_j = predictions[j];
 
-            let comparable = if e_i && e_j {
-                t_i < t_j
-            } else if e_i && !e_j {
-                t_i < t_j
+            // Standard Harrell: the event observation is the "earlier" member
+            // of a comparable pair. In this time-ascending sweep t_i <= t_j;
+            // at exactly-tied times an event precedes a censoring regardless
+            // of sort position, so both role assignments must be checked.
+            let (event_p, other_p) = if e_i && (t_i < t_j || (t_i == t_j && !e_j)) {
+                (p_i, p_j)
+            } else if e_j && t_i == t_j && !e_i {
+                (p_j, p_i)
             } else {
-                false
+                continue;
             };
 
-            if comparable {
-                total_comparable += 1.0;
-
-                if p_i > p_j {
-                    concordant += 1.0;
-                } else if (p_i - p_j).abs() < 1e-10 {
-                    concordant += 0.5;
-                }
+            total_comparable += 1.0;
+            if event_p > other_p {
+                concordant += 1.0;
+            } else if event_p == other_p {
+                concordant += 0.5;
             }
         }
     }
@@ -588,7 +637,7 @@ fn count_concordant_pairs(predictions: &[f64]) -> (f64, f64, f64) {
             for j in (i + 1)..n {
                 if predictions[i] > predictions[j] {
                     concordant += 1.0;
-                } else if (predictions[i] - predictions[j]).abs() < 1e-10 {
+                } else if predictions[i] == predictions[j] {
                     ties += 1.0;
                 }
             }
@@ -603,27 +652,23 @@ fn count_concordant_pairs(predictions: &[f64]) -> (f64, f64, f64) {
         let mut temp = vec![(0.0, 0); n];
         concordant = merge_sort_count(&mut sorted, &mut temp, 0, n);
 
-        // Count ties separately (merge sort doesn't handle ties well)
-        // This is still O(n log n) with a sorted array
+        // Count exact-equality ties separately: every pair inside a run of
+        // `==`-equal predictions is a tie regardless of time order, so a run
+        // of g contributes C(g, 2). (The pre-2026-07-23 1e-10 window grouped
+        // against the run BASE — non-transitive, so an epsilon chain silently
+        // dropped cross-group tie credits and this function disagreed with
+        // its own n < 100 branch.)
         sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut i = 0;
         while i < n {
             let mut j = i + 1;
-            while j < n && (sorted[j].0 - sorted[i].0).abs() < 1e-10 {
+            // total_cmp puts -0.0 before +0.0 but `==` merges them, matching
+            // the direct-count branch.
+            while j < n && sorted[j].0 == sorted[i].0 {
                 j += 1;
             }
-            let group_size = j - i;
-            if group_size > 1 {
-                // Ties within this group that come from different original positions
-                // Each pair of ties where original_i < original_j counts
-                for k in i..j {
-                    for l in (k + 1)..j {
-                        if sorted[k].1 < sorted[l].1 {
-                            ties += 1.0;
-                        }
-                    }
-                }
-            }
+            let g = (j - i) as f64;
+            ties += g * (g - 1.0) / 2.0;
             i = j;
         }
     }
@@ -700,9 +745,12 @@ fn merge_count(
 /// Calculate concordance index considering only uncensored observations.
 ///
 /// This is a simplified version that ignores censored observations entirely.
+/// Tied-time pairs are not comparable (standard Harrell, consistent with
+/// `concordance_index`); prediction ties (exact f64 `==`) get 0.5 credit.
 ///
 /// # Arguments
-/// * `predictions` - Predicted risk scores or times.
+/// * `predictions` - Predicted risk scores (higher = higher risk; negate
+///   survival-TIME predictions before calling).
 /// * `times` - Observed times to event.
 /// * `events` - Event indicators (true = event occurred, false = censored).
 ///
@@ -748,11 +796,17 @@ pub fn concordance_index_uncensored_only(
             let p_i = predictions[idx_i];
             let p_j = predictions[idx_j];
 
+            // Tied-time event pairs are not comparable under Harrell —
+            // consistent with `concordance_index` in this module (they were
+            // previously counted here, silently deflating the result).
+            if t_i == t_j {
+                continue;
+            }
             total += 1.0;
 
             if (t_i < t_j && p_i > p_j) || (t_i > t_j && p_i < p_j) {
                 concordant += 1.0;
-            } else if (p_i - p_j).abs() < 1e-10 {
+            } else if p_i == p_j {
                 concordant += 0.5;
             }
         }
@@ -1357,39 +1411,46 @@ mod tests {
                 "trial {trial}: C-index mismatch (fenwick {new_c} vs brute {old_c})"
             );
 
-            // The public function must agree too whenever it takes the general
-            // path (any censoring, or any exact time tie).
-            let has_censoring = events.iter().any(|&e| !e);
-            let mut ts: Vec<f64> = times.to_vec();
-            ts.sort_by(f64::total_cmp);
-            let has_time_ties = ts.windows(2).any(|w| w[0] == w[1]);
-            if has_censoring || has_time_ties {
-                let public_c = concordance_index(&predictions, &times, &events);
-                assert_eq!(
-                    public_c.to_bits(),
-                    old_c.to_bits(),
-                    "trial {trial}: public concordance_index mismatch"
-                );
-            }
+            // The public function must agree on EVERY trial — including the
+            // all-uncensored/no-time-tie trials that take the merge-sort fast
+            // path. (Pre-2026-07-23 this assertion was gated to skip exactly
+            // that path, which is where the non-transitive 1e-10 tie window
+            // silently dropped tie credits on epsilon chains.)
+            let public_c = concordance_index(&predictions, &times, &events);
+            assert_eq!(
+                public_c.to_bits(),
+                old_c.to_bits(),
+                "trial {trial}: public concordance_index mismatch (public {public_c} vs brute {old_c})"
+            );
         }
     }
 
     #[test]
     fn test_concordance_censored_fenwick_edge_cases() {
-        // -0.0 and +0.0 times are equal under `<`, so they form a tied group:
-        // zero comparable pairs -> 0.5. The brute-force loop must agree.
+        // -0.0 and +0.0 times are equal under `<`, forming a tied-time group.
+        // Standard Harrell (2026-07-23 fix): the event precedes the censoring
+        // at the same time, so the pair IS comparable; the event has the
+        // higher prediction -> concordant, C = 1.0 (lifelines agrees; the old
+        // code returned 0 comparable pairs -> 0.5).
         let predictions = Array1::from_vec(vec![2.0, 1.0]);
         let times = Array1::from_vec(vec![-0.0, 0.0]);
         let events = Array1::from_vec(vec![true, false]);
         let (fc, ft, fp) = concordance_counts_censored_fenwick(&predictions, &times, &events);
-        assert_eq!((fc, ft, fp), (0, 0, 0));
+        assert_eq!((fc, ft, fp), (1, 0, 1));
         let (bc, bp) = concordance_counts_censored_bruteforce(&predictions, &times, &events);
-        assert_eq!((bc, bp), (0.0, 0.0));
-        assert_eq!(concordance_index(&predictions, &times, &events), 0.5);
+        assert_eq!((bc, bp), (1.0, 1.0));
+        assert_eq!(concordance_index(&predictions, &times, &events), 1.0);
 
-        // Epsilon-boundary trap: p_j = p_i + 1e-10 exactly (as rounded). The tie
-        // predicate is (p_i - p_j).abs() < 1e-10 via subtraction, which is NOT
-        // p_j < p_i + 1e-10. Check both sides of the window, plus exact tie.
+        // Tied-time event/event pairs remain non-comparable.
+        let events_both = Array1::from_vec(vec![true, true]);
+        let (fc, ft, fp) =
+            concordance_counts_censored_fenwick(&predictions, &times, &events_both);
+        assert_eq!((fc, ft, fp), (0, 0, 0));
+        assert_eq!(concordance_index(&predictions, &times, &events_both), 0.5);
+
+        // Near-tie probes: prediction ties are EXACT equality (0.5 credit);
+        // everything else is strict comparison. Fenwick must agree with the
+        // brute-force reference bit-for-bit on every offset.
         let p_i = 0.1;
         for (p_j, _label) in [
             (p_i, "exact tie"),

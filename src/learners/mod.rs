@@ -912,12 +912,24 @@ impl FeatureHists {
                     raw[slot] += 1.0;
                 }
             }
-        } else if indices.len() == cache.n_rows {
+        } else if indices.len() == cache.n_rows
+            && indices
+                .iter()
+                .enumerate()
+                .all(|(k, &i)| i as usize == k)
+        {
             // ROOT node, unweighted: bin counts depend only on the binned
             // matrix, so seed them from the cache (computed once per cache,
             // shared by every tree of every boosting iteration) and
             // accumulate only the y-sums. Counts are exact integer sums of
             // 1.0 — identical to accumulating them per row.
+            //
+            // The identity scan above is required, not just the length check:
+            // a full-length index list WITH DUPLICATES (reachable through the
+            // public fit_predict_cached_rows API) would otherwise seed the
+            // Arc-shared OnceLock with its own multiset's counts, permanently
+            // poisoning every later fit on this cache (2026-07-23 audit). The
+            // O(n) scan is negligible next to the O(n*p) accumulation below.
             let counts = cache.root_counts.get_or_init(|| {
                 let mut c = vec![0.0; p * n_bins];
                 for &i in indices {
@@ -2367,6 +2379,13 @@ fn scan_sorted_entries(
     parent_sum: f64,
     parent_weight: f64,
 ) -> (f64, f64) {
+    // best_improvement starts at 0.0 and candidates must be strictly
+    // greater, so zero-gain candidates (pure/constant-y nodes) never become
+    // "valid" splits. (A former `+ 1e-10` floor on every improvement defeated
+    // the callers' `best_improvement <= 0.0` leaf check: constant-y nodes
+    // emitted fake splits crediting arbitrary features in
+    // feature_importances — 2026-07-23 audit. The floor was added to every
+    // candidate equally, so removing it cannot change which candidate wins.)
     let mut best_threshold = f64::NAN;
     let mut best_improvement = 0.0;
     let mut left_sum = 0.0;
@@ -2402,7 +2421,7 @@ fn scan_sorted_entries(
             let left_mean = left_sum / left_weight;
             let right_mean = right_sum / right_weight;
             let diff = left_mean - right_mean;
-            let improvement = (left_weight * right_weight / parent_weight) * diff * diff + 1e-10;
+            let improvement = (left_weight * right_weight / parent_weight) * diff * diff;
 
             if improvement > best_improvement {
                 best_improvement = improvement;
@@ -2441,7 +2460,7 @@ fn scan_sorted_entries(
             let left_mean = left_sum / left_weight;
             let right_mean = right_sum / right_weight;
             let diff = left_mean - right_mean;
-            let improvement = (left_weight * right_weight / parent_weight) * diff * diff + 1e-10;
+            let improvement = (left_weight * right_weight / parent_weight) * diff * diff;
 
             if improvement > best_improvement {
                 best_improvement = improvement;
@@ -2713,7 +2732,10 @@ fn find_best_split_friedman(
 
 /// Returns the default tree learner matching Python's sklearn default:
 /// DecisionTreeRegressor with max_depth=3 and criterion="friedman_mse".
-/// This is the *exact* split finder — bit-equivalent to sklearn's trees.
+/// This is the *exact* split finder — matches sklearn's split choices and
+/// f32 threshold/routing semantics (verified bit-identical over 400 random
+/// configs); minor structural conventions (e.g. pure-node handling) can
+/// still differ from sklearn internals.
 pub fn default_tree_learner() -> DecisionTreeLearner {
     DecisionTreeLearner::default_sklearn()
 }
