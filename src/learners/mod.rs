@@ -91,6 +91,44 @@ pub trait BaseLearner: Send + Sync {
         let w_sub = sample_weight.map(|w| w.select(ndarray::Axis(0), &idx));
         self.fit_predict_cached(&x_sub, &y_sub, w_sub.as_ref(), None)
     }
+
+    /// Fit on a row subset (`rows`, or all rows when `None`) restricted to the
+    /// feature subset `cols` (in the given, possibly shuffled, order), using a
+    /// cache built on the FULL `x`. Predictions come back in `rows` order (or
+    /// cache row order when `rows` is `None`). The fitted learner records
+    /// SUBSET-LOCAL feature indices — internal feature `f` means full column
+    /// `cols[f]` — matching a fit on the materialized subset matrix, so the
+    /// prediction-side `col_idxs` mapping is unchanged.
+    ///
+    /// The default materializes the subset and fits it from scratch (the
+    /// pre-existing per-iteration behavior). Histogram trees override this to
+    /// scan only `cols` of the full-X cache: for full-row fits the result is
+    /// bit-identical to the materialized fit (same edges, same scan order);
+    /// for row-subsampled fits the full-X quantile edges are the same
+    /// deliberate LightGBM-style difference `fit_predict_cached_rows` makes.
+    fn fit_predict_cached_rows_cols(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        _cache: &dyn FitCache,
+        rows: Option<&[u32]>,
+        cols: &[usize],
+    ) -> Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str> {
+        let (x_rows, y_sub, w_sub) = match rows {
+            Some(r) => {
+                let idx: Vec<usize> = r.iter().map(|&i| i as usize).collect();
+                (
+                    x.select(ndarray::Axis(0), &idx),
+                    y.select(ndarray::Axis(0), &idx),
+                    sample_weight.map(|w| w.select(ndarray::Axis(0), &idx)),
+                )
+            }
+            None => (x.to_owned(), y.to_owned(), sample_weight.cloned()),
+        };
+        let x_sub = x_rows.select(ndarray::Axis(1), cols);
+        self.fit_predict_cached(&x_sub, &y_sub, w_sub.as_ref(), None)
+    }
 }
 
 pub trait TrainedBaseLearner: Send + Sync {
@@ -730,6 +768,68 @@ impl BaseLearner for HistogramLearner {
             }
         }
     }
+
+    fn fit_predict_cached_rows_cols(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        cache: &dyn FitCache,
+        rows: Option<&[u32]>,
+        cols: &[usize],
+    ) -> Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str> {
+        // Identity column set → the specialized full-feature paths (which keep
+        // their shared-root-counts fast path and exact legacy behavior).
+        let identity_cols = cols.len() == x.ncols() && cols.iter().enumerate().all(|(i, &c)| c == i);
+        if identity_cols {
+            return match rows {
+                Some(r) => self.fit_predict_cached_rows(x, y, sample_weight, cache, r),
+                None => self.fit_predict_cached(x, y, sample_weight, Some(cache)),
+            };
+        }
+
+        match cache.as_any().downcast_ref::<HistogramFitCache>() {
+            Some(c) if c.n_rows == x.nrows() && c.n_features == x.ncols() => {
+                let indices: Vec<u32> = match rows {
+                    Some(r) => r.to_vec(),
+                    None => (0..c.n_rows as u32).collect(),
+                };
+                // Full-length scatter buffer indexed by cache row ids, then
+                // gathered back in the caller's row order.
+                let mut preds_full = vec![0.0f64; c.n_rows];
+                let fitted = self.fit_indices_cols_from_cache(
+                    c,
+                    y,
+                    sample_weight,
+                    indices,
+                    cols,
+                    Some(&mut preds_full),
+                )?;
+                let preds = match rows {
+                    Some(r) => Array1::from_iter(r.iter().map(|&i| preds_full[i as usize])),
+                    None => Array1::from_vec(preds_full),
+                };
+                Ok((fitted, preds))
+            }
+            // Wrong cache type or stale dims — the trait default's
+            // materialize-and-fit behavior.
+            _ => {
+                let (x_rows, y_sub, w_sub) = match rows {
+                    Some(r) => {
+                        let idx: Vec<usize> = r.iter().map(|&i| i as usize).collect();
+                        (
+                            x.select(ndarray::Axis(0), &idx),
+                            y.select(ndarray::Axis(0), &idx),
+                            sample_weight.map(|w| w.select(ndarray::Axis(0), &idx)),
+                        )
+                    }
+                    None => (x.to_owned(), y.to_owned(), sample_weight.cloned()),
+                };
+                let x_sub = x_rows.select(ndarray::Axis(1), cols);
+                self.fit_predict_cached(&x_sub, &y_sub, w_sub.as_ref(), None)
+            }
+        }
+    }
 }
 
 impl HistogramLearner {
@@ -790,6 +890,47 @@ impl HistogramLearner {
         );
 
         Ok(Box::new(TrainedHistogramTree::new(root, cache.n_features)))
+    }
+
+    /// Column-masked sibling of [`fit_indices_from_cache`]: fit on `indices`
+    /// considering only the features in `cols` (subset-local ids recorded in
+    /// the tree — see `fit_predict_cached_rows_cols`). `y`, `sample_weight`
+    /// and the `preds` scatter buffer stay indexed by the cache's row ids.
+    fn fit_indices_cols_from_cache(
+        &self,
+        cache: &HistogramFitCache,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        indices: Vec<u32>,
+        cols: &[usize],
+        preds: Option<&mut [f64]>,
+    ) -> Result<Box<dyn TrainedBaseLearner>, &'static str> {
+        if y.len() != cache.n_rows {
+            return Err("y length does not match cached X");
+        }
+        if cols.is_empty() {
+            return Err("cols must not be empty");
+        }
+        if cols.iter().any(|&c| c >= cache.n_features) {
+            return Err("cols contains an out-of-range feature index");
+        }
+
+        let root_hists = FeatureHists::build_cols(cache, &indices, y, sample_weight, cols);
+        let root = build_histogram_tree_node_cols(
+            cache,
+            y,
+            sample_weight,
+            indices,
+            root_hists,
+            cols,
+            0,
+            self.max_depth,
+            self.min_samples_split,
+            self.min_samples_leaf,
+            preds,
+        );
+
+        Ok(Box::new(TrainedHistogramTree::new(root, cols.len())))
     }
 }
 
@@ -956,6 +1097,112 @@ impl FeatureHists {
                 let row = &cache.binned[i * p..(i + 1) * p];
                 for (f, &b) in row.iter().enumerate() {
                     let slot = f * n_bins + b as usize;
+                    count[slot] += 1.0;
+                    sum[slot] += yi;
+                }
+            }
+        }
+
+        FeatureHists {
+            count,
+            sum,
+            raw,
+            n_bins,
+        }
+    }
+
+    /// Column-masked sibling of [`FeatureHists::build`]: histograms for the
+    /// feature subset `cols` ONLY, laid out compactly as
+    /// `[local_feature * n_bins + bin]` where `local_feature` is the position
+    /// in `cols` (which is in the caller's — possibly shuffled — order, so
+    /// split scans tie-break exactly like a fit on the materialized subset
+    /// matrix). The full-X bin edges and binned matrix are reused; nothing is
+    /// re-sorted or re-binned.
+    fn build_cols(
+        cache: &HistogramFitCache,
+        indices: &[u32],
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        cols: &[usize],
+    ) -> Self {
+        let p = cache.n_features;
+        let k = cols.len();
+        // Uniform flat layout over the SELECTED features' bin counts.
+        let n_bins = cols
+            .iter()
+            .map(|&c| cache.bin_edges[c].len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let mut count = vec![0.0; k * n_bins];
+        let mut sum = vec![0.0; k * n_bins];
+        let mut raw: Option<Vec<f64>> = None;
+
+        if let Some(weights) = sample_weight {
+            let raw = raw.get_or_insert_with(|| vec![0.0; k * n_bins]);
+            for &i in indices {
+                let i = i as usize;
+                let w = weights[i];
+                let yw = y[i] * w;
+                let row = &cache.binned[i * p..(i + 1) * p];
+                for (f, &c) in cols.iter().enumerate() {
+                    let slot = f * n_bins + row[c] as usize;
+                    count[slot] += w;
+                    sum[slot] += yw;
+                    raw[slot] += 1.0;
+                }
+            }
+        } else if indices.len() == cache.n_rows
+            && indices
+                .iter()
+                .enumerate()
+                .all(|(idx, &i)| i as usize == idx)
+        {
+            // ROOT node, unweighted, full identity rows (the col-sampled
+            // boosting iteration's root): gather the selected features'
+            // stripes out of the cache-shared root counts instead of
+            // re-accumulating. The values are exact integer sums either way.
+            // Same duplicate-safety identity scan as `build` (see its comment).
+            let global_bins = cache
+                .bin_edges
+                .iter()
+                .map(|e| e.len())
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let counts = cache.root_counts.get_or_init(|| {
+                let mut c = vec![0.0; p * global_bins];
+                for &i in indices {
+                    let row = &cache.binned[i as usize * p..(i as usize + 1) * p];
+                    for (f, &b) in row.iter().enumerate() {
+                        c[f * global_bins + b as usize] += 1.0;
+                    }
+                }
+                c
+            });
+            for (f, &c) in cols.iter().enumerate() {
+                // Any occupied bin of feature c sits below its edge count,
+                // which is <= both strides; the copy width is the smaller
+                // stride so this is always in-bounds.
+                let width = n_bins.min(global_bins);
+                count[f * n_bins..f * n_bins + width]
+                    .copy_from_slice(&counts[c * global_bins..c * global_bins + width]);
+            }
+            for &i in indices {
+                let i = i as usize;
+                let yi = y[i];
+                let row = &cache.binned[i * p..(i + 1) * p];
+                for (f, &c) in cols.iter().enumerate() {
+                    sum[f * n_bins + row[c] as usize] += yi;
+                }
+            }
+        } else {
+            for &i in indices {
+                let i = i as usize;
+                let yi = y[i];
+                let row = &cache.binned[i * p..(i + 1) * p];
+                for (f, &c) in cols.iter().enumerate() {
+                    let slot = f * n_bins + row[c] as usize;
                     count[slot] += 1.0;
                     sum[slot] += yi;
                 }
@@ -1166,6 +1413,180 @@ fn build_histogram_tree_node(
         sample_weight,
         right_indices,
         right_hists,
+        depth + 1,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+        preds,
+    );
+
+    HistTreeNode::Split {
+        feature_index: best_feature,
+        bin_threshold: best_bin,
+        threshold_value: best_threshold_value,
+        improvement: best_improvement,
+        left: Box::new(left_child),
+        right: Box::new(right_child),
+    }
+}
+
+/// Column-masked sibling of [`build_histogram_tree_node`]: identical
+/// algorithm, but candidate features are the subset `cols` (in the caller's
+/// order) of the FULL-X cache, and every recorded `feature_index` is
+/// subset-local (its position in `cols`) — exactly what a tree fit on the
+/// materialized subset matrix would store, so prediction-side `col_idxs`
+/// mapping is unchanged. Kept as a separate function rather than a `cols`
+/// parameter on the original so the full-feature hot path's codegen is
+/// untouched.
+#[allow(clippy::too_many_arguments)]
+fn build_histogram_tree_node_cols(
+    cache: &HistogramFitCache,
+    y: &Array1<f64>,
+    sample_weight: Option<&Array1<f64>>,
+    indices: Vec<u32>,
+    hists: FeatureHists,
+    cols: &[usize],
+    depth: usize,
+    max_depth: usize,
+    min_samples_split: usize,
+    min_samples_leaf: usize,
+    mut preds: Option<&mut [f64]>,
+) -> HistTreeNode {
+    let (parent_count, parent_sum) = hists.totals(0);
+    let node_value = if parent_count > 0.0 {
+        parent_sum / parent_count
+    } else {
+        0.0
+    };
+
+    let make_leaf = |indices: &[u32], preds: &mut Option<&mut [f64]>| {
+        if let Some(p) = preds.as_deref_mut() {
+            for &i in indices {
+                p[i as usize] = node_value;
+            }
+        }
+        HistTreeNode::Leaf { value: node_value }
+    };
+
+    if depth >= max_depth || indices.len() < min_samples_split || parent_count <= 0.0 {
+        return make_leaf(&indices, &mut preds);
+    }
+
+    let mut best_feature = 0;
+    let mut best_bin: u8 = 0;
+    let mut best_improvement = 0.0;
+    let mut best_threshold_value = 0.0;
+
+    let parent_raw = indices.len() as f64;
+    let raw_bins = hists.raw.as_deref();
+
+    for (f, &c) in cols.iter().enumerate() {
+        let n_edges = cache.bin_edges[c].len();
+        if n_edges < 2 {
+            continue; // constant feature — no split possible
+        }
+        let base = f * hists.n_bins;
+        let mut left_count = 0.0;
+        let mut left_sum = 0.0;
+        let mut left_raw = 0.0;
+
+        for bin in 0..(n_edges - 1) {
+            let empty = match raw_bins {
+                Some(r) => r[base + bin] == 0.0,
+                None => hists.count[base + bin] == 0.0,
+            };
+            if empty {
+                continue;
+            }
+            left_count += hists.count[base + bin];
+            left_sum += hists.sum[base + bin];
+            let left_raw = match raw_bins {
+                Some(r) => {
+                    left_raw += r[base + bin];
+                    left_raw
+                }
+                None => left_count,
+            };
+
+            let right_count = parent_count - left_count;
+            let right_sum = parent_sum - left_sum;
+
+            if left_raw < min_samples_leaf as f64
+                || parent_raw - left_raw < min_samples_leaf as f64
+            {
+                continue;
+            }
+            if left_count <= 0.0 || right_count <= 0.0 {
+                continue;
+            }
+
+            let left_mean = left_sum / left_count;
+            let right_mean = right_sum / right_count;
+            let diff = left_mean - right_mean;
+            let improvement = (left_count * right_count / parent_count) * diff * diff;
+
+            if improvement > best_improvement {
+                best_improvement = improvement;
+                best_feature = f;
+                best_bin = (bin + 1) as u8;
+                best_threshold_value = cache.bin_edges[c][bin + 1];
+            }
+        }
+    }
+
+    if best_improvement <= 0.0 {
+        return make_leaf(&indices, &mut preds);
+    }
+
+    // Partition row ids by bin — best_feature is subset-local, so the binned
+    // matrix is addressed through cols.
+    let p = cache.n_features;
+    let split_col = cols[best_feature];
+    let estimated = indices.len() / 2;
+    let mut left_indices = Vec::with_capacity(estimated);
+    let mut right_indices = Vec::with_capacity(estimated);
+    for &i in &indices {
+        if cache.binned[i as usize * p + split_col] < best_bin {
+            left_indices.push(i);
+        } else {
+            right_indices.push(i);
+        }
+    }
+
+    if left_indices.len() < min_samples_leaf || right_indices.len() < min_samples_leaf {
+        return make_leaf(&indices, &mut preds);
+    }
+
+    let (left_hists, right_hists) = if left_indices.len() <= right_indices.len() {
+        let lh = FeatureHists::build_cols(cache, &left_indices, y, sample_weight, cols);
+        let rh = hists.subtract(&lh);
+        (lh, rh)
+    } else {
+        let rh = FeatureHists::build_cols(cache, &right_indices, y, sample_weight, cols);
+        let lh = hists.subtract(&rh);
+        (lh, rh)
+    };
+
+    let left_child = build_histogram_tree_node_cols(
+        cache,
+        y,
+        sample_weight,
+        left_indices,
+        left_hists,
+        cols,
+        depth + 1,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+        preds.as_deref_mut(),
+    );
+    let right_child = build_histogram_tree_node_cols(
+        cache,
+        y,
+        sample_weight,
+        right_indices,
+        right_hists,
+        cols,
         depth + 1,
         max_depth,
         min_samples_split,
@@ -3589,6 +4010,205 @@ mod ridge_tests {
                 "row {i}: weighted {} vs duplicated {}",
                 pw[i],
                 pd[i]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod col_masked_tests {
+    //! Parity proofs for the column-masked cache fit
+    //! (`fit_predict_cached_rows_cols`): for full-row fits the masked path
+    //! must be BIT-identical to materializing the column subset and fitting
+    //! it from scratch — same bin edges (per-column, value-dependent only),
+    //! same scan order (cols order), same tie-breaking — so col-sampled
+    //! boosting produces byte-for-byte the same models as before the
+    //! optimization.
+    use super::*;
+
+    fn synth(n: usize, p: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
+        let mut s = seed;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (u32::MAX as f64)
+        };
+        let x = Array2::from_shape_fn((n, p), |_| next());
+        let y = Array1::from_shape_fn(n, |i| x[[i, 0]] * 3.0 - x[[i, p - 1]] + next() * 0.1);
+        (x, y)
+    }
+
+    fn assert_bitwise(a: &Array1<f64>, b: &Array1<f64>, what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: length mismatch");
+        for i in 0..a.len() {
+            assert!(
+                a[i].to_bits() == b[i].to_bits(),
+                "{what}: bit mismatch at {i}: {} vs {}",
+                a[i],
+                b[i]
+            );
+        }
+    }
+
+    /// Full rows + column mask vs materialized column subset: bitwise equal
+    /// training predictions, held-out predictions, and split structure —
+    /// across shapes, seeds, unsorted column orders, and weighted fits.
+    #[test]
+    fn cols_masked_full_rows_bitwise_matches_materialized_subset() {
+        for (n, p, seed) in [(800usize, 9usize, 11u64), (1500, 13, 42), (300, 5, 7)] {
+            let (x, y) = synth(n, p, seed);
+            let (x_test, _) = synth(97, p, seed ^ 0xdead);
+            // Deliberately unsorted, non-contiguous column subset — the order
+            // trees scan features in, so it must be preserved verbatim.
+            let cols: Vec<usize> = match p {
+                5 => vec![3, 0, 4],
+                9 => vec![7, 2, 5, 0, 8],
+                _ => vec![11, 3, 0, 9, 6, 1, 12],
+            };
+            let weights = Array1::from_shape_fn(n, |i| 0.5 + ((i * 37 % 100) as f64) / 100.0);
+
+            for w in [None, Some(&weights)] {
+                let learner = HistogramLearner::new(4);
+                let cache = learner.build_fit_cache(&x).expect("cache");
+
+                let (masked, masked_preds) = learner
+                    .fit_predict_cached_rows_cols(&x, &y, w, cache.as_ref(), None, &cols)
+                    .expect("masked fit");
+
+                let x_sub = x.select(ndarray::Axis(1), &cols);
+                let (reference, ref_preds) = learner
+                    .fit_predict_cached(&x_sub, &y, w, None)
+                    .expect("reference fit");
+
+                assert_bitwise(&masked_preds, &ref_preds, "training predictions");
+                assert_bitwise(
+                    &masked.predict(&x_sub),
+                    &reference.predict(&x_sub),
+                    "train-matrix predict",
+                );
+                let x_test_sub = x_test.select(ndarray::Axis(1), &cols);
+                assert_bitwise(
+                    &masked.predict(&x_test_sub),
+                    &reference.predict(&x_test_sub),
+                    "held-out predict",
+                );
+                assert_eq!(
+                    masked.split_features(),
+                    reference.split_features(),
+                    "split structure must match (n={n}, p={p}, weighted={})",
+                    w.is_some()
+                );
+            }
+        }
+    }
+
+    /// Rows + columns subsampled together: the returned leaf-scattered
+    /// predictions must be bit-identical to `fitted.predict` on the
+    /// materialized subset (the invariant the fit loop relies on), and the
+    /// fit must be deterministic. (Not compared to a from-scratch subset fit:
+    /// the cached path deliberately keeps full-X bin edges, the same
+    /// documented LightGBM-style choice `fit_predict_cached_rows` makes.)
+    #[test]
+    fn cols_masked_row_subset_scatter_matches_predict() {
+        let (x, y) = synth(1200, 10, 99);
+        let cols = vec![8, 1, 4, 0, 6];
+        // Unsorted row subset with the shuffle-like order sample() produces.
+        let rows: Vec<u32> = (0..1200u32).filter(|r| (r * 2654435761) % 5 < 3).rev().collect();
+        let weights = Array1::from_shape_fn(1200, |i| 0.25 + ((i * 13 % 50) as f64) / 50.0);
+
+        for w in [None, Some(&weights)] {
+            let learner = HistogramLearner::new(4);
+            let cache = learner.build_fit_cache(&x).expect("cache");
+
+            let (fitted_a, preds_a) = learner
+                .fit_predict_cached_rows_cols(&x, &y, w, cache.as_ref(), Some(&rows), &cols)
+                .expect("masked rows+cols fit");
+            let (_, preds_b) = learner
+                .fit_predict_cached_rows_cols(&x, &y, w, cache.as_ref(), Some(&rows), &cols)
+                .expect("repeat fit");
+            assert_bitwise(&preds_a, &preds_b, "determinism");
+
+            let idx: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+            let x_sub = x.select(ndarray::Axis(0), &idx).select(ndarray::Axis(1), &cols);
+            assert_bitwise(&preds_a, &fitted_a.predict(&x_sub), "scatter vs predict");
+        }
+    }
+
+    /// Identity column set must delegate to the legacy full-feature paths and
+    /// stay bitwise-equal to calling them directly.
+    #[test]
+    fn cols_identity_delegates_bitwise() {
+        let (x, y) = synth(900, 7, 5);
+        let cols: Vec<usize> = (0..7).collect();
+        let rows: Vec<u32> = (0..900u32).filter(|r| r % 3 != 0).collect();
+        let learner = HistogramLearner::new(4);
+        let cache = learner.build_fit_cache(&x).expect("cache");
+
+        let (_, via_cols) = learner
+            .fit_predict_cached_rows_cols(&x, &y, None, cache.as_ref(), Some(&rows), &cols)
+            .expect("identity cols");
+        let (_, via_rows) = learner
+            .fit_predict_cached_rows(&x, &y, None, cache.as_ref(), &rows)
+            .expect("rows path");
+        assert_bitwise(&via_cols, &via_rows, "identity delegation (rows)");
+
+        let (_, via_cols_full) = learner
+            .fit_predict_cached_rows_cols(&x, &y, None, cache.as_ref(), None, &cols)
+            .expect("identity cols full");
+        let (_, via_full) = learner
+            .fit_predict_cached(&x, &y, None, Some(cache.as_ref()))
+            .expect("full path");
+        assert_bitwise(&via_cols_full, &via_full, "identity delegation (full)");
+    }
+}
+
+#[cfg(test)]
+mod col_masked_bench {
+    //! Wall-clock proof for the column-masked cache fit. Run with:
+    //! `cargo test --release --lib --features openblas,simd-math bench_col_sample -- --ignored --nocapture`
+    use crate::dist::Poisson;
+    use crate::ngboost::NGBoost;
+    use crate::scores::LogScore;
+    use super::HistogramLearner;
+    use ndarray::{Array1, Array2};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_col_sample_cached_vs_stable() {
+        let n = 12_000usize;
+        let p = 127usize;
+        let iters = 200u32;
+        let mut s = 0x6e67_b005u64;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (u32::MAX as f64)
+        };
+        let x = Array2::from_shape_fn((n, p), |_| next());
+        let y = Array1::from_shape_fn(n, |i| {
+            (x[[i, 0]] * 4.0 + x[[i, 1]] * 3.0 + next() * 2.0).round().max(0.0)
+        });
+
+        for (label, col_sample, mb) in [
+            ("col=1.0 mb=1.0", 1.0, 1.0),
+            ("col=0.8 mb=1.0", 0.8, 1.0),
+            ("col=0.6 mb=1.0", 0.6, 1.0),
+            ("col=0.6 mb=0.7", 0.6, 0.7),
+        ] {
+            let mut m: NGBoost<Poisson, LogScore, HistogramLearner> =
+                NGBoost::new(iters, 0.05, HistogramLearner::new(5));
+            m.col_sample = col_sample;
+            m.minibatch_frac = mb;
+            m.set_random_state(42);
+            let t = Instant::now();
+            m.fit(&x, &y).expect("fit");
+            let el = t.elapsed();
+            println!(
+                "{label}: {iters} iters in {el:7.2?} ({:6.2} ms/iter)",
+                el.as_secs_f64() / iters as f64 * 1000.0
             );
         }
     }

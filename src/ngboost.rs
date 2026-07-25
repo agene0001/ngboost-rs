@@ -890,18 +890,17 @@ where
         let mut best_iter_this_run: Option<usize> = None;
 
         // The fit cache (bin edges + binned matrix) depends only on X's
-        // columns, so with full columns the cache built once on the full X
-        // serves every iteration — including row-subsampled ones, whose trees
-        // fit on a row-index subset of it (LightGBM-style: bin once globally,
-        // bag rows against the global bins). Only column subsampling forces
-        // per-iteration caches. Learners that don't benefit return None.
+        // columns, so the cache built once on the full X serves EVERY
+        // iteration: row-subsampled ones fit on a row-index subset of it
+        // (LightGBM-style: bin once globally, bag rows against the global
+        // bins), and column-subsampled ones scan only the sampled columns of
+        // it (`fit_predict_cached_rows_cols`) — rebuilding the cache per
+        // iteration for col_sample < 1.0 was a measured 5-6x per-iteration
+        // cost (a sort per feature per iteration, recomputing edges that
+        // never change). Learners that don't benefit return None.
         let x_is_stable = self.minibatch_frac >= 1.0 && self.col_sample >= 1.0;
         let stable_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
-            if self.col_sample >= 1.0 {
-                self.base_learner.build_fit_cache(&x_train)
-            } else {
-                None
-            };
+            self.base_learner.build_fit_cache(&x_train);
 
         for itr in 0..self.n_estimators {
             // Sample data for this iteration
@@ -914,15 +913,19 @@ where
             // iteration's stale column subset (silent prediction corruption
             // whenever col_sample < 1.0).
 
-            // Row-subset fast path: rows subsampled, columns intact, and the
-            // learner has a full-X cache — fit on row indices of that cache
-            // instead of re-binning the minibatch every iteration.
-            let use_row_subset = row_idxs.is_some() && stable_cache.is_some();
+            // Subset fast path: rows and/or columns subsampled and the
+            // learner has a full-X cache — fit on (row indices, column mask)
+            // of that cache instead of re-binning the minibatch every
+            // iteration.
+            let cols_subsampled = col_idxs.len() < x_train.ncols();
+            let use_cached_subset =
+                stable_cache.is_some() && (row_idxs.is_some() || cols_subsampled);
 
-            // With column subsampling, X changes per iteration — build a
-            // per-iteration cache, still amortized across n_params fits.
+            // Without a usable full-X cache, a subsampled X still changes per
+            // iteration — build a per-iteration cache, amortized across the
+            // n_params fits.
             let iter_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
-                if use_row_subset {
+                if use_cached_subset {
                     None // the subset path uses stable_cache directly
                 } else {
                     match &stable_cache {
@@ -985,13 +988,16 @@ where
                 (0..n_params).map(|j| grads.column(j).to_owned()).collect();
 
             let fit_results: Vec<Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>> =
-                if use_row_subset {
-                    // Fit each tree on the row-index subset of the full-X
-                    // cache. The gradient is scattered into a full-length
-                    // buffer aligned with the cache's row ids (rows outside
-                    // the minibatch are never read); returned predictions
-                    // come back in row_idxs order, matching y_sampled.
-                    let rows: &[u32] = row_idxs.as_deref().unwrap();
+                if use_cached_subset {
+                    // Fit each tree on the (row indices, column mask) subset
+                    // of the full-X cache. The gradient is scattered into a
+                    // full-length buffer aligned with the cache's row ids
+                    // (rows outside the minibatch are never read); returned
+                    // predictions come back in row_idxs order, matching
+                    // y_sampled. Trees record subset-local feature ids, so
+                    // the col_idxs bookkeeping downstream is unchanged.
+                    let rows: Option<&[u32]> = row_idxs.as_deref();
+                    let cols: &[usize] = &col_idxs;
                     let cache_ref = stable_cache.as_deref().unwrap();
                     let x_train_ref = &*x_train;
                     let n_train = x_train_ref.nrows();
@@ -1001,16 +1007,25 @@ where
                         .into_par_iter()
                         .zip(grad_cols.into_par_iter())
                         .map(|(learner, grad_j)| {
-                            let mut grad_full = Array1::zeros(n_train);
-                            for (k, &r) in rows.iter().enumerate() {
-                                grad_full[r as usize] = grad_j[k];
-                            }
-                            learner.fit_predict_cached_rows(
+                            let grad_full = match rows {
+                                Some(r) => {
+                                    let mut g = Array1::zeros(n_train);
+                                    for (k, &ri) in r.iter().enumerate() {
+                                        g[ri as usize] = grad_j[k];
+                                    }
+                                    g
+                                }
+                                // Full rows in cache order: the gradient is
+                                // already aligned with the cache's row ids.
+                                None => grad_j,
+                            };
+                            learner.fit_predict_cached_rows_cols(
                                 x_train_ref,
                                 &grad_full,
                                 sample_weight,
                                 cache_ref,
                                 rows,
+                                cols,
                             )
                         })
                         .collect()
