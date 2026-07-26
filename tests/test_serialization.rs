@@ -6,8 +6,8 @@ extern crate accelerate_src;
 // Tests that models can be saved and loaded correctly with predictions matching.
 
 use ndarray::{Array1, Array2};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 use ngboost_rs::ngboost::{NGBClassifier, NGBRegressor};
 use tempfile::tempdir;
 

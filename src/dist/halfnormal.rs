@@ -148,10 +148,7 @@ impl DistributionMethods for HalfNormal {
         let q_hi = (1.0 - alpha / 2.0).clamp(0.0, 1.0 - 1e-15);
         let z_lo = std_normal.inverse_cdf((1.0 + q_lo) / 2.0);
         let z_hi = std_normal.inverse_cdf((1.0 + q_hi) / 2.0);
-        (
-            self.scale.mapv(|s| s * z_lo),
-            self.scale.mapv(|s| s * z_hi),
-        )
+        (self.scale.mapv(|s| s * z_lo), self.scale.mapv(|s| s * z_hi))
     }
 
     fn sample(&self, n_samples: usize) -> Array2<f64> {
@@ -270,8 +267,7 @@ impl Scorable<CRPScore> for HalfNormal {
                 let erf_z_over_sqrt2 = erf(z * frac_1_sqrt_2);
                 let phi_z = INV_SQRT_2PI * (-0.5 * z * z).exp();
 
-                *s =
-                    sigma * (z * (2.0 * erf_z_over_sqrt2 - 1.0) + 4.0 * phi_z - two_inv_sqrt_pi);
+                *s = sigma * (z * (2.0 * erf_z_over_sqrt2 - 1.0) + 4.0 * phi_z - two_inv_sqrt_pi);
             });
         scores
     }
@@ -334,8 +330,16 @@ mod tests {
             let lo_ref = dist.ppf(&Array1::from_elem(2, alpha / 2.0));
             let hi_ref = dist.ppf(&Array1::from_elem(2, 1.0 - alpha / 2.0));
             for i in 0..2 {
-                assert_eq!(lo[i].to_bits(), lo_ref[i].to_bits(), "alpha={alpha} lo[{i}]");
-                assert_eq!(hi[i].to_bits(), hi_ref[i].to_bits(), "alpha={alpha} hi[{i}]");
+                assert_eq!(
+                    lo[i].to_bits(),
+                    lo_ref[i].to_bits(),
+                    "alpha={alpha} lo[{i}]"
+                );
+                assert_eq!(
+                    hi[i].to_bits(),
+                    hi_ref[i].to_bits(),
+                    "alpha={alpha} hi[{i}]"
+                );
             }
         }
     }
@@ -585,8 +589,7 @@ mod tests {
                 let z = y_val.max(0.0) / scale;
                 let phi_z = std_normal.pdf(z);
                 let big_phi_z = std_normal.cdf(z);
-                let expected =
-                    scale * (z * (4.0 * big_phi_z - 3.0) + 4.0 * phi_z - 2.0 / sqrt_pi);
+                let expected = scale * (z * (4.0 * big_phi_z - 3.0) + 4.0 * phi_z - 2.0 / sqrt_pi);
 
                 assert_relative_eq!(score[0], expected, epsilon = 1e-12,);
             }

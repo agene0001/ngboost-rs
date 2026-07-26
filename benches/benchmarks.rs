@@ -1264,10 +1264,7 @@ fn bench_arena_vs_legacy(c: &mut Criterion) {
 
 /// Build presorted per-feature (value, row) pair lists for a synthetic node of
 /// `n` rows and `p` features, plus the matching y array and parent stats.
-fn make_presorted_node(
-    n: usize,
-    p: usize,
-) -> (Vec<Vec<SortedEntry>>, Array1<f64>, f64, f64) {
+fn make_presorted_node(n: usize, p: usize) -> (Vec<Vec<SortedEntry>>, Array1<f64>, f64, f64) {
     let x = Array2::random((n, p), Uniform::new(0.0, 1.0).unwrap());
     let y = Array1::random(n, Uniform::new(-1.0, 1.0).unwrap());
 
@@ -1301,37 +1298,29 @@ fn bench_presort_scan(c: &mut Criterion) {
             let (sorted, _y, parent_sum, parent_weight) = make_presorted_node(n, p);
             group.throughput(Throughput::Elements((n * p) as u64));
 
-            group.bench_with_input(
-                BenchmarkId::new(format!("seq/p{p}"), n),
-                &n,
-                |b, _| {
-                    b.iter(|| {
-                        find_best_presorted_split_seq(
-                            black_box(&sorted),
-                            None,
-                            1,
-                            black_box(parent_sum),
-                            black_box(parent_weight),
-                        )
-                    })
-                },
-            );
+            group.bench_with_input(BenchmarkId::new(format!("seq/p{p}"), n), &n, |b, _| {
+                b.iter(|| {
+                    find_best_presorted_split_seq(
+                        black_box(&sorted),
+                        None,
+                        1,
+                        black_box(parent_sum),
+                        black_box(parent_weight),
+                    )
+                })
+            });
 
-            group.bench_with_input(
-                BenchmarkId::new(format!("par/p{p}"), n),
-                &n,
-                |b, _| {
-                    b.iter(|| {
-                        find_best_presorted_split_par(
-                            black_box(&sorted),
-                            None,
-                            1,
-                            black_box(parent_sum),
-                            black_box(parent_weight),
-                        )
-                    })
-                },
-            );
+            group.bench_with_input(BenchmarkId::new(format!("par/p{p}"), n), &n, |b, _| {
+                b.iter(|| {
+                    find_best_presorted_split_par(
+                        black_box(&sorted),
+                        None,
+                        1,
+                        black_box(parent_sum),
+                        black_box(parent_weight),
+                    )
+                })
+            });
         }
     }
 
@@ -1362,7 +1351,8 @@ fn bench_survival_training(c: &mut Criterion) {
                     0.1,
                     DecisionTreeLearner::default_sklearn(),
                 );
-                m.fit(black_box(&x), black_box(&time), black_box(&event)).unwrap()
+                m.fit(black_box(&x), black_box(&time), black_box(&event))
+                    .unwrap()
             })
         });
 
@@ -1373,7 +1363,8 @@ fn bench_survival_training(c: &mut Criterion) {
                     0.1,
                     HistogramLearner::new(3),
                 );
-                m.fit(black_box(&x), black_box(&time), black_box(&event)).unwrap()
+                m.fit(black_box(&x), black_box(&time), black_box(&event))
+                    .unwrap()
             })
         });
     }

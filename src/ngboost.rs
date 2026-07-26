@@ -706,7 +706,10 @@ where
         }
         // Degenerate weights silently poison every weighted mean downstream
         // (0/0 = NaN losses reported as Ok, dead line search); reject up front.
-        for (w, n) in [(sample_weight, y.len()), (val_sample_weight, y_val.map_or(0, |v| v.len()))] {
+        for (w, n) in [
+            (sample_weight, y.len()),
+            (val_sample_weight, y_val.map_or(0, |v| v.len())),
+        ] {
             if let Some(w) = w {
                 if w.len() != n {
                     return Err("sample_weight length must match the number of samples");
@@ -780,7 +783,8 @@ where
             // never empty (an empty one would make every val_loss 0.0 and
             // "early stop" at the first iteration).
             let n_samples = x.nrows();
-            let n_val = (((n_samples as f64) * self.validation_fraction).ceil() as usize).min(n_samples);
+            let n_val =
+                (((n_samples as f64) * self.validation_fraction).ceil() as usize).min(n_samples);
             let n_train = n_samples - n_val;
             if n_train == 0 {
                 return Err("validation_fraction leaves no training data");
@@ -962,11 +966,7 @@ where
                         self.tikhonov_reg,
                     )
                 } else {
-                    Scorable::<S>::dense_natural_grad(
-                        &batch_dist,
-                        y_sampled_ref,
-                        self.tikhonov_reg,
-                    )
+                    Scorable::<S>::dense_natural_grad(&batch_dist, y_sampled_ref, self.tikhonov_reg)
                 }
             } else {
                 Scorable::grad(&batch_dist, y_sampled_ref, self.natural_gradient)
@@ -1435,10 +1435,8 @@ where
             let mut buf = vec![0.0; rows];
             // zip with `factors` (len n_iters) truncates to the requested
             // iteration count
-            for ((learners, col_idx), &factor) in base_models
-                .iter()
-                .zip(col_idxs.iter())
-                .zip(factors.iter())
+            for ((learners, col_idx), &factor) in
+                base_models.iter().zip(col_idxs.iter()).zip(factors.iter())
             {
                 let mapping = if col_idx.len() == p {
                     None
@@ -2033,9 +2031,9 @@ where
                 learners
                     .iter()
                     .map(|learner| {
-                        learner.to_serializable().ok_or(
-                            "base learner type does not support serialization",
-                        )
+                        learner
+                            .to_serializable()
+                            .ok_or("base learner type does not support serialization")
                     })
                     .collect::<Result<Vec<_>, _>>()
             })

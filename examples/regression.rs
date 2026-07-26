@@ -8,11 +8,9 @@ extern crate accelerate_src;
 // - Training an NGBoost model with Normal distribution
 // - Making predictions and evaluating performance
 
-
-
 use ndarray::{Array1, Array2};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 use ngboost_rs::dist::Normal;
 use ngboost_rs::learners::StumpLearner;
 use ngboost_rs::ngboost::NGBoost;

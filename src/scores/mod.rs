@@ -507,7 +507,7 @@ pub trait Scorable<S: Score> {
 #[cfg(test)]
 mod natgrad_tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
     use ndarray_linalg::Solve;
 
     /// The closed-form 2×2 / 3×3 solve must agree with the generic LAPACK solve
@@ -528,8 +528,7 @@ mod natgrad_tests {
             let n = g.len();
             let expected = m.solve_into(g.clone()).unwrap();
             for &reg in &[0.0, 1e-3] {
-                let got =
-                    solve_small_natural_gradient(&g.view(), &m.view(), reg, n).unwrap();
+                let got = solve_small_natural_gradient(&g.view(), &m.view(), reg, n).unwrap();
                 let mut m_reg = m.clone();
                 for j in 0..n {
                     m_reg[[j, j]] += reg;

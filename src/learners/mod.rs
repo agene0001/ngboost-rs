@@ -753,8 +753,7 @@ impl BaseLearner for HistogramLearner {
                     rows.to_vec(),
                     Some(&mut preds_full),
                 )?;
-                let preds =
-                    Array1::from_iter(rows.iter().map(|&r| preds_full[r as usize]));
+                let preds = Array1::from_iter(rows.iter().map(|&r| preds_full[r as usize]));
                 Ok((fitted, preds))
             }
             // Wrong cache type or stale dims — materialize the subset and
@@ -780,7 +779,8 @@ impl BaseLearner for HistogramLearner {
     ) -> Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str> {
         // Identity column set → the specialized full-feature paths (which keep
         // their shared-root-counts fast path and exact legacy behavior).
-        let identity_cols = cols.len() == x.ncols() && cols.iter().enumerate().all(|(i, &c)| c == i);
+        let identity_cols =
+            cols.len() == x.ncols() && cols.iter().enumerate().all(|(i, &c)| c == i);
         if identity_cols {
             return match rows {
                 Some(r) => self.fit_predict_cached_rows(x, y, sample_weight, cache, r),
@@ -1054,10 +1054,7 @@ impl FeatureHists {
                 }
             }
         } else if indices.len() == cache.n_rows
-            && indices
-                .iter()
-                .enumerate()
-                .all(|(k, &i)| i as usize == k)
+            && indices.iter().enumerate().all(|(k, &i)| i as usize == k)
         {
             // ROOT node, unweighted: bin counts depend only on the binned
             // matrix, so seed them from the cache (computed once per cache,
@@ -1339,8 +1336,7 @@ fn build_histogram_tree_node(
             let right_count = parent_count - left_count;
             let right_sum = parent_sum - left_sum;
 
-            if left_raw < min_samples_leaf as f64
-                || parent_raw - left_raw < min_samples_leaf as f64
+            if left_raw < min_samples_leaf as f64 || parent_raw - left_raw < min_samples_leaf as f64
             {
                 continue;
             }
@@ -1511,8 +1507,7 @@ fn build_histogram_tree_node_cols(
             let right_count = parent_count - left_count;
             let right_sum = parent_sum - left_sum;
 
-            if left_raw < min_samples_leaf as f64
-                || parent_raw - left_raw < min_samples_leaf as f64
+            if left_raw < min_samples_leaf as f64 || parent_raw - left_raw < min_samples_leaf as f64
             {
                 continue;
             }
@@ -2032,8 +2027,11 @@ fn build_presorted_features(x: &Array2<f64>, y: &Array1<f64>) -> Vec<Vec<SortedE
                 row: i as u32,
             })
             .collect();
-        entries
-            .sort_unstable_by(|a, b| a.val.partial_cmp(&b.val).unwrap_or(std::cmp::Ordering::Equal));
+        entries.sort_unstable_by(|a, b| {
+            a.val
+                .partial_cmp(&b.val)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         entries
     };
 
@@ -3053,7 +3051,11 @@ fn evaluate_feature_split(
         val: feature_col[i] as f32,
         row: i as u32,
     }));
-    sort_buf.sort_unstable_by(|a, b| a.val.partial_cmp(&b.val).unwrap_or(std::cmp::Ordering::Equal));
+    sort_buf.sort_unstable_by(|a, b| {
+        a.val
+            .partial_cmp(&b.val)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     scan_sorted_entries(
         sort_buf,
@@ -3378,18 +3380,17 @@ mod presort_tests {
     fn exact_tree_fit_predict_f32_consistent() {
         let eps24 = (2.0f64).powi(-24); // half of the f32 ULP at 1.0
         let adversarial = 1.0 + eps24; // f32 cast = 1.0 (ties-to-even)
-        let x = Array2::from_shape_vec(
-            (3, 1),
-            vec![1.0, adversarial, 1.0 + 2.0 * eps24],
-        )
-        .unwrap();
+        let x = Array2::from_shape_vec((3, 1), vec![1.0, adversarial, 1.0 + 2.0 * eps24]).unwrap();
         let y = Array1::from_vec(vec![0.0, 0.0, 10.0]);
         // Split lands between f32 groups {1.0, 1.0} and {1 + 2^-23}:
         // threshold = 1 + 2^-24 == adversarial exactly.
 
         let tree = DecisionTreeLearner::new(1).fit(&x, &y).unwrap();
         let p = tree.predict(&x);
-        assert_eq!(p[1], 0.0, "depth-1 tree routed the tie value to the wrong leaf");
+        assert_eq!(
+            p[1], 0.0,
+            "depth-1 tree routed the tie value to the wrong leaf"
+        );
         assert_eq!(p[0], 0.0);
         assert_eq!(p[2], 10.0);
 
@@ -3399,7 +3400,10 @@ mod presort_tests {
 
         let arena = ArenaDecisionTreeLearner::new(1).fit(&x, &y).unwrap();
         let p = arena.predict(&x);
-        assert_eq!(p[1], 0.0, "arena tree routed the tie value to the wrong leaf");
+        assert_eq!(
+            p[1], 0.0,
+            "arena tree routed the tie value to the wrong leaf"
+        );
     }
 
     /// A stump is a depth-1 tree: both must pick the same split and produce
@@ -3553,8 +3557,16 @@ mod presort_tests {
             let seq = find_best_presorted_split_seq(&sorted, Some(&w), 1, ps, pw);
             let par = find_best_presorted_split_par(&sorted, Some(&w), 1, ps, pw);
             assert_eq!(seq.0, par.0, "weighted feature mismatch (n={n}, p={p})");
-            assert_eq!(seq.1.to_bits(), par.1.to_bits(), "weighted threshold mismatch");
-            assert_eq!(seq.2.to_bits(), par.2.to_bits(), "weighted improvement mismatch");
+            assert_eq!(
+                seq.1.to_bits(),
+                par.1.to_bits(),
+                "weighted threshold mismatch"
+            );
+            assert_eq!(
+                seq.2.to_bits(),
+                par.2.to_bits(),
+                "weighted improvement mismatch"
+            );
         }
     }
 
@@ -4003,7 +4015,10 @@ mod ridge_tests {
             .fit_with_weights(&x, &y, Some(&w))
             .unwrap()
             .predict(&x);
-        let pd = learner.fit_with_weights(&xd, &yd, None).unwrap().predict(&x);
+        let pd = learner
+            .fit_with_weights(&xd, &yd, None)
+            .unwrap()
+            .predict(&x);
         for i in 0..n {
             assert!(
                 (pw[i] - pd[i]).abs() <= 1e-9 * pd[i].abs().max(1.0),
@@ -4114,7 +4129,10 @@ mod col_masked_tests {
         let (x, y) = synth(1200, 10, 99);
         let cols = vec![8, 1, 4, 0, 6];
         // Unsorted row subset with the shuffle-like order sample() produces.
-        let rows: Vec<u32> = (0..1200u32).filter(|r| (r * 2654435761) % 5 < 3).rev().collect();
+        let rows: Vec<u32> = (0..1200u32)
+            .filter(|r| (r * 2654435761) % 5 < 3)
+            .rev()
+            .collect();
         let weights = Array1::from_shape_fn(1200, |i| 0.25 + ((i * 13 % 50) as f64) / 50.0);
 
         for w in [None, Some(&weights)] {
@@ -4130,7 +4148,9 @@ mod col_masked_tests {
             assert_bitwise(&preds_a, &preds_b, "determinism");
 
             let idx: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
-            let x_sub = x.select(ndarray::Axis(0), &idx).select(ndarray::Axis(1), &cols);
+            let x_sub = x
+                .select(ndarray::Axis(0), &idx)
+                .select(ndarray::Axis(1), &cols);
             assert_bitwise(&preds_a, &fitted_a.predict(&x_sub), "scatter vs predict");
         }
     }
@@ -4167,10 +4187,10 @@ mod col_masked_tests {
 mod col_masked_bench {
     //! Wall-clock proof for the column-masked cache fit. Run with:
     //! `cargo test --release --lib --features openblas,simd-math bench_col_sample -- --ignored --nocapture`
+    use super::HistogramLearner;
     use crate::dist::Poisson;
     use crate::ngboost::NGBoost;
     use crate::scores::LogScore;
-    use super::HistogramLearner;
     use ndarray::{Array1, Array2};
     use std::time::Instant;
 
@@ -4189,7 +4209,9 @@ mod col_masked_bench {
         };
         let x = Array2::from_shape_fn((n, p), |_| next());
         let y = Array1::from_shape_fn(n, |i| {
-            (x[[i, 0]] * 4.0 + x[[i, 1]] * 3.0 + next() * 2.0).round().max(0.0)
+            (x[[i, 0]] * 4.0 + x[[i, 1]] * 3.0 + next() * 2.0)
+                .round()
+                .max(0.0)
         });
 
         for (label, col_sample, mb) in [

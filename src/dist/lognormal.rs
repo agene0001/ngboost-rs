@@ -379,8 +379,8 @@ fn norm_ln_sf(z: f64) -> f64 {
     } else {
         // Mills expansion: S(z) = φ(z)/z · (1 − 1/z² + 3/z⁴ − 15/z⁶ + 105/z⁸ …)
         let z2 = z * z;
-        let series = -1.0 / z2 + 3.0 / (z2 * z2) - 15.0 / (z2 * z2 * z2)
-            + 105.0 / (z2 * z2 * z2 * z2);
+        let series =
+            -1.0 / z2 + 3.0 / (z2 * z2) - 15.0 / (z2 * z2 * z2) + 105.0 / (z2 * z2 * z2 * z2);
         -0.5 * z2 - z.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln() + series.ln_1p()
     }
 }
@@ -393,8 +393,7 @@ fn norm_hazard(z: f64) -> f64 {
         phi / (0.5 * statrs::function::erf::erfc(z / std::f64::consts::SQRT_2))
     } else {
         let z2 = z * z;
-        z / (1.0 - 1.0 / z2 + 3.0 / (z2 * z2) - 15.0 / (z2 * z2 * z2)
-            + 105.0 / (z2 * z2 * z2 * z2))
+        z / (1.0 - 1.0 / z2 + 3.0 / (z2 * z2) - 15.0 / (z2 * z2 * z2) + 105.0 / (z2 * z2 * z2 * z2))
     }
 }
 
@@ -605,10 +604,30 @@ mod tests {
     #[test]
     fn test_censored_log_score_stable_tail() {
         let cases: [(f64, f64, f64, f64); 4] = [
-            (2.0, 3.7831843336820319, -2.3732155328228409, -4.7464310656456817),
-            (6.0, 20.736768949974706, -6.1584826045445989, -36.950895627267594),
-            (10.0, 53.231285150512471, -10.098093233962512, -100.98093233962512),
-            (40.0, 804.60844201375379, -40.024968847207264, -1600.9987538882905),
+            (
+                2.0,
+                3.7831843336820319,
+                -2.3732155328228409,
+                -4.7464310656456817,
+            ),
+            (
+                6.0,
+                20.736768949974706,
+                -6.1584826045445989,
+                -36.950895627267594,
+            ),
+            (
+                10.0,
+                53.231285150512471,
+                -10.098093233962512,
+                -100.98093233962512,
+            ),
+            (
+                40.0,
+                804.60844201375379,
+                -40.024968847207264,
+                -1600.9987538882905,
+            ),
         ];
         let params = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
         let dist = LogNormal::from_params(&params);
@@ -639,8 +658,7 @@ mod tests {
                 event: Array1::from_vec(vec![false]),
             };
             let score_at = |mu: f64, log_sigma: f64| -> f64 {
-                let params =
-                    Array2::from_shape_vec((1, 2), vec![mu, log_sigma]).unwrap();
+                let params = Array2::from_shape_vec((1, 2), vec![mu, log_sigma]).unwrap();
                 let dist = LogNormal::from_params(&params);
                 CensoredScorable::<LogScoreCensored>::censored_score(&dist, &y)[0]
             };

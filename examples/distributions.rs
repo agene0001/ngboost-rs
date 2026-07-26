@@ -9,10 +9,9 @@ extern crate accelerate_src;
 // - Gamma: Positive continuous data (e.g., wait times)
 // - Laplace: Data with heavy tails
 
-
 use ndarray::{Array1, Array2};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 use ngboost_rs::dist::{Exponential, Gamma, Laplace, Normal, Poisson};
 use ngboost_rs::learners::StumpLearner;
 use ngboost_rs::ngboost::NGBoost;

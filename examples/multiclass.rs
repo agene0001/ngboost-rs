@@ -10,8 +10,8 @@ extern crate accelerate_src;
 // Run with: cargo run --example multiclass --features accelerate
 
 use ndarray::{Array1, Array2};
-use ngboost_rs::dist::categorical::{Categorical3, Categorical5};
 use ngboost_rs::dist::Distribution;
+use ngboost_rs::dist::categorical::{Categorical3, Categorical5};
 use ngboost_rs::learners::default_tree_learner;
 use ngboost_rs::ngboost::NGBoost;
 use ngboost_rs::scores::{LogScore, Scorable};

@@ -3,9 +3,9 @@
 use approx::assert_relative_eq;
 use ndarray::Array1;
 use ngboost_rs::evaluation::{
-    brier_score, calculate_calib_error, calibration_curve_data, calibration_regression,
-    concordance_index, concordance_index_uncensored_only, log_loss, mean_absolute_error,
-    mean_squared_error, pit_histogram, root_mean_squared_error, CalibrationResult,
+    CalibrationResult, brier_score, calculate_calib_error, calibration_curve_data,
+    calibration_regression, concordance_index, concordance_index_uncensored_only, log_loss,
+    mean_absolute_error, mean_squared_error, pit_histogram, root_mean_squared_error,
 };
 
 // ============================================================================

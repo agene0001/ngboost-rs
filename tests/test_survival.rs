@@ -6,11 +6,11 @@ extern crate accelerate_src;
 // Tests the NGBSurvival implementation with censored data.
 
 use ndarray::{Array1, Array2};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
+use ngboost_rs::dist::Distribution;
 use ngboost_rs::dist::exponential::Exponential;
 use ngboost_rs::dist::lognormal::LogNormal;
-use ngboost_rs::dist::Distribution;
 use ngboost_rs::learners::default_tree_learner;
 use ngboost_rs::scores::{CRPScoreCensored, CensoredScorable, LogScoreCensored, SurvivalData};
 use ngboost_rs::survival::{NGBSurvival, NGBSurvivalExponential, NGBSurvivalLogNormal};
@@ -202,8 +202,7 @@ fn test_survival_parallel_get_params_bit_exact() {
             col_major.push(x_big[[r, c]]);
         }
     }
-    let x_f =
-        Array2::from_shape_vec((x_big.nrows(), x_big.ncols()).f(), col_major).unwrap();
+    let x_f = Array2::from_shape_vec((x_big.nrows(), x_big.ncols()).f(), col_major).unwrap();
     assert!(
         x_f.as_slice().is_none(),
         "f-order copy must not be standard layout"

@@ -393,7 +393,9 @@ fn test_parallel_prediction_path_bit_exact() {
 
     let mut pieces = Vec::new();
     for chunk_start in (0..1200).step_by(300) {
-        let xs = x.slice(ndarray::s![chunk_start..chunk_start + 300, ..]).to_owned();
+        let xs = x
+            .slice(ndarray::s![chunk_start..chunk_start + 300, ..])
+            .to_owned();
         pieces.push(ngb.pred_param(&xs));
     }
 
@@ -440,7 +442,9 @@ fn test_parallel_prediction_path_bit_exact_col_subsample() {
 
     let mut pieces = Vec::new();
     for chunk_start in (0..1200).step_by(300) {
-        let xs = x.slice(ndarray::s![chunk_start..chunk_start + 300, ..]).to_owned();
+        let xs = x
+            .slice(ndarray::s![chunk_start..chunk_start + 300, ..])
+            .to_owned();
         pieces.push(ngb.pred_param(&xs));
     }
 
@@ -474,7 +478,17 @@ fn test_partial_fit_after_early_stopped_fit_is_not_truncated() {
     // validation_fraction = 0.0 so the later partial_fit (no explicit val
     // data) does not auto-split: early stopping is configured but cannot run.
     let mut ngb = NGBRegressor::with_options(
-        40, 0.05, true, 1.0, 1.0, false, 100.0, 1e-12, Some(5), 0.0, false,
+        40,
+        0.05,
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-12,
+        Some(5),
+        0.0,
+        false,
     );
     ngb.fit_with_validation(&x_train, &y_train, Some(&x_val), Some(&y_val))
         .expect("fit should succeed");
@@ -611,7 +625,17 @@ fn test_best_val_loss_itr_is_global_across_partial_fits() {
 fn test_early_stopping_auto_split_tiny_dataset() {
     let (x, y) = generate_regression_data(8, 2);
     let mut ngb = NGBRegressor::with_options(
-        30, 0.1, true, 1.0, 1.0, false, 100.0, 1e-12, Some(10), 0.1, false,
+        30,
+        0.1,
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-12,
+        Some(10),
+        0.1,
+        false,
     );
     ngb.fit(&x, &y).expect("fit should succeed");
 
@@ -631,9 +655,9 @@ fn test_early_stopping_auto_split_tiny_dataset() {
 /// is an error, since it would silently skew early stopping.
 #[test]
 fn test_early_stopping_weight_mismatch_is_an_error() {
+    use ngboost_rs::dist::Normal;
     use ngboost_rs::learners::default_base_learner;
     use ngboost_rs::ngboost::NGBoost;
-    use ngboost_rs::dist::Normal;
     use ngboost_rs::scores::LogScore;
 
     let (x, y) = generate_regression_data(200, 3);
@@ -684,8 +708,15 @@ fn test_early_stopping_weight_mismatch_is_an_error() {
         0.1,
         false,
     );
-    ngb2.fit_with_validation(&x_train, &y_train, Some(&x_val), Some(&y_val), Some(&w), None)
-        .expect("permitted without early stopping");
+    ngb2.fit_with_validation(
+        &x_train,
+        &y_train,
+        Some(&x_val),
+        Some(&y_val),
+        Some(&w),
+        None,
+    )
+    .expect("permitted without early stopping");
 }
 
 /// The row-subsampled histogram path (full-X bin edges reused across
@@ -751,13 +782,33 @@ fn test_degenerate_config_rejected() {
 
     // early_stopping_rounds = 0 silently trained exactly 1 estimator
     let mut m = NGBRegressor::with_options(
-        20, 0.1, true, 1.0, 1.0, false, 100.0, 1e-4, Some(0), 0.1, false,
+        20,
+        0.1,
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-4,
+        Some(0),
+        0.1,
+        false,
     );
     assert!(m.fit(&x, &y).is_err());
 
     // early stopping with no possible validation data silently disabled it
     let mut m = NGBRegressor::with_options(
-        20, 0.1, true, 1.0, 1.0, false, 100.0, 1e-4, Some(5), 0.0, false,
+        20,
+        0.1,
+        true,
+        1.0,
+        1.0,
+        false,
+        100.0,
+        1e-4,
+        Some(5),
+        0.0,
+        false,
     );
     assert!(m.fit(&x, &y).is_err());
 
@@ -797,17 +848,29 @@ fn test_classifier_label_validation() {
     let x = Array2::random((40, 3), Uniform::new(0.0, 1.0).unwrap());
 
     // negative labels (SVM-style {-1, +1})
-    let y_neg = Array1::from_vec((0..40).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect());
+    let y_neg = Array1::from_vec(
+        (0..40)
+            .map(|i| if i % 2 == 0 { -1.0 } else { 1.0 })
+            .collect(),
+    );
     let mut m = NGBClassifier::new(10, 0.1);
     assert!(m.fit(&x, &y_neg).is_err());
 
     // label >= K (binary classifier fed a 2.0) — used to panic
-    let y_big = Array1::from_vec((0..40).map(|i| f64::from(u8::from(i % 3 == 0)) + 1.0).collect());
+    let y_big = Array1::from_vec(
+        (0..40)
+            .map(|i| f64::from(u8::from(i % 3 == 0)) + 1.0)
+            .collect(),
+    );
     let mut m = NGBClassifier::new(10, 0.1);
     assert!(m.fit(&x, &y_big).is_err());
 
     // non-integer labels
-    let y_frac = Array1::from_vec((0..40).map(|i| if i % 2 == 0 { 0.5 } else { 1.0 }).collect());
+    let y_frac = Array1::from_vec(
+        (0..40)
+            .map(|i| if i % 2 == 0 { 0.5 } else { 1.0 })
+            .collect(),
+    );
     let mut m = NGBClassifier::new(10, 0.1);
     assert!(m.fit(&x, &y_frac).is_err());
 

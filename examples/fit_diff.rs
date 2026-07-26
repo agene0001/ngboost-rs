@@ -16,7 +16,13 @@ fn main() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect())
+        .map(|r| {
+            r.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect()
+        })
         .collect();
     let n = xv.len();
     let p = xv[0].len();
@@ -67,8 +73,12 @@ fn main() {
         .zip(model.scalings.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f64, f64::max);
-    println!("scalings diff: {:.2e} (py first 3: {:?}, rs first 3: {:?})",
-        sc_diff, &sc_py[..3.min(sc_py.len())], &model.scalings[..3.min(model.scalings.len())]);
+    println!(
+        "scalings diff: {:.2e} (py first 3: {:?}, rs first 3: {:?})",
+        sc_diff,
+        &sc_py[..3.min(sc_py.len())],
+        &model.scalings[..3.min(model.scalings.len())]
+    );
 
     // staged params: python (n_params, N); rust .params() -> (N, n_params)
     let staged_rs = model.staged_pred_dist(&x);
@@ -79,7 +89,13 @@ fn main() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect())
+            .map(|r| {
+                r.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap())
+                    .collect()
+            })
             .collect();
         let mut max_d = 0.0f64;
         for i in 0..n {

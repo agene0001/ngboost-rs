@@ -284,7 +284,11 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
                     let p_j = self.probs[[j + 1, i]];
                     for k in 0..n_params {
                         let p_k = self.probs[[k + 1, i]];
-                        fi[[j, k]] = if j == k { p_j * (1.0 - p_j) } else { -p_j * p_k };
+                        fi[[j, k]] = if j == k {
+                            p_j * (1.0 - p_j)
+                        } else {
+                            -p_j * p_k
+                        };
                     }
                 }
                 let g_row = grad.row(i).to_owned();
@@ -465,9 +469,8 @@ mod tests {
         let y = Array1::from_vec(vec![1.0, 1.0, 2.0, 2.0]);
         let init = Categorical::<3>::fit(&y);
         assert!(init.iter().all(|v| v.is_finite()));
-        let dist = Categorical::<3>::from_params(
-            &init.clone().insert_axis(ndarray::Axis(0)).to_owned(),
-        );
+        let dist =
+            Categorical::<3>::from_params(&init.clone().insert_axis(ndarray::Axis(0)).to_owned());
         // probabilities must be finite, positive, and sum to 1
         let p = &dist.probs;
         let total: f64 = p.column(0).sum();
@@ -638,8 +641,7 @@ mod tests {
     #[test]
     fn test_categorical_crps_d_score_matches_finite_diff() {
         // Asymmetric 3-class logits across several observations, covering each true class
-        let params =
-            Array2::from_shape_vec((3, 2), vec![0.7, -1.2, -0.3, 0.9, 1.5, 0.4]).unwrap();
+        let params = Array2::from_shape_vec((3, 2), vec![0.7, -1.2, -0.3, 0.9, 1.5, 0.4]).unwrap();
         let y = Array1::from_vec(vec![0.0, 1.0, 2.0]);
         let dist = Categorical::<3>::from_params(&params);
 
@@ -655,8 +657,7 @@ mod tests {
 
     #[test]
     fn test_categorical_logscore_d_score_matches_finite_diff() {
-        let params =
-            Array2::from_shape_vec((3, 2), vec![0.7, -1.2, -0.3, 0.9, 1.5, 0.4]).unwrap();
+        let params = Array2::from_shape_vec((3, 2), vec![0.7, -1.2, -0.3, 0.9, 1.5, 0.4]).unwrap();
         let y = Array1::from_vec(vec![0.0, 1.0, 2.0]);
         let dist = Categorical::<3>::from_params(&params);
 

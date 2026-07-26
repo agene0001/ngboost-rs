@@ -83,21 +83,33 @@ impl HyperParamSpec {
     pub fn float(name: impl Into<String>, low: f64, high: f64) -> Self {
         Self {
             name: name.into(),
-            param_type: HyperParamType::Float { low, high, log: false },
+            param_type: HyperParamType::Float {
+                low,
+                high,
+                log: false,
+            },
         }
     }
 
     pub fn log_float(name: impl Into<String>, low: f64, high: f64) -> Self {
         Self {
             name: name.into(),
-            param_type: HyperParamType::Float { low, high, log: true },
+            param_type: HyperParamType::Float {
+                low,
+                high,
+                log: true,
+            },
         }
     }
 
     pub fn int(name: impl Into<String>, low: i64, high: i64) -> Self {
         Self {
             name: name.into(),
-            param_type: HyperParamType::Int { low, high, log: false },
+            param_type: HyperParamType::Int {
+                low,
+                high,
+                log: false,
+            },
         }
     }
 
@@ -210,9 +222,8 @@ impl PrunerState {
                 match self.intermediate_scores.get(&step) {
                     Some(scores) if !scores.is_empty() => {
                         let mut sorted = scores.clone();
-                        sorted.sort_by(|a, b| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        sorted
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         let median = sorted[sorted.len() / 2];
                         score > median
                     }
@@ -229,11 +240,9 @@ impl PrunerState {
                 match self.intermediate_scores.get(&step) {
                     Some(scores) if !scores.is_empty() => {
                         let mut sorted = scores.clone();
-                        sorted.sort_by(|a, b| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        let idx = ((sorted.len() as f64 * percentile / 100.0).ceil()
-                            as usize)
+                        sorted
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let idx = ((sorted.len() as f64 * percentile / 100.0).ceil() as usize)
                             .saturating_sub(1)
                             .min(sorted.len() - 1);
                         let threshold = sorted[idx];
@@ -529,7 +538,11 @@ fn make_optimizer(
 ) -> Result<Option<TpeOptimizer>, Box<dyn std::error::Error>> {
     let optimizer = match param_type {
         HyperParamType::Float { low, high, log } => {
-            let (lo, hi) = if *log { (low.ln(), high.ln()) } else { (*low, *high) };
+            let (lo, hi) = if *log {
+                (low.ln(), high.ln())
+            } else {
+                (*low, *high)
+            };
             Some(TpeOptimizer::new(parzen_estimator(), range(lo, hi)?))
         }
         HyperParamType::Int { low, high, log } => {
@@ -622,8 +635,7 @@ where
     // Forward-chaining splits into `n_folds + 1` time segments; disabled when there
     // are too few rows to segment (falls back to k-fold/holdout behavior).
     let ts_seg = n_samples / (n_folds + 1);
-    let time_series =
-        matches!(cv_scheme, CvScheme::TimeSeries) && !single_holdout && ts_seg > 0;
+    let time_series = matches!(cv_scheme, CvScheme::TimeSeries) && !single_holdout && ts_seg > 0;
     let mut fold_scores = Vec::with_capacity(n_iters);
     // Boosting rounds each fold actually used (early-stopped best iteration
     // + 1, or the full sampled count when early stopping never fired).
@@ -737,10 +749,8 @@ where
         // Pruning is meaningless with a single holdout — there are no further
         // folds to skip.
         if !single_holdout {
-            let running_mean =
-                fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
-            if pruner_state.should_prune(pruning_strategy, i, running_mean, n_completed_trials)
-            {
+            let running_mean = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+            if pruner_state.should_prune(pruning_strategy, i, running_mean, n_completed_trials) {
                 pruned = true;
                 break;
             }
@@ -755,10 +765,7 @@ where
     let mean_rounds = if fold_rounds.is_empty() {
         None
     } else {
-        Some(
-            (fold_rounds.iter().sum::<usize>() as f64 / fold_rounds.len() as f64).round()
-                as usize,
-        )
+        Some((fold_rounds.iter().sum::<usize>() as f64 / fold_rounds.len() as f64).round() as usize)
     };
 
     (final_score, pruned, fold_scores, mean_rounds)
@@ -775,9 +782,7 @@ where
 /// * `{ "low": …, "high": …, "log": true }`        → log-float
 /// * `{ "low": …, "high": …, "type": "int" }`      → int (or log-int with both)
 /// * `{ "choices": [...] }`                        → categorical
-pub fn parse_hp_specs(
-    hp_dict: &HashMap<String, Value>,
-) -> Result<Vec<HyperParamSpec>, String> {
+pub fn parse_hp_specs(hp_dict: &HashMap<String, Value>) -> Result<Vec<HyperParamSpec>, String> {
     let mut specs = Vec::with_capacity(hp_dict.len());
 
     // NOTE: sorted by name below — HashMap iteration order is per-process
@@ -812,8 +817,7 @@ pub fn parse_hp_specs(
                         .and_then(|v| v.as_f64())
                         .ok_or_else(|| format!("Missing 'high' for {}", name))?;
                     let log = obj.get("log").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let is_int =
-                        obj.get("type").and_then(|v| v.as_str()) == Some("int");
+                    let is_int = obj.get("type").and_then(|v| v.as_str()) == Some("int");
 
                     if is_int {
                         HyperParamSpec {
@@ -966,21 +970,16 @@ mod tests {
             verbose: false,
         };
 
-        let result = hyper_opt_with_config::<Normal, LogScore, StumpLearner, _>(
-            &x,
-            &y,
-            &hp,
-            cfg,
-            |p| {
-                let lr = p.get("learning_rate").and_then(|v| v.as_f64()).unwrap_or(0.05);
-                let n_est = p
-                    .get("n_estimators")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(10) as u32;
+        let result =
+            hyper_opt_with_config::<Normal, LogScore, StumpLearner, _>(&x, &y, &hp, cfg, |p| {
+                let lr = p
+                    .get("learning_rate")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.05);
+                let n_est = p.get("n_estimators").and_then(|v| v.as_i64()).unwrap_or(10) as u32;
                 NGBoost::<Normal, LogScore, StumpLearner>::new(n_est, lr, StumpLearner)
-            },
-        )
-        .expect("hyper_opt should succeed on smoke test");
+            })
+            .expect("hyper_opt should succeed on smoke test");
 
         assert!(!result.best_params.is_empty());
         assert_eq!(result.trials.len(), 3);
@@ -1040,7 +1039,11 @@ mod tests {
             run_categorical_tpe(&["alpha", "best", "gamma", "delta"], "best", 7, 100);
         assert_eq!(modal, "best");
         // Majority of the last 50 picks (strictly more than half).
-        assert!(count > 25, "best picked only {}/50 times in second half", count);
+        assert!(
+            count > 25,
+            "best picked only {}/50 times in second half",
+            count
+        );
     }
 
     /// Unordered-sensitivity: the same objective with category labels
@@ -1052,9 +1055,9 @@ mod tests {
     #[test]
     fn test_categorical_permutation_invariance() {
         let permutations: [[&str; 4]; 3] = [
-            ["best", "sgd", "rmsprop", "lbfgs"],  // best first
-            ["sgd", "rmsprop", "lbfgs", "best"],  // best last
-            ["sgd", "best", "rmsprop", "lbfgs"],  // best mid-list
+            ["best", "sgd", "rmsprop", "lbfgs"], // best first
+            ["sgd", "rmsprop", "lbfgs", "best"], // best last
+            ["sgd", "best", "rmsprop", "lbfgs"], // best mid-list
         ];
         for (i, perm) in permutations.iter().enumerate() {
             let (modal, count) = run_categorical_tpe(perm, "best", 1234, 80);
@@ -1096,14 +1099,11 @@ mod tests {
             verbose: false,
         };
 
-        let result = hyper_opt_with_config::<Normal, LogScore, StumpLearner, _>(
-            &x,
-            &y,
-            &hp,
-            cfg,
-            |_p| NGBoost::<Normal, LogScore, StumpLearner>::new(10, 0.05, StumpLearner),
-        )
-        .expect("hyper_opt with categorical param should succeed");
+        let result =
+            hyper_opt_with_config::<Normal, LogScore, StumpLearner, _>(&x, &y, &hp, cfg, |_p| {
+                NGBoost::<Normal, LogScore, StumpLearner>::new(10, 0.05, StumpLearner)
+            })
+            .expect("hyper_opt with categorical param should succeed");
 
         let is_valid_choice = |v: &Value| v.as_str().is_some_and(|s| choices.contains(&s));
         assert_eq!(result.trials.len(), 4);
@@ -1112,6 +1112,10 @@ mod tests {
             assert!(is_valid_choice(v), "sampled invalid choice {:?}", v);
         }
         let best = result.best_params.get("mode").expect("mode in best_params");
-        assert!(is_valid_choice(best), "best choice {:?} not in declared set", best);
+        assert!(
+            is_valid_choice(best),
+            "best choice {:?} not in declared set",
+            best
+        );
     }
 }

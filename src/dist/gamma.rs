@@ -231,13 +231,7 @@ pub(crate) fn gamma_ppf_unit(a: f64, q: f64) -> f64 {
     use statrs::function::gamma::{gamma_lr, ln_gamma};
     debug_assert!(a > 0.0 && q > 0.0 && q < 1.0);
 
-    let cdf = |x: f64| -> f64 {
-        if x <= 0.0 {
-            0.0
-        } else {
-            gamma_lr(a, x)
-        }
-    };
+    let cdf = |x: f64| -> f64 { if x <= 0.0 { 0.0 } else { gamma_lr(a, x) } };
     let pdf = |x: f64| -> f64 { ((a - 1.0) * x.ln() - x - ln_gamma(a)).exp() };
 
     // Seed A: Wilson–Hilferty cube approximation.
@@ -512,20 +506,19 @@ impl Scorable<CRPScore> for Gamma {
             let s_hi = (shape_i + 12.0 * shape_i.sqrt() + 40.0).ln();
 
             // Log-domain panel over s ∈ [s_lo, s_hi] with n nodes.
-            let log_panel =
-                |acc: &mut [[f64; 2]; 2], s_lo: f64, s_hi: f64, n: usize| {
-                    if n == 0 || s_hi <= s_lo {
-                        return;
-                    }
-                    let ds = (s_hi - s_lo) / n as f64;
-                    for j in 0..n {
-                        let s = s_lo + ds * (j as f64 + 0.5);
-                        let w_node = s.exp();
-                        // pdf(w)·w·Δs computed in log space (no y^(α−1) overflow)
-                        let w = (shape_i * s - w_node - ln_gamma_a).exp() * ds;
-                        accumulate(acc, w, grads_at(w_node / rate_i));
-                    }
-                };
+            let log_panel = |acc: &mut [[f64; 2]; 2], s_lo: f64, s_hi: f64, n: usize| {
+                if n == 0 || s_hi <= s_lo {
+                    return;
+                }
+                let ds = (s_hi - s_lo) / n as f64;
+                for j in 0..n {
+                    let s = s_lo + ds * (j as f64 + 0.5);
+                    let w_node = s.exp();
+                    // pdf(w)·w·Δs computed in log space (no y^(α−1) overflow)
+                    let w = (shape_i * s - w_node - ln_gamma_a).exp() * ds;
+                    accumulate(acc, w, grads_at(w_node / rate_i));
+                }
+            };
 
             if shape_i >= 1.0 {
                 let s_lo = ((1e-13f64).ln() + ln_gamma_a1) / shape_i;
@@ -673,11 +666,9 @@ mod tests {
             (3.0, 2.5, 4.848041975e-1, 4.460508116e-1, -4.623662583e-1),
         ];
         for &(shape, rate, m00, m11, m01) in &cases {
-            let params = Array2::from_shape_vec(
-                (1, 2),
-                vec![(shape as f64).ln(), (rate as f64).ln()],
-            )
-            .unwrap();
+            let params =
+                Array2::from_shape_vec((1, 2), vec![(shape as f64).ln(), (rate as f64).ln()])
+                    .unwrap();
             let d = Gamma::from_params(&params);
             let fi = Scorable::<CRPScore>::metric(&d);
             assert_relative_eq!(fi[[0, 0, 0]], m00, max_relative = 1e-3);

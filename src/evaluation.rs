@@ -578,7 +578,10 @@ fn concordance_counts_censored_bruteforce(
 ///
 /// Returns `None` if `times` contains ties: tied-time pairs are not comparable
 /// under Harrell's definition, and the inversion count cannot exclude them.
-fn concordance_index_uncensored_fast(predictions: &Array1<f64>, times: &Array1<f64>) -> Option<f64> {
+fn concordance_index_uncensored_fast(
+    predictions: &Array1<f64>,
+    times: &Array1<f64>,
+) -> Option<f64> {
     let n = times.len();
     if n < 2 {
         return Some(0.5);
@@ -1385,8 +1388,7 @@ mod tests {
 
             let (old_conc, old_comp) =
                 concordance_counts_censored_bruteforce(&predictions, &times, &events);
-            let (fc, ft, fp) =
-                concordance_counts_censored_fenwick(&predictions, &times, &events);
+            let (fc, ft, fp) = concordance_counts_censored_fenwick(&predictions, &times, &events);
 
             // Raw counts must match exactly (float accumulation of multiples of
             // 0.5 below 2^53 is exact, so f64 == is a legitimate exact check).
@@ -1403,7 +1405,11 @@ mod tests {
             );
 
             // Final C-index must be bit-identical.
-            let old_c = if old_comp == 0.0 { 0.5 } else { old_conc / old_comp };
+            let old_c = if old_comp == 0.0 {
+                0.5
+            } else {
+                old_conc / old_comp
+            };
             let new_c = c_from_fenwick_counts(fc, ft, fp);
             assert_eq!(
                 new_c.to_bits(),
@@ -1443,8 +1449,7 @@ mod tests {
 
         // Tied-time event/event pairs remain non-comparable.
         let events_both = Array1::from_vec(vec![true, true]);
-        let (fc, ft, fp) =
-            concordance_counts_censored_fenwick(&predictions, &times, &events_both);
+        let (fc, ft, fp) = concordance_counts_censored_fenwick(&predictions, &times, &events_both);
         assert_eq!((fc, ft, fp), (0, 0, 0));
         assert_eq!(concordance_index(&predictions, &times, &events_both), 0.5);
 
@@ -1463,12 +1468,15 @@ mod tests {
             let predictions = Array1::from_vec(vec![p_i, p_j, 0.5]);
             let times = Array1::from_vec(vec![1.0, 2.0, 3.0]);
             let events = Array1::from_vec(vec![true, false, true]);
-            let (fc, ft, fp) =
-                concordance_counts_censored_fenwick(&predictions, &times, &events);
-            let (bc, bp) =
-                concordance_counts_censored_bruteforce(&predictions, &times, &events);
+            let (fc, ft, fp) = concordance_counts_censored_fenwick(&predictions, &times, &events);
+            let (bc, bp) = concordance_counts_censored_bruteforce(&predictions, &times, &events);
             let new_conc = fc as f64 + 0.5 * ft as f64;
-            assert_eq!(new_conc.to_bits(), bc.to_bits(), "p_j offset {:e}", p_j - p_i);
+            assert_eq!(
+                new_conc.to_bits(),
+                bc.to_bits(),
+                "p_j offset {:e}",
+                p_j - p_i
+            );
             assert_eq!((fp as f64).to_bits(), bp.to_bits());
         }
     }

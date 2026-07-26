@@ -222,8 +222,20 @@ mod tests {
 
     fn test_points() -> Array1<f64> {
         Array1::from_vec(vec![
-            -745.0, -709.0, -10.0, -1.0, -1e-12, 0.0, 1e-12, 0.5, 1.0, 10.0, 709.0, 745.0,
-            f64::NEG_INFINITY, f64::INFINITY,
+            -745.0,
+            -709.0,
+            -10.0,
+            -1.0,
+            -1e-12,
+            0.0,
+            1e-12,
+            0.5,
+            1.0,
+            10.0,
+            709.0,
+            745.0,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
         ])
     }
 
@@ -288,9 +300,7 @@ mod tests {
         }
         // df = 1.5: moments undefined/infinite — check finiteness and that
         // the sample median sits at 0 (the distribution's median).
-        let mut vals: Vec<f64> = (0..100_000)
-            .map(|_| sample_std_t(&mut rng, 1.5))
-            .collect();
+        let mut vals: Vec<f64> = (0..100_000).map(|_| sample_std_t(&mut rng, 1.5)).collect();
         assert!(vals.iter().all(|v| v.is_finite()));
         vals.sort_unstable_by(|a, b| a.total_cmp(b));
         let median = vals[vals.len() / 2];
@@ -319,8 +329,14 @@ mod tests {
             // SE(mean) = √(α/n); SE(var) = α·√((2 + 6/α)/n).
             let se_mean = (alpha / nf).sqrt();
             let se_var = alpha * ((2.0 + 6.0 / alpha) / nf).sqrt();
-            assert!((mean - alpha).abs() < 5.0 * se_mean, "alpha {alpha} mean {mean}");
-            assert!((var - alpha).abs() < 5.0 * se_var, "alpha {alpha} var {var}");
+            assert!(
+                (mean - alpha).abs() < 5.0 * se_mean,
+                "alpha {alpha} mean {mean}"
+            );
+            assert!(
+                (var - alpha).abs() < 5.0 * se_var,
+                "alpha {alpha} var {var}"
+            );
         }
     }
 

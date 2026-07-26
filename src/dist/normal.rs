@@ -883,19 +883,25 @@ mod tests {
     /// default trait path (ppf(alpha/2), ppf(1 - alpha/2)).
     #[test]
     fn test_interval_override_matches_ppf_path() {
-        let params = Array2::from_shape_vec(
-            (3, 2),
-            vec![0.0, 0.0, -2.5, 1.3, 40.0, (0.01_f64).ln()],
-        )
-        .unwrap();
+        let params =
+            Array2::from_shape_vec((3, 2), vec![0.0, 0.0, -2.5, 1.3, 40.0, (0.01_f64).ln()])
+                .unwrap();
         let dist = Normal::from_params(&params);
         for alpha in [0.5, 0.1, 0.05, 0.01, 1e-6] {
             let (lo, hi) = dist.interval(alpha);
             let lo_ref = dist.ppf(&Array1::from_elem(3, alpha / 2.0));
             let hi_ref = dist.ppf(&Array1::from_elem(3, 1.0 - alpha / 2.0));
             for i in 0..3 {
-                assert_eq!(lo[i].to_bits(), lo_ref[i].to_bits(), "alpha={alpha} lo[{i}]");
-                assert_eq!(hi[i].to_bits(), hi_ref[i].to_bits(), "alpha={alpha} hi[{i}]");
+                assert_eq!(
+                    lo[i].to_bits(),
+                    lo_ref[i].to_bits(),
+                    "alpha={alpha} lo[{i}]"
+                );
+                assert_eq!(
+                    hi[i].to_bits(),
+                    hi_ref[i].to_bits(),
+                    "alpha={alpha} hi[{i}]"
+                );
             }
         }
     }

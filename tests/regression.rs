@@ -2,8 +2,8 @@
 extern crate accelerate_src;
 
 use ndarray::{Array1, Array2};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 use ngboost_rs::ngboost::NGBRegressor;
 
 fn mean_squared_error(y_true: &Array1<f64>, y_pred: &Array1<f64>) -> f64 {

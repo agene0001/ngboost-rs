@@ -8,11 +8,10 @@ extern crate accelerate_src;
 // - Training an NGBoost classifier
 // - Making predictions and getting class probabilities
 
-
 use ndarray::{Array1, Array2};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
-use ngboost_rs::dist::{categorical::Bernoulli, ClassificationDistn};
+use ndarray_rand::rand_distr::Uniform;
+use ngboost_rs::dist::{ClassificationDistn, categorical::Bernoulli};
 use ngboost_rs::learners::StumpLearner;
 use ngboost_rs::ngboost::NGBoost;
 use ngboost_rs::scores::LogScore;

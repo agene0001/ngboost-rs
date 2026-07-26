@@ -9,10 +9,9 @@ extern crate accelerate_src;
 // - Compute confidence intervals
 // - Identify uncertain predictions
 
-
 use ndarray::{Array1, Array2};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 use ngboost_rs::dist::Normal;
 use ngboost_rs::learners::StumpLearner;
 use ngboost_rs::ngboost::NGBoost;
@@ -32,7 +31,8 @@ fn main() {
         .column(0)
         .iter()
         .enumerate()
-        .map(|(_, x)| { // Removed '&' from pattern match to handle references manually below
+        .map(|(_, x)| {
+            // Removed '&' from pattern match to handle references manually below
             let x = *x as f64;
             // True function: y = sin(x) + noise
             // Noise increases with x (heteroscedastic)

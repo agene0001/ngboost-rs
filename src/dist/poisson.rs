@@ -480,10 +480,7 @@ mod tests {
                 let q_clamped = q.clamp(0.0, 1.0 - 1e-15);
                 let k = got as u64;
                 assert_eq!(got, k as f64, "rate={rate} q={q}: non-integer {got}");
-                assert!(
-                    d.cdf(k) >= q_clamped,
-                    "rate={rate} q={q}: CDF({k}) < q"
-                );
+                assert!(d.cdf(k) >= q_clamped, "rate={rate} q={q}: CDF({k}) < q");
                 assert!(
                     k == 0 || d.cdf(k - 1) < q_clamped,
                     "rate={rate} q={q}: {k} not the smallest satisfying k"

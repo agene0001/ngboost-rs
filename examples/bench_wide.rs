@@ -99,22 +99,49 @@ fn main() {
 
     // Edge cases
     let edges = vec![
-        0.0, -0.0, 1.0, -1.0, f64::MIN_POSITIVE, 1e-300, 745.0, -745.0, 709.0, -709.0,
-        f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        f64::MIN_POSITIVE,
+        1e-300,
+        745.0,
+        -745.0,
+        709.0,
+        -709.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
     ];
     let mut ve = vec![0.0; edges.len()];
     wexp(&edges, &mut ve);
     println!("\nexp edge cases (x -> wide | libm):");
     for (&x, &v) in edges.iter().zip(&ve) {
-        let ok = if v == x.exp() || (v.is_nan() && x.exp().is_nan()) { "" } else { "  <-- MISMATCH" };
+        let ok = if v == x.exp() || (v.is_nan() && x.exp().is_nan()) {
+            ""
+        } else {
+            "  <-- MISMATCH"
+        };
         println!("  {x:>10e} -> {v:e} | {:e}{ok}", x.exp());
     }
-    let pos_edges = vec![0.0, f64::MIN_POSITIVE, 1e-308, 1.0, f64::INFINITY, f64::NAN, -1.0];
+    let pos_edges = vec![
+        0.0,
+        f64::MIN_POSITIVE,
+        1e-308,
+        1.0,
+        f64::INFINITY,
+        f64::NAN,
+        -1.0,
+    ];
     let mut vl = vec![0.0; pos_edges.len()];
     wln(&pos_edges, &mut vl);
     println!("ln edge cases (x -> wide | libm):");
     for (&x, &v) in pos_edges.iter().zip(&vl) {
-        let ok = if v == x.ln() || (v.is_nan() && x.ln().is_nan()) { "" } else { "  <-- MISMATCH" };
+        let ok = if v == x.ln() || (v.is_nan() && x.ln().is_nan()) {
+            ""
+        } else {
+            "  <-- MISMATCH"
+        };
         println!("  {x:>10e} -> {v:e} | {:e}{ok}", x.ln());
     }
 

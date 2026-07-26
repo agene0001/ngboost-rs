@@ -7,9 +7,7 @@ use ngboost_rs::dist::{
     MultivariateNormal, Normal, NormalFixedMean, NormalFixedVar, Poisson, StudentT, TFixedDf,
     TFixedDfFixedVar, Weibull,
 };
-use ngboost_rs::scores::{
-    CRPScoreCensored, CensoredScorable, LogScoreCensored, SurvivalData,
-};
+use ngboost_rs::scores::{CRPScoreCensored, CensoredScorable, LogScoreCensored, SurvivalData};
 use ngboost_rs::{CRPScore, Distribution, LogScore, Scorable, Score};
 use serde_json::Value;
 
@@ -54,9 +52,20 @@ where
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect())
+        .map(|r| {
+            r.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect()
+        })
         .collect();
-    let y: Vec<f64> = c["y"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let y: Vec<f64> = c["y"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
     let y = Array1::from(y);
     let params = build_params(&pp);
     let d = D::from_params(&params);
@@ -65,14 +74,24 @@ where
     let rs_ds = Scorable::<S>::d_score(&d, &y);
     let rs_m = Scorable::<S>::metric(&d);
 
-    let py_score: Vec<f64> =
-        c["py_score"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let py_score: Vec<f64> = c["py_score"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
     // d_score: (n_obs, n_params)
     let py_ds: Vec<f64> = c["py_dscore"]
         .as_array()
         .unwrap()
         .iter()
-        .flat_map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>())
+        .flat_map(|r| {
+            r.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect::<Vec<_>>()
+        })
         .collect();
     // metric: (n_obs, n_params, n_params)
     let py_m: Vec<f64> = c["py_metric"]
@@ -83,7 +102,13 @@ where
             r.as_array()
                 .unwrap()
                 .iter()
-                .flat_map(|rr| rr.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>())
+                .flat_map(|rr| {
+                    rr.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_f64().unwrap())
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -128,12 +153,27 @@ where
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect())
+        .map(|r| {
+            r.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect()
+        })
         .collect();
-    let y: Vec<f64> = c["y"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let y: Vec<f64> = c["y"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
     let time = Array1::from(y);
-    let event: Vec<bool> =
-        c["event"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap() != 0).collect();
+    let event: Vec<bool> = c["event"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() != 0)
+        .collect();
     let sd = SurvivalData::new(Array1::from(event), time);
     let params = build_params(&pp);
     let d = D::from_params(&params);
@@ -142,13 +182,23 @@ where
     let rs_ds = CensoredScorable::<S>::censored_d_score(&d, &sd);
     let rs_m = CensoredScorable::<S>::censored_metric(&d);
 
-    let py_score: Vec<f64> =
-        c["py_score"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let py_score: Vec<f64> = c["py_score"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
     let py_ds: Vec<f64> = c["py_dscore"]
         .as_array()
         .unwrap()
         .iter()
-        .flat_map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>())
+        .flat_map(|r| {
+            r.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect::<Vec<_>>()
+        })
         .collect();
     let py_m: Vec<f64> = c["py_metric"]
         .as_array()
@@ -158,7 +208,13 @@ where
             r.as_array()
                 .unwrap()
                 .iter()
-                .flat_map(|rr| rr.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>())
+                .flat_map(|rr| {
+                    rr.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_f64().unwrap())
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -249,12 +305,24 @@ fn main() {
         }
         println!(
             "{:<16} {:<10} {:>9.1e}{} {:>11.1e}{} {:>10.1e}{} {:>11.1e}{}",
-            name, score, s, flag(s, tol), ds, flag(ds, tol), m, flag(m, tol), fd, flag(fd, fd_tol)
+            name,
+            score,
+            s,
+            flag(s, tol),
+            ds,
+            flag(ds, tol),
+            m,
+            flag(m, tol),
+            fd,
+            flag(fd, fd_tol)
         );
     }
     println!("{}", "-".repeat(82));
     println!("'<' in *_vs_py = differs from Python (may be a KNOWN Python bug Rust fixes).");
-    println!("grad_vs_own_fd = Rust d_score vs finite-diff of Rust's OWN score (tol {:.0e}).", fd_tol);
+    println!(
+        "grad_vs_own_fd = Rust d_score vs finite-diff of Rust's OWN score (tol {:.0e}).",
+        fd_tol
+    );
     if any_bad {
         println!(">>> A Rust gradient disagrees with its own score's derivative — REAL BUG.");
     } else {

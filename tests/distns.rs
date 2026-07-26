@@ -2,9 +2,10 @@
 extern crate accelerate_src;
 
 use ndarray::{Array1, Array2};
-use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 use ngboost_rs::dist::{
+    Distribution,
     categorical::{Bernoulli, Categorical3},
     cauchy::{Cauchy, CauchyFixedVar},
     exponential::Exponential,
@@ -16,7 +17,6 @@ use ngboost_rs::dist::{
     poisson::Poisson,
     studentt::{StudentT, TFixedDf, TFixedDfFixedVar},
     weibull::Weibull,
-    Distribution,
 };
 use ngboost_rs::learners::{HistogramLearner, StumpLearner};
 use ngboost_rs::ngboost::NGBoost;

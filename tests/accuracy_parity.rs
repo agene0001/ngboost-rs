@@ -12,8 +12,8 @@ extern crate accelerate_src;
 
 use ndarray::{Array1, Array2};
 use ngboost_rs::NGBoost;
-use ngboost_rs::dist::{Bernoulli, Exponential, LogNormal, Normal, RegressionDistn, Weibull};
 use ngboost_rs::dist::Distribution;
+use ngboost_rs::dist::{Bernoulli, Exponential, LogNormal, Normal, RegressionDistn, Weibull};
 use ngboost_rs::learners::{BaseLearner, DecisionTreeLearner, HistogramLearner};
 use ngboost_rs::scores::{CensoredScorable, LogScore, LogScoreCensored, SurvivalData};
 use ngboost_rs::survival::NGBSurvival;
@@ -127,7 +127,11 @@ fn histogram_and_exact_trees_have_comparable_holdout_accuracy() {
     // guards against gross regressions in either learner.)
     let nll_gap = (m_hist_nll - m_exact_nll) / m_exact_nll.abs();
     let rmse_gap = (m_hist_rmse - m_exact_rmse) / m_exact_rmse;
-    println!("relative gaps: NLL {:+.3}% RMSE {:+.3}%", nll_gap * 100.0, rmse_gap * 100.0);
+    println!(
+        "relative gaps: NLL {:+.3}% RMSE {:+.3}%",
+        nll_gap * 100.0,
+        rmse_gap * 100.0
+    );
     assert!(
         nll_gap < 0.05,
         "histogram NLL more than 5% worse than exact: {m_hist_nll} vs {m_exact_nll}"
@@ -172,8 +176,10 @@ fn regression_parity_means(
 }
 
 fn assert_parity(name: &str, exact: f64, hist: f64) {
-    println!("{name}: exact NLL={exact:.5} hist NLL={hist:.5} gap={:+.3}%",
-        (hist - exact) / exact.abs() * 100.0);
+    println!(
+        "{name}: exact NLL={exact:.5} hist NLL={hist:.5} gap={:+.3}%",
+        (hist - exact) / exact.abs() * 100.0
+    );
     assert!(
         hist - exact < 0.05 * exact.abs(),
         "{name}: histogram NLL more than 5% worse ({hist} vs {exact})"
@@ -260,9 +266,7 @@ fn histogram_parity_classification() {
         hist.fit(&x_tr, &y_tr).unwrap();
         let h_nll = hist.score(&x_te, &y_te);
 
-        println!(
-            "classification seed {seed}: exact logloss={e_nll:.5} hist logloss={h_nll:.5}"
-        );
+        println!("classification seed {seed}: exact logloss={e_nll:.5} hist logloss={h_nll:.5}");
         // Sanity: both clearly beat the ~0.69 coin-flip log-loss
         assert!(e_nll < 0.65, "exact classifier failed to learn");
         assert!(h_nll < 0.65, "hist classifier failed to learn");
@@ -309,8 +313,11 @@ fn histogram_parity_survival_lognormal() {
             DecisionTreeLearner::default_sklearn(),
         );
         exact.fit(&x_tr, &t_tr, &e_tr).unwrap();
-        let e_nll =
-            CensoredScorable::<LogScoreCensored>::total_censored_score(&exact.pred_dist(&x_te), &y_te, None);
+        let e_nll = CensoredScorable::<LogScoreCensored>::total_censored_score(
+            &exact.pred_dist(&x_te),
+            &y_te,
+            None,
+        );
 
         let mut hist = NGBSurvival::<LogNormal, LogScoreCensored, HistogramLearner>::new(
             200,
@@ -318,8 +325,11 @@ fn histogram_parity_survival_lognormal() {
             HistogramLearner::new(3),
         );
         hist.fit(&x_tr, &t_tr, &e_tr).unwrap();
-        let h_nll =
-            CensoredScorable::<LogScoreCensored>::total_censored_score(&hist.pred_dist(&x_te), &y_te, None);
+        let h_nll = CensoredScorable::<LogScoreCensored>::total_censored_score(
+            &hist.pred_dist(&x_te),
+            &y_te,
+            None,
+        );
 
         println!("survival seed {seed}: exact NLL={e_nll:.5} hist NLL={h_nll:.5}");
         e_scores.push(e_nll);
@@ -416,17 +426,20 @@ fn histogram_parity_survival_weibull() {
     let mut h_scores = Vec::new();
     for seed in [31u64, 87] {
         let (x_tr, t_tr, e_tr) = make_weibull_survival(1200, seed);
-        let (x_te, t_te, e_te) = make_weibull_survival(600, seed.wrapping_mul(7919).wrapping_add(1));
+        let (x_te, t_te, e_te) =
+            make_weibull_survival(600, seed.wrapping_mul(7919).wrapping_add(1));
         let y_te = SurvivalData::from_arrays(&t_te, &e_te);
 
         let e_nll = survival_nll::<Weibull, _>(
             DecisionTreeLearner::default_sklearn(),
-            &x_tr, &t_tr, &e_tr, &x_te, &y_te,
+            &x_tr,
+            &t_tr,
+            &e_tr,
+            &x_te,
+            &y_te,
         );
-        let h_nll = survival_nll::<Weibull, _>(
-            HistogramLearner::new(3),
-            &x_tr, &t_tr, &e_tr, &x_te, &y_te,
-        );
+        let h_nll =
+            survival_nll::<Weibull, _>(HistogramLearner::new(3), &x_tr, &t_tr, &e_tr, &x_te, &y_te);
         println!("weibull survival seed {seed}: exact NLL={e_nll:.5} hist NLL={h_nll:.5}");
         e_scores.push(e_nll);
         h_scores.push(h_nll);
@@ -448,11 +461,19 @@ fn histogram_parity_survival_exponential() {
 
         let e_nll = survival_nll::<Exponential, _>(
             DecisionTreeLearner::default_sklearn(),
-            &x_tr, &t_tr, &e_tr, &x_te, &y_te,
+            &x_tr,
+            &t_tr,
+            &e_tr,
+            &x_te,
+            &y_te,
         );
         let h_nll = survival_nll::<Exponential, _>(
             HistogramLearner::new(3),
-            &x_tr, &t_tr, &e_tr, &x_te, &y_te,
+            &x_tr,
+            &t_tr,
+            &e_tr,
+            &x_te,
+            &y_te,
         );
         println!("exponential survival seed {seed}: exact NLL={e_nll:.5} hist NLL={h_nll:.5}");
         e_scores.push(e_nll);
@@ -479,7 +500,8 @@ fn histogram_parity_survival_weibull_crps() {
     let mut h_scores = Vec::new();
     for seed in [61u64] {
         let (x_tr, t_tr, e_tr) = make_weibull_survival(800, seed);
-        let (x_te, t_te, e_te) = make_weibull_survival(400, seed.wrapping_mul(7919).wrapping_add(1));
+        let (x_te, t_te, e_te) =
+            make_weibull_survival(400, seed.wrapping_mul(7919).wrapping_add(1));
         let y_te = SurvivalData::from_arrays(&t_te, &e_te);
 
         let train = |learner_exact: bool| -> f64 {
@@ -515,8 +537,14 @@ fn histogram_parity_survival_weibull_crps() {
         let e_crps = train(true);
         let h_crps = train(false);
         println!("weibull CRPS survival seed {seed}: exact CRPS={e_crps:.5} hist CRPS={h_crps:.5}");
-        assert!(e_crps.is_finite(), "exact CRPS training diverged (seed {seed})");
-        assert!(h_crps.is_finite(), "hist CRPS training diverged (seed {seed})");
+        assert!(
+            e_crps.is_finite(),
+            "exact CRPS training diverged (seed {seed})"
+        );
+        assert!(
+            h_crps.is_finite(),
+            "hist CRPS training diverged (seed {seed})"
+        );
         e_scores.push(e_crps);
         h_scores.push(h_crps);
     }

@@ -4,10 +4,10 @@
 //! Run: cargo run --release --features accelerate --example bench_multiclass_natgrad
 
 use ndarray::{Array1, Array2};
-use ngboost_rs::dist::categorical::Categorical;
 use ngboost_rs::Distribution;
-use ngboost_rs::scores::{natural_gradient_regularized, LogScore, Scorable};
 use ngboost_rs::NGBMultiClassifier;
+use ngboost_rs::dist::categorical::Categorical;
+use ngboost_rs::scores::{LogScore, Scorable, natural_gradient_regularized};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::Instant;

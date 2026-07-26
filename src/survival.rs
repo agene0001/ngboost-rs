@@ -439,46 +439,46 @@ where
             // Fit base learners for each parameter in parallel (matches the
             // main NGBoost training loop's rayon strategy)
             let weight_ref: Option<&Array1<f64>> = weights_sampled.as_ref().map(|w| w.as_ref());
-            let grad_cols: Vec<Array1<f64>> =
-                (0..n_params).map(|j| grads_sampled.column(j).to_owned()).collect();
+            let grad_cols: Vec<Array1<f64>> = (0..n_params)
+                .map(|j| grads_sampled.column(j).to_owned())
+                .collect();
             let learners: Vec<B> = (0..n_params).map(|_| self.base_learner.clone()).collect();
             let cache_ref = iter_cache.as_deref();
-            let fit_results: Vec<
-                Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>,
-            > = if use_row_subset {
-                let rows: Vec<u32> = row_idxs.iter().map(|&r| r as u32).collect();
-                let cache_full = stable_cache.as_deref().unwrap();
-                let n_train = x.nrows();
-                learners
-                    .into_par_iter()
-                    .zip(grad_cols.into_par_iter())
-                    .map(|(learner, grad_j)| {
-                        // Scatter the minibatch gradient into a full-length
-                        // buffer aligned with the cache's row ids.
-                        let mut grad_full = Array1::zeros(n_train);
-                        for (k, &r) in rows.iter().enumerate() {
-                            grad_full[r as usize] = grad_j[k];
-                        }
-                        learner.fit_predict_cached_rows(
-                            x,
-                            &grad_full,
-                            sample_weight,
-                            cache_full,
-                            &rows,
-                        )
-                    })
-                    .collect()
-            } else {
-                learners
-                    .into_par_iter()
-                    .zip(grad_cols.into_par_iter())
-                    .map(|(learner, grad_j)| {
-                        // Fused fit + train-predictions (leaf-scatter for
-                        // histogram trees), mirroring the main NGBoost loop.
-                        learner.fit_predict_cached(&x_sampled, &grad_j, weight_ref, cache_ref)
-                    })
-                    .collect()
-            };
+            let fit_results: Vec<Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>> =
+                if use_row_subset {
+                    let rows: Vec<u32> = row_idxs.iter().map(|&r| r as u32).collect();
+                    let cache_full = stable_cache.as_deref().unwrap();
+                    let n_train = x.nrows();
+                    learners
+                        .into_par_iter()
+                        .zip(grad_cols.into_par_iter())
+                        .map(|(learner, grad_j)| {
+                            // Scatter the minibatch gradient into a full-length
+                            // buffer aligned with the cache's row ids.
+                            let mut grad_full = Array1::zeros(n_train);
+                            for (k, &r) in rows.iter().enumerate() {
+                                grad_full[r as usize] = grad_j[k];
+                            }
+                            learner.fit_predict_cached_rows(
+                                x,
+                                &grad_full,
+                                sample_weight,
+                                cache_full,
+                                &rows,
+                            )
+                        })
+                        .collect()
+                } else {
+                    learners
+                        .into_par_iter()
+                        .zip(grad_cols.into_par_iter())
+                        .map(|(learner, grad_j)| {
+                            // Fused fit + train-predictions (leaf-scatter for
+                            // histogram trees), mirroring the main NGBoost loop.
+                            learner.fit_predict_cached(&x_sampled, &grad_j, weight_ref, cache_ref)
+                        })
+                        .collect()
+                };
 
             let mut fitted_learners: Vec<Box<dyn TrainedBaseLearner>> =
                 Vec::with_capacity(n_params);
@@ -497,7 +497,8 @@ where
             // Line search to find optimal step size. `dist` is the distribution
             // at `params_sampled`, so pass it as the start point instead of
             // letting line_search rebuild it with from_params.
-            let scale = self.line_search(&predictions, &params_sampled, &dist, &y_sampled, weight_ref);
+            let scale =
+                self.line_search(&predictions, &params_sampled, &dist, &y_sampled, weight_ref);
             self.scalings.push(scale);
             self.base_models.push(fitted_learners);
 
@@ -672,8 +673,8 @@ where
         let params_sampled = params.select(ndarray::Axis(0), &row_idxs);
 
         // Sample weights if provided
-        let weights_sampled = sample_weight
-            .map(|weights| Cow::Owned(weights.select(ndarray::Axis(0), &row_idxs)));
+        let weights_sampled =
+            sample_weight.map(|weights| Cow::Owned(weights.select(ndarray::Axis(0), &row_idxs)));
 
         (
             row_idxs,
@@ -798,10 +799,8 @@ where
                     .for_each(|(p_chunk, x_chunk)| {
                         let rows = x_chunk.len() / p;
                         let mut buf = vec![0.0; rows];
-                        for ((learners, col_idx), &factor) in base_models
-                            .iter()
-                            .zip(col_idxs.iter())
-                            .zip(factors.iter())
+                        for ((learners, col_idx), &factor) in
+                            base_models.iter().zip(col_idxs.iter()).zip(factors.iter())
                         {
                             let mapping = if col_idx.len() == p {
                                 None

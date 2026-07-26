@@ -1737,8 +1737,7 @@ mod tests {
     fn test_studentt_crps_df_gradient_sentinel_window() {
         for nu in [1.0000005_f64, 1.0000009, 1.0000011, 1.000002] {
             for z in [-3.0_f64, -1.0, 0.5] {
-                let params =
-                    Array2::from_shape_vec((1, 3), vec![0.0, 0.0, nu.ln()]).unwrap();
+                let params = Array2::from_shape_vec((1, 3), vec![0.0, 0.0, nu.ln()]).unwrap();
                 let dist = StudentT::from_params(&params);
                 let y = Array1::from_vec(vec![z]);
                 let d = Scorable::<CRPScore>::d_score(&dist, &y);
@@ -1765,8 +1764,7 @@ mod tests {
         ];
         for (nu, truth, tol) in cases {
             // params: [loc, log(scale), log(df)]; y = loc - scale => z = -1
-            let params =
-                Array2::from_shape_vec((1, 3), vec![0.0, 0.0, nu.ln()]).unwrap();
+            let params = Array2::from_shape_vec((1, 3), vec![0.0, 0.0, nu.ln()]).unwrap();
             let dist = StudentT::from_params(&params);
             let y = Array1::from_vec(vec![-1.0]);
             let d = Scorable::<CRPScore>::d_score(&dist, &y);
@@ -1867,8 +1865,7 @@ mod tests {
             let term_1 = (df / 2.0) * digamma((df + 1.0) / 2.0);
             let term_2 = (-df / 2.0) * digamma(df / 2.0);
             let term_4_1 = (-df / 2.0) * (1.0 + diff_sq / (df * var)).ln();
-            let term_4_2 =
-                (df + 1.0) * diff_sq / (2.0 * (df * var) * (1.0 + diff_sq / (df * var)));
+            let term_4_2 = (df + 1.0) * diff_sq / (2.0 * (df * var) * (1.0 + diff_sq / (df * var)));
             let g2 = -(term_1 + term_2 - 0.5 + term_4_1 + term_4_2);
             let g = [g0, g1, g2];
             for a in 0..3 {
@@ -1926,11 +1923,8 @@ mod tests {
             (20.0, 2.5558790e-2, 2.358913637e-5, -7.509118801e-4),
         ];
         for &(nu, m11, m22, m12) in &cases {
-            let params = Array2::from_shape_vec(
-                (1, 3),
-                vec![0.0, 0.7_f64.ln(), (nu as f64).ln()],
-            )
-            .unwrap();
+            let params =
+                Array2::from_shape_vec((1, 3), vec![0.0, 0.7_f64.ln(), (nu as f64).ln()]).unwrap();
             let d = StudentT::from_params(&params);
             let fi = Scorable::<CRPScore>::metric(&d);
             assert_relative_eq!(fi[[0, 0, 0]], 1.0 / 3.0, max_relative = 1e-4);
@@ -1944,8 +1938,7 @@ mod tests {
     fn test_studentt_logscore_metric_known_values() {
         // I[1,1] = 2ν/(ν+3): classic value 1/2 at ν=1 (Cauchy log-scale Fisher).
         // I[0,0] = (ν+1)/((ν+3)σ²).
-        let params =
-            Array2::from_shape_vec((1, 3), vec![0.0, 2.0_f64.ln(), 1.0_f64.ln()]).unwrap();
+        let params = Array2::from_shape_vec((1, 3), vec![0.0, 2.0_f64.ln(), 1.0_f64.ln()]).unwrap();
         let dist = StudentT::from_params(&params);
         let fi = Scorable::<LogScore>::metric(&dist);
         assert_relative_eq!(fi[[0, 1, 1]], 0.5, max_relative = 1e-12);
