@@ -693,8 +693,18 @@ where
             return Err("Cannot fit to dataset with no features");
         }
 
-        // Check for NaN/Inf values in input data
-        if x.iter().any(|&v| !v.is_finite()) {
+        // Check for NaN/Inf values in input data. NaN in X is allowed when the
+        // base learner declares native missing-value support (histogram trees:
+        // NaN = missing, routed consistently at fit and predict) — that is the
+        // no-imputation training mode. ±inf is never allowed, and learners
+        // without missing support keep the strict check: they would silently
+        // propagate NaN through every fitted statistic. Targets are always
+        // strict.
+        if self.base_learner.supports_missing() {
+            if x.iter().any(|&v| v.is_infinite()) {
+                return Err("Input X contains infinite values");
+            }
+        } else if x.iter().any(|&v| !v.is_finite()) {
             return Err("Input X contains NaN or infinite values");
         }
         if y.iter().any(|&v| !v.is_finite()) {
@@ -3219,5 +3229,80 @@ impl NGBClassifier {
         if let Some(seed) = params.random_state {
             self.model.set_random_state(seed);
         }
+    }
+}
+
+#[cfg(test)]
+mod missing_support_tests {
+    use super::*;
+    use crate::dist::Poisson;
+    use crate::learners::{HistogramLearner, RidgeLearner};
+    use crate::scores::LogScore;
+    use ndarray::{Array1, Array2};
+
+    fn nan_data() -> (Array2<f64>, Array1<f64>) {
+        // Deterministic count data with ~15% NaN holes in X.
+        let n = 300usize;
+        let p = 6usize;
+        let mut s = 0x00ba_d5eedu64;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (u32::MAX as f64)
+        };
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mut lin = 0.0;
+            for j in 0..p {
+                let v = next();
+                x[[i, j]] = if next() < 0.15 { f64::NAN } else { v };
+                if x[[i, j]].is_finite() && j < 3 {
+                    lin += v;
+                }
+            }
+            y[i] = (1.0 + lin).round();
+        }
+        (x, y)
+    }
+
+    /// The histogram learner declares missing support, so NaN in X must fit,
+    /// and predictions — including on NaN-bearing rows — must be finite.
+    #[test]
+    fn histogram_learner_accepts_nan_features() {
+        let (x, y) = nan_data();
+        let mut m: NGBoost<Poisson, LogScore, HistogramLearner> =
+            NGBoost::new(30, 0.1, HistogramLearner::new(3));
+        m.set_random_state(7);
+        m.fit(&x, &y).expect("NaN X must be accepted");
+        let preds = m.predict(&x);
+        assert_eq!(preds.len(), x.nrows());
+        assert!(
+            preds.iter().all(|v| v.is_finite()),
+            "predictions on NaN-bearing rows must be finite"
+        );
+    }
+
+    /// ±inf stays rejected even for missing-capable learners.
+    #[test]
+    fn histogram_learner_rejects_infinite_features() {
+        let (mut x, y) = nan_data();
+        x[[0, 0]] = f64::INFINITY;
+        let mut m: NGBoost<Poisson, LogScore, HistogramLearner> =
+            NGBoost::new(5, 0.1, HistogramLearner::new(3));
+        m.set_random_state(7);
+        assert!(m.fit(&x, &y).is_err(), "inf must still be rejected");
+    }
+
+    /// Learners without missing support keep the strict NaN rejection —
+    /// Ridge computes over raw values and would propagate NaN silently.
+    #[test]
+    fn non_missing_learner_still_rejects_nan() {
+        let (x, y) = nan_data();
+        let mut m: NGBoost<Poisson, LogScore, RidgeLearner> =
+            NGBoost::new(5, 0.1, RidgeLearner::new(1.0));
+        m.set_random_state(7);
+        assert!(m.fit(&x, &y).is_err(), "NaN must be rejected without support");
     }
 }

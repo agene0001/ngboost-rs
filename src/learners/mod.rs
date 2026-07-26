@@ -11,6 +11,22 @@ pub trait FitCache: Send + Sync {
 }
 
 pub trait BaseLearner: Send + Sync {
+    /// Whether this learner handles NaN feature values natively. When true,
+    /// `NGBoost::fit` accepts NaN in X (±inf is always rejected) and passes it
+    /// through as the learner's missing marker. Default false: learners that
+    /// compute over raw feature values (linear, plain decision trees) would
+    /// silently propagate NaN into every statistic.
+    ///
+    /// The histogram learner overrides this: `compute_bin_edges` ignores
+    /// non-finite values and `find_bin` routes NaN to the LAST bin, and tree
+    /// prediction (`value < threshold` is false for NaN → right child) routes
+    /// it identically — fit and predict agree. Note this is a cruder missing
+    /// treatment than XGBoost/LightGBM's learned per-split default direction:
+    /// missing always goes right rather than to whichever child fits better.
+    fn supports_missing(&self) -> bool {
+        false
+    }
+
     fn fit(
         &self,
         x: &Array2<f64>,
@@ -669,6 +685,13 @@ impl HistogramLearner {
 }
 
 impl BaseLearner for HistogramLearner {
+    /// See the trait doc: binning ignores non-finite values, NaN lands in the
+    /// last bin at fit time, and threshold comparison routes NaN right at
+    /// predict time — the two agree, so NaN is a well-defined missing marker.
+    fn supports_missing(&self) -> bool {
+        true
+    }
+
     fn fit_with_weights(
         &self,
         x: &Array2<f64>,
