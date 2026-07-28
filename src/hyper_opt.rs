@@ -273,6 +273,13 @@ pub enum CvScheme {
     TimeSeries,
 }
 
+/// Search-space keys with this prefix are handed to the [`FoldTransform`] only.
+/// They parameterize preprocessing (imputer rank, neighbour count, …) rather
+/// than the model, so a single TPE study can tune the pipeline and the model
+/// together. The convention matches `gradientlss`-rs, where the boosting
+/// backend additionally skips these keys when building its params.
+pub const TRANSFORM_PARAM_PREFIX: &str = "__";
+
 /// Configuration for `hyper_opt_with_config`.
 #[derive(Debug, Clone)]
 pub struct HyperOptConfig {
