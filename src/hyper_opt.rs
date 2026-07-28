@@ -338,6 +338,30 @@ where
     B: BaseLearner + Clone + 'static,
     F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B>,
 {
+    hyper_opt_with_transform(features, labels, hp_dict, config, builder, None)
+}
+
+/// [`hyper_opt_with_config`] plus a [`FoldTransform`] fitted inside each CV
+/// fold.
+///
+/// Use this when preprocessing learns from the data — imputation above all.
+/// The plain entry point passes `None` and is exactly equivalent to the
+/// previous behaviour, so existing callers are unaffected.
+#[allow(clippy::too_many_arguments)]
+pub fn hyper_opt_with_transform<D, S, B, F>(
+    features: &Array2<f64>,
+    labels: &Array1<f64>,
+    hp_dict: &HashMap<String, Value>,
+    config: HyperOptConfig,
+    builder: F,
+    fold_transform: Option<&dyn FoldTransform>,
+) -> Result<HyperOptResult, Box<dyn std::error::Error>>
+where
+    D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
+    S: Score + 'static,
+    B: BaseLearner + Clone + 'static,
+    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B>,
+{
     use std::time::Instant;
 
     let hp_seed = config.hp_seed.unwrap_or(config.seed);
@@ -415,6 +439,7 @@ where
             &pruner_state,
             n_completed_trials,
             config.seed + trial as u64,
+            fold_transform,
         );
 
         // Feed score back to TPE regardless of pruning so the surrogate
@@ -609,6 +634,34 @@ const CV_EARLY_STOPPING_ROUNDS: u32 = 50;
 /// `n_folds <= 1` runs a single 80/20 holdout instead — train on the first
 /// 80%, score on the last 20% — a single fit with no cross-fold pruning. Much
 /// cheaper than k-fold and equivalent to a plain train/val split for HPO.
+/// A data-dependent transform fitted INSIDE each CV fold.
+///
+/// Preprocessing that learns from the data — imputation being the motivating
+/// case — must be fitted on the fold's TRAIN rows only. Fitting it once on the
+/// whole matrix before folding lets the fitted state encode the very rows each
+/// fold then scores against, which flatters every CV number and so biases the
+/// model selection the tuner exists to perform.
+///
+/// Implementors receive the fold's train/valid feature blocks and the trial's
+/// sampled parameters, so the transform's own hyperparameters (matrix-imputer
+/// `rank`, KNN `k`, …) can be tuned in the same search as the model's. Called
+/// once per (trial, fold); keep it cheap.
+///
+/// Labels are deliberately not passed: a transform that reads y is a target
+/// leak waiting to happen.
+pub trait FoldTransform: Sync {
+    /// Fit on `train_x` and apply to both blocks, in place.
+    ///
+    /// Returning `Err` marks the fold unscorable (infinite loss) rather than
+    /// aborting the study.
+    fn fit_transform(
+        &self,
+        train_x: &mut Array2<f64>,
+        valid_x: &mut Array2<f64>,
+        trial_params: &HashMap<String, Value>,
+    ) -> Result<(), String>;
+}
+
 fn cv_with_pruning<D, S, B, F>(
     features: &Array2<f64>,
     labels: &Array1<f64>,
@@ -620,6 +673,7 @@ fn cv_with_pruning<D, S, B, F>(
     pruner_state: &PrunerState,
     n_completed_trials: usize,
     trial_seed: u64,
+    fold_transform: Option<&dyn FoldTransform>,
 ) -> (f64, bool, Vec<f64>, Option<usize>)
 where
     D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
@@ -700,6 +754,21 @@ where
                 };
             (train_features, train_labels, test_features, test_labels)
         };
+
+        // Fit-inside-the-fold preprocessing: runs AFTER the split, so the
+        // transform only ever sees this fold's training rows. A failure makes
+        // the fold unscorable rather than killing the study, matching how the
+        // concatenate failures above are handled.
+        let (mut train_features, mut test_features) = (train_features, test_features);
+        if let Some(t) = fold_transform
+            && let Err(e) = t.fit_transform(&mut train_features, &mut test_features, trial_params)
+        {
+            if std::env::var("NGBOOST_VERBOSE").is_ok() {
+                eprintln!("fold {i}: fold transform failed ({e}); scoring as infinite");
+            }
+            fold_scores.push(f64::INFINITY);
+            continue;
+        }
 
         let mut model = builder(trial_params);
         // Override the model's RNG so identical trial_params on different
