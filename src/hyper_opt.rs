@@ -300,6 +300,20 @@ pub struct HyperOptConfig {
     pub pruning: PruningStrategy,
     /// Wall-clock budget in minutes (`None` = no limit). Checked between trials.
     pub max_minutes: Option<f64>,
+    /// Stop the study after this many CONSECUTIVE COMPLETED trials without a
+    /// new best. `None` (the default) runs every trial, as before.
+    ///
+    /// Study-level early stopping, distinct from [`PruningStrategy`]: pruning
+    /// abandons one BAD trial partway through its folds, but never ends the
+    /// search — so a study that peaked at trial 10 still pays for the other
+    /// 90. Measured on the consumer's 2026-08-26 sweep, searches routinely
+    /// found their best in the first 10-20 trials and spent the remaining
+    /// budget improving by <0.11%.
+    ///
+    /// Only COMPLETED trials advance the counter: a pruned trial was killed
+    /// precisely because it was bad, and counting those would end a search
+    /// that is still exploring productively.
+    pub plateau_patience: Option<u32>,
     /// Whether to print per-10-trial progress to stderr.
     pub verbose: bool,
 }
@@ -314,6 +328,7 @@ impl Default for HyperOptConfig {
             hp_seed: None,
             pruning: PruningStrategy::None,
             max_minutes: None,
+            plateau_patience: None,
             verbose: true,
         }
     }
@@ -402,6 +417,7 @@ where
     }
 
     let mut best_score = f64::INFINITY;
+    let mut trials_since_best: u32 = 0;
     let mut best_params: HashMap<String, Value> = HashMap::new();
     let mut best_rounds: usize = 0;
     let mut trials: Vec<TrialResult> = Vec::with_capacity(config.n_trials as usize);
@@ -468,8 +484,12 @@ where
             }
         }
 
+        if !pruned {
+            trials_since_best = trials_since_best.saturating_add(1);
+        }
         if !pruned && cv_score < best_score {
             best_score = cv_score;
+            trials_since_best = 0;
             best_params = trial_params.clone();
             // Surface the rounds that actually won CV (mean early-stopped
             // iteration across folds) so a refit reproduces the winning
@@ -513,6 +533,24 @@ where
                 pruned_count,
                 trial + 1
             );
+        }
+
+        // Study-level early stop. After the progress print, so the last line
+        // before stopping still reports the state that triggered it.
+        if let Some(patience) = config.plateau_patience
+            && patience > 0
+            && trials_since_best >= patience
+        {
+            if config.verbose {
+                eprintln!(
+                    "Stopping at trial {}/{}: {} completed trials with no new best                      (best = {:.6})",
+                    trial + 1,
+                    config.n_trials,
+                    trials_since_best,
+                    best_score
+                );
+            }
+            break;
         }
     }
 
