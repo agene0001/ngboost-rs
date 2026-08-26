@@ -4152,8 +4152,12 @@ mod col_masked_tests {
         let (x, y) = synth(1200, 10, 99);
         let cols = vec![8, 1, 4, 0, 6];
         // Unsorted row subset with the shuffle-like order sample() produces.
+        // `wrapping_mul`: 2654435761 is Knuth's multiplicative-hash constant and
+        // the product exceeds u32 for every r >= 2, so a plain `*` panics under
+        // overflow checks before the col-masked path is ever exercised. Wrapping
+        // IS the hash — the crate's other uses of this constant already wrap.
         let rows: Vec<u32> = (0..1200u32)
-            .filter(|r| (r * 2654435761) % 5 < 3)
+            .filter(|r| r.wrapping_mul(2654435761) % 5 < 3)
             .rev()
             .collect();
         let weights = Array1::from_shape_fn(1200, |i| 0.25 + ((i * 13 % 50) as f64) / 50.0);
