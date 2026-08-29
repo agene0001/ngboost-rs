@@ -281,10 +281,26 @@ pub enum CvScheme {
 pub const TRANSFORM_PARAM_PREFIX: &str = "__";
 
 /// Configuration for `hyper_opt_with_config`.
+/// Per-fold TRAIN-row weight generator: called with the fold's train length,
+/// returns that many sample weights applied to the fold's training rows only
+/// (the scoring fold stays unweighted, mirroring an ES holdout). Lets a
+/// caller whose FINAL fit is sample-weighted (e.g. a recency ramp) make the
+/// search answer the same weighted question.
+#[derive(Clone)]
+pub struct FoldWeightFn(pub std::sync::Arc<dyn Fn(usize) -> Vec<f64> + Send + Sync>);
+
+impl std::fmt::Debug for FoldWeightFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldWeightFn(..)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HyperOptConfig {
     /// Number of optimization trials.
     pub n_trials: u32,
+    /// See [`FoldWeightFn`]. `None` = unweighted folds (historical behaviour).
+    pub fold_weight_fn: Option<FoldWeightFn>,
     /// Number of cross-validation folds per trial.
     pub n_folds: usize,
     /// How CV folds are partitioned (`KFold` default; `TimeSeries` for forward
@@ -343,6 +359,7 @@ impl Default for HyperOptConfig {
     fn default() -> Self {
         Self {
             n_trials: 100,
+            fold_weight_fn: None,
             n_folds: 5,
             cv_scheme: CvScheme::KFold,
             seed: 42,
@@ -517,6 +534,7 @@ where
             n_completed_trials,
             config.seed + trial as u64,
             fold_transform,
+            config.fold_weight_fn.as_ref(),
         );
 
         // Feed score back to TPE regardless of pruning so the surrogate
@@ -810,6 +828,7 @@ fn cv_with_pruning<D, S, B, F>(
     n_completed_trials: usize,
     trial_seed: u64,
     fold_transform: Option<&dyn FoldTransform>,
+    fold_weight_fn: Option<&FoldWeightFn>,
 ) -> (f64, bool, Vec<f64>, Option<usize>)
 where
     D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
@@ -946,12 +965,16 @@ where
             model.early_stopping_rounds = Some(CV_EARLY_STOPPING_ROUNDS);
         }
 
+        // Weight the fold's TRAIN rows the same way the caller's final fit
+        // will (see `FoldWeightFn`); the scoring fold stays unweighted.
+        let fold_weights =
+            fold_weight_fn.map(|wf| Array1::from_vec((wf.0)(train_labels.len())));
         let fit_result = model.fit_with_validation(
             &train_features,
             &train_labels,
             Some(&test_features),
             Some(&test_labels),
-            None,
+            fold_weights.as_ref(),
             None,
         );
         let score = if fit_result.is_err() {

@@ -277,9 +277,21 @@ impl Scorable<LogScore> for Poisson {
 /// recurrence pmf(k+1) = pmf(k)·λ/(k+1) — no special-function calls per entry.
 /// Falls back to statrs pmf when e^{-λ} underflows (λ ≳ 708).
 fn poisson_tables(lambda: f64, k_max: i64) -> (Vec<f64>, Vec<f64>) {
+    let mut pmf = Vec::new();
+    let mut cdf = Vec::new();
+    poisson_tables_into(lambda, k_max, &mut pmf, &mut cdf);
+    (pmf, cdf)
+}
+
+/// Caller-owned-scratch variant: the CRPS score/gradient/metric loops call
+/// this once PER OBSERVATION PER BOOSTING ROUND, so the allocating wrapper
+/// above was churning two fresh Vecs tens of millions of times per tuned fit.
+fn poisson_tables_into(lambda: f64, k_max: i64, pmf: &mut Vec<f64>, cdf: &mut Vec<f64>) {
     let len = (k_max + 1).max(1) as usize;
-    let mut pmf = vec![0.0; len];
-    let mut cdf = vec![0.0; len];
+    pmf.clear();
+    pmf.resize(len, 0.0);
+    cdf.clear();
+    cdf.resize(len, 0.0);
 
     let p0 = (-lambda).exp();
     if p0 > 0.0 {
@@ -302,7 +314,6 @@ fn poisson_tables(lambda: f64, k_max: i64) -> (Vec<f64>, Vec<f64>) {
             *fk = f.min(1.0);
         }
     }
-    (pmf, cdf)
 }
 
 /// Hard cap on CRPS pmf/cdf table length (~80 MB per table): a single
@@ -320,6 +331,20 @@ const POISSON_CRPS_MAX_TABLE: i64 = 10_000_000;
 /// Uses prefix/suffix sums over a single pmf/cdf table — O(k_max) total,
 /// replacing the previous O(k_max²) nested loop with per-element cdf calls.
 fn poisson_crps_metric_value(lambda: f64) -> f64 {
+    let mut scratch = CrpsScratch::default();
+    poisson_crps_metric_value_with(lambda, &mut scratch)
+}
+
+/// Reusable per-observation buffers for the CRPS loops.
+#[derive(Default)]
+struct CrpsScratch {
+    pmf: Vec<f64>,
+    cdf: Vec<f64>,
+    fp: Vec<f64>,
+    suf: Vec<f64>,
+}
+
+fn poisson_crps_metric_value_with(lambda: f64, scratch: &mut CrpsScratch) -> f64 {
     let std_dev = lambda.sqrt();
     let y_max = ((lambda + 8.0 * std_dev).ceil() as i64)
         .max(5)
@@ -329,17 +354,22 @@ fn poisson_crps_metric_value(lambda: f64) -> f64 {
         .max(y_max + 10)
         .min(POISSON_CRPS_MAX_TABLE);
 
-    let (pmf, cdf) = poisson_tables(lambda, k_total);
+    poisson_tables_into(lambda, k_total, &mut scratch.pmf, &mut scratch.cdf);
+    let (pmf, cdf) = (&scratch.pmf, &scratch.cdf);
     let len = pmf.len();
 
     // fp[k] = Σ_{j≤k} F(j)·pmf(j)  (prefix);  suf[k] = Σ_{j≥k} pmf(j)  (suffix)
-    let mut fp = vec![0.0; len];
+    let fp = &mut scratch.fp;
+    fp.clear();
+    fp.resize(len, 0.0);
     let mut acc = 0.0;
     for k in 0..len {
         acc += cdf[k] * pmf[k];
         fp[k] = acc;
     }
-    let mut suf = vec![0.0; len + 1];
+    let suf = &mut scratch.suf;
+    suf.clear();
+    suf.resize(len + 1, 0.0);
     for k in (0..len).rev() {
         suf[k] = suf[k + 1] + pmf[k];
     }
@@ -375,8 +405,9 @@ impl Scorable<CRPScore> for Poisson {
         // CRPScore metric for Poisson: M = Σ_y g(y)² · P(Y=y) (1 param)
         let n_obs = self.rate.len();
         let mut diag = Array2::zeros((n_obs, 1));
+        let mut scratch = CrpsScratch::default();
         for i in 0..n_obs {
-            diag[[i, 0]] = poisson_crps_metric_value(self.rate[i]);
+            diag[[i, 0]] = poisson_crps_metric_value_with(self.rate[i], &mut scratch);
         }
         diag
     }
@@ -387,6 +418,7 @@ impl Scorable<CRPScore> for Poisson {
         // Truncated where the probability mass becomes negligible.
         let mut scores = Array1::zeros(y.len());
 
+        let (mut pmf_buf, mut cdf_buf) = (Vec::new(), Vec::new());
         for i in 0..y.len() {
             let lambda = self.rate[i];
             let y_i = y[i].round() as i64; // Round to nearest integer
@@ -396,7 +428,8 @@ impl Scorable<CRPScore> for Poisson {
             let k_max = ((lambda + 6.0 * std_dev).ceil() as i64)
                 .max(y_i + 10)
                 .min(POISSON_CRPS_MAX_TABLE);
-            let (_, cdf) = poisson_tables(lambda, k_max);
+            poisson_tables_into(lambda, k_max, &mut pmf_buf, &mut cdf_buf);
+            let cdf = &cdf_buf;
 
             let mut crps = 0.0;
             for (k, &f_k) in cdf.iter().enumerate() {
@@ -423,6 +456,7 @@ impl Scorable<CRPScore> for Poisson {
         let n_obs = y.len();
         let mut d_params = Array2::zeros((n_obs, 1));
 
+        let (mut pmf_buf, mut cdf_buf) = (Vec::new(), Vec::new());
         for i in 0..n_obs {
             let lambda = self.rate[i];
             let y_i = y[i].round() as i64;
@@ -433,7 +467,8 @@ impl Scorable<CRPScore> for Poisson {
             let k_max = ((lambda + 6.0 * std_dev).ceil() as i64)
                 .max(y_i + 10)
                 .min(POISSON_CRPS_MAX_TABLE);
-            let (pmf, cdf) = poisson_tables(lambda, k_max);
+            poisson_tables_into(lambda, k_max, &mut pmf_buf, &mut cdf_buf);
+            let (pmf, cdf) = (&pmf_buf, &cdf_buf);
 
             let mut d_crps = 0.0;
             for k in 0..pmf.len() {
@@ -451,8 +486,9 @@ impl Scorable<CRPScore> for Poisson {
         // Deterministic CRPScore metric: M = Σ_y g(y)² · P(Y=y)
         let n_obs = self.rate.len();
         let mut fi = Array3::zeros((n_obs, 1, 1));
+        let mut scratch = CrpsScratch::default();
         for i in 0..n_obs {
-            fi[[i, 0, 0]] = poisson_crps_metric_value(self.rate[i]);
+            fi[[i, 0, 0]] = poisson_crps_metric_value_with(self.rate[i], &mut scratch);
         }
         fi
     }
