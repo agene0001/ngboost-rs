@@ -966,16 +966,27 @@ where
         }
 
         // Weight the fold's TRAIN rows the same way the caller's final fit
-        // will (see `FoldWeightFn`); the scoring fold stays unweighted.
+        // will (see `FoldWeightFn`); the scoring fold stays effectively
+        // unweighted.
+        //
+        // The val weights must be Some ALL-ONES rather than None: with early
+        // stopping on explicit validation data, `fit_internal` REJECTS a
+        // weighted train set paired with `None` val weights (it reads as
+        // "you forgot to weight validation"). All-ones is a provable no-op —
+        // `total_score` computes (scores*w).sum()/w.sum(), which for w = 1 is
+        // exactly the unweighted mean it would take on the `None` branch.
         let fold_weights =
             fold_weight_fn.map(|wf| Array1::from_vec((wf.0)(train_labels.len())));
+        let val_weights = fold_weights
+            .as_ref()
+            .map(|_| Array1::from_elem(test_labels.len(), 1.0));
         let fit_result = model.fit_with_validation(
             &train_features,
             &train_labels,
             Some(&test_features),
             Some(&test_labels),
             fold_weights.as_ref(),
-            None,
+            val_weights.as_ref(),
         );
         let score = if fit_result.is_err() {
             f64::INFINITY
@@ -1178,6 +1189,73 @@ mod tests {
     use crate::scores::LogScore;
     use ndarray::Array;
     use serde_json::json;
+
+    /// A weighted CV search must actually SEARCH. `fit_internal` rejects a
+    /// weighted train set paired with `None` validation weights whenever
+    /// early stopping is active (which CV always forces), so a naive
+    /// fold_weight_fn wiring made every fold `Err` -> every trial INFINITY
+    /// -> an "Ok" result carrying no params, which callers silently trained
+    /// with defaults and cached forever. Guard the whole class: weighted and
+    /// unweighted searches must both produce finite scores and real params.
+    #[test]
+    fn weighted_folds_produce_a_real_search_not_silent_infinities() {
+        let n = 120usize;
+        let features =
+            Array::from_shape_fn((n, 2), |(i, j)| (i as f64) * 0.01 + (j as f64) * 0.5);
+        let labels = Array::from_shape_fn(n, |i| (i as f64) * 0.02);
+        let mut hp = HashMap::new();
+        hp.insert(
+            "learning_rate".to_string(),
+            json!({"low": 0.05, "high": 0.2}),
+        );
+
+        let run = |weighted: bool| {
+            let mut config = HyperOptConfig {
+                n_trials: 3,
+                n_folds: 2,
+                seed: 7,
+                verbose: false,
+                ..Default::default()
+            };
+            if weighted {
+                // Recency-ramp shape, same as the production caller.
+                config.fold_weight_fn = Some(FoldWeightFn(std::sync::Arc::new(|len| {
+                    (0..len)
+                        .map(|i| 0.5 + 0.5 * (i as f64) / (len.max(2) - 1) as f64)
+                        .collect()
+                })));
+            }
+            hyper_opt_with_config::<Normal, LogScore, StumpLearner, _>(
+                &features,
+                &labels,
+                &hp,
+                config,
+                |params| {
+                    let lr = params
+                        .get("learning_rate")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.1);
+                    NGBoost::<Normal, LogScore, StumpLearner>::new(8, lr, StumpLearner)
+                },
+            )
+            .expect("search should not error")
+        };
+
+        let unweighted = run(false);
+        let weighted = run(true);
+        assert!(
+            unweighted.best_score.is_finite(),
+            "unweighted control search degenerated"
+        );
+        assert!(
+            weighted.best_score.is_finite(),
+            "WEIGHTED search scored every trial infinite — fold fits are erroring"
+        );
+        assert!(
+            !weighted.best_params.is_empty(),
+            "weighted search returned no parameters"
+        );
+    }
 
     #[test]
     fn test_parse_hp_specs_array() {
