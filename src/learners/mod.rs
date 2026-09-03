@@ -1028,6 +1028,125 @@ fn build_histogram_cache(x: &Array2<f64>, max_bins: usize) -> HistogramFitCache 
 /// slower than this layout at every size on Apple Silicon — the ~20KB arrays
 /// both sit in L1/L2, so the halved cache-line traffic never materializes and
 /// the doubled index arithmetic just costs. Do not retry the interleave here.
+/// Row × feature cell visits below which a histogram fill stays serial: rayon
+/// costs ~5–10 µs per task, and deep-tree nodes are small. Above it the fill
+/// is split across contiguous FEATURE groups (never across rows — see
+/// [`fill_hists_par`]).
+const HIST_PAR_MIN_CELLS: usize = 200_000;
+
+/// Features per parallel task for a fill of `k` features over `n_cells`
+/// row×feature visits, or `None` to fill serially. One task per rayon thread,
+/// at least 8 features each so a task's row loop touches a contiguous run of
+/// the binned row.
+#[allow(unused_variables)]
+fn hist_par_group_size(k: usize, n_cells: usize, force_serial: bool) -> Option<usize> {
+    #[cfg(feature = "parallel")]
+    {
+        if !force_serial && n_cells >= HIST_PAR_MIN_CELLS && k >= 16 {
+            let threads = rayon::current_num_threads().max(1);
+            return Some(k.div_ceil(threads).max(8));
+        }
+    }
+    None
+}
+
+/// Parallel histogram fill over contiguous feature groups.
+///
+/// **Bitwise identical to the serial loops in [`FeatureHists::build`] /
+/// [`FeatureHists::build_cols`]**: every (feature, bin) slot is owned by
+/// exactly one task, and that task visits the node's rows in the same order
+/// the serial loop does, so each slot receives the same additions in the same
+/// order. Splitting across ROWS instead would sum in a different order and
+/// could flip a tie-broken split. Before 2026-09-03 this fill was the serial
+/// hot loop of every boosting round (37 ms/round at 18.6k rows × 263
+/// features, one core busy, eleven idle).
+///
+/// `cols = None` fills every feature (`f` → column `f`); `Some(cols)` fills
+/// the selected columns in `cols` order, laid out compactly (see
+/// `build_cols`). `accumulate_count = false` is the ROOT path, whose counts
+/// were seeded from the cache — only sums are accumulated.
+#[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
+fn fill_hists_par(
+    binned: &[u8],
+    p: usize,
+    indices: &[u32],
+    y: &Array1<f64>,
+    weights: Option<&Array1<f64>>,
+    cols: Option<&[usize]>,
+    n_bins: usize,
+    gsz: usize,
+    count: &mut [f64],
+    sum: &mut [f64],
+    raw: Option<&mut [f64]>,
+    accumulate_count: bool,
+) {
+    use rayon::prelude::*;
+    let k = cols.map_or(p, |c| c.len());
+    let cs = gsz * n_bins;
+    let fill_group = |g: usize, c: &mut [f64], s: &mut [f64], mut r: Option<&mut [f64]>| {
+        let f0 = g * gsz;
+        let f1 = (f0 + gsz).min(k);
+        for &i in indices {
+            let i = i as usize;
+            let (yv, w) = match weights {
+                Some(wt) => {
+                    let w = wt[i];
+                    (y[i] * w, w)
+                }
+                None => (y[i], 1.0),
+            };
+            let row = &binned[i * p..(i + 1) * p];
+            for f in f0..f1 {
+                let b = match cols {
+                    None => row[f],
+                    Some(cols) => row[cols[f]],
+                } as usize;
+                let slot = (f - f0) * n_bins + b;
+                if accumulate_count {
+                    c[slot] += w;
+                }
+                s[slot] += yv;
+                if let Some(r) = r.as_deref_mut() {
+                    r[slot] += 1.0;
+                }
+            }
+        }
+    };
+    match raw {
+        Some(raw) => count
+            .par_chunks_mut(cs)
+            .zip(sum.par_chunks_mut(cs))
+            .zip(raw.par_chunks_mut(cs))
+            .enumerate()
+            .for_each(|(g, ((c, s), r))| fill_group(g, c, s, Some(r))),
+        None => count
+            .par_chunks_mut(cs)
+            .zip(sum.par_chunks_mut(cs))
+            .enumerate()
+            .for_each(|(g, (c, s))| fill_group(g, c, s, None)),
+    }
+}
+
+#[cfg(not(feature = "parallel"))]
+#[allow(clippy::too_many_arguments)]
+fn fill_hists_par(
+    _binned: &[u8],
+    _p: usize,
+    _indices: &[u32],
+    _y: &Array1<f64>,
+    _weights: Option<&Array1<f64>>,
+    _cols: Option<&[usize]>,
+    _n_bins: usize,
+    _gsz: usize,
+    _count: &mut [f64],
+    _sum: &mut [f64],
+    _raw: Option<&mut [f64]>,
+    _accumulate_count: bool,
+) {
+    unreachable!("hist_par_group_size returns None without the `parallel` feature")
+}
+
 struct FeatureHists {
     count: Vec<f64>,
     sum: Vec<f64>,
@@ -1049,6 +1168,18 @@ impl FeatureHists {
         y: &Array1<f64>,
         sample_weight: Option<&Array1<f64>>,
     ) -> Self {
+        Self::build_impl(cache, indices, y, sample_weight, false)
+    }
+
+    /// [`build`] with the parallel fill forced off — the reference the
+    /// parity test compares against; production always goes through `build`.
+    fn build_impl(
+        cache: &HistogramFitCache,
+        indices: &[u32],
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        force_serial: bool,
+    ) -> Self {
         let p = cache.n_features;
         // Per-feature bin counts differ; use the max so the flat layout is uniform
         let n_bins = cache
@@ -1062,18 +1193,27 @@ impl FeatureHists {
         let mut sum = vec![0.0; p * n_bins];
         let mut raw: Option<Vec<f64>> = None;
 
+        let gsz = hist_par_group_size(p, indices.len() * p, force_serial);
+
         if let Some(weights) = sample_weight {
             let raw = raw.get_or_insert_with(|| vec![0.0; p * n_bins]);
-            for &i in indices {
-                let i = i as usize;
-                let w = weights[i];
-                let yw = y[i] * w;
-                let row = &cache.binned[i * p..(i + 1) * p];
-                for (f, &b) in row.iter().enumerate() {
-                    let slot = f * n_bins + b as usize;
-                    count[slot] += w;
-                    sum[slot] += yw;
-                    raw[slot] += 1.0;
+            if let Some(gsz) = gsz {
+                fill_hists_par(
+                    &cache.binned, p, indices, y, Some(weights), None, n_bins, gsz,
+                    &mut count, &mut sum, Some(raw), true,
+                );
+            } else {
+                for &i in indices {
+                    let i = i as usize;
+                    let w = weights[i];
+                    let yw = y[i] * w;
+                    let row = &cache.binned[i * p..(i + 1) * p];
+                    for (f, &b) in row.iter().enumerate() {
+                        let slot = f * n_bins + b as usize;
+                        count[slot] += w;
+                        sum[slot] += yw;
+                        raw[slot] += 1.0;
+                    }
                 }
             }
         } else if indices.len() == cache.n_rows
@@ -1102,14 +1242,26 @@ impl FeatureHists {
                 c
             });
             count.copy_from_slice(counts);
-            for &i in indices {
-                let i = i as usize;
-                let yi = y[i];
-                let row = &cache.binned[i * p..(i + 1) * p];
-                for (f, &b) in row.iter().enumerate() {
-                    sum[f * n_bins + b as usize] += yi;
+            if let Some(gsz) = gsz {
+                fill_hists_par(
+                    &cache.binned, p, indices, y, None, None, n_bins, gsz,
+                    &mut count, &mut sum, None, false,
+                );
+            } else {
+                for &i in indices {
+                    let i = i as usize;
+                    let yi = y[i];
+                    let row = &cache.binned[i * p..(i + 1) * p];
+                    for (f, &b) in row.iter().enumerate() {
+                        sum[f * n_bins + b as usize] += yi;
+                    }
                 }
             }
+        } else if let Some(gsz) = gsz {
+            fill_hists_par(
+                &cache.binned, p, indices, y, None, None, n_bins, gsz,
+                &mut count, &mut sum, None, true,
+            );
         } else {
             for &i in indices {
                 let i = i as usize;
@@ -1145,6 +1297,18 @@ impl FeatureHists {
         sample_weight: Option<&Array1<f64>>,
         cols: &[usize],
     ) -> Self {
+        Self::build_cols_impl(cache, indices, y, sample_weight, cols, false)
+    }
+
+    /// [`build_cols`] with the parallel fill forced off (parity reference).
+    fn build_cols_impl(
+        cache: &HistogramFitCache,
+        indices: &[u32],
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        cols: &[usize],
+        force_serial: bool,
+    ) -> Self {
         let p = cache.n_features;
         let k = cols.len();
         // Uniform flat layout over the SELECTED features' bin counts.
@@ -1158,18 +1322,27 @@ impl FeatureHists {
         let mut sum = vec![0.0; k * n_bins];
         let mut raw: Option<Vec<f64>> = None;
 
+        let gsz = hist_par_group_size(k, indices.len() * k, force_serial);
+
         if let Some(weights) = sample_weight {
             let raw = raw.get_or_insert_with(|| vec![0.0; k * n_bins]);
-            for &i in indices {
-                let i = i as usize;
-                let w = weights[i];
-                let yw = y[i] * w;
-                let row = &cache.binned[i * p..(i + 1) * p];
-                for (f, &c) in cols.iter().enumerate() {
-                    let slot = f * n_bins + row[c] as usize;
-                    count[slot] += w;
-                    sum[slot] += yw;
-                    raw[slot] += 1.0;
+            if let Some(gsz) = gsz {
+                fill_hists_par(
+                    &cache.binned, p, indices, y, Some(weights), Some(cols), n_bins, gsz,
+                    &mut count, &mut sum, Some(raw), true,
+                );
+            } else {
+                for &i in indices {
+                    let i = i as usize;
+                    let w = weights[i];
+                    let yw = y[i] * w;
+                    let row = &cache.binned[i * p..(i + 1) * p];
+                    for (f, &c) in cols.iter().enumerate() {
+                        let slot = f * n_bins + row[c] as usize;
+                        count[slot] += w;
+                        sum[slot] += yw;
+                        raw[slot] += 1.0;
+                    }
                 }
             }
         } else if indices.len() == cache.n_rows
@@ -1208,14 +1381,26 @@ impl FeatureHists {
                 count[f * n_bins..f * n_bins + width]
                     .copy_from_slice(&counts[c * global_bins..c * global_bins + width]);
             }
-            for &i in indices {
-                let i = i as usize;
-                let yi = y[i];
-                let row = &cache.binned[i * p..(i + 1) * p];
-                for (f, &c) in cols.iter().enumerate() {
-                    sum[f * n_bins + row[c] as usize] += yi;
+            if let Some(gsz) = gsz {
+                fill_hists_par(
+                    &cache.binned, p, indices, y, None, Some(cols), n_bins, gsz,
+                    &mut count, &mut sum, None, false,
+                );
+            } else {
+                for &i in indices {
+                    let i = i as usize;
+                    let yi = y[i];
+                    let row = &cache.binned[i * p..(i + 1) * p];
+                    for (f, &c) in cols.iter().enumerate() {
+                        sum[f * n_bins + row[c] as usize] += yi;
+                    }
                 }
             }
+        } else if let Some(gsz) = gsz {
+            fill_hists_par(
+                &cache.binned, p, indices, y, None, Some(cols), n_bins, gsz,
+                &mut count, &mut sum, None, true,
+            );
         } else {
             for &i in indices {
                 let i = i as usize;
@@ -4260,5 +4445,56 @@ mod col_masked_bench {
                 el.as_secs_f64() / iters as f64 * 1000.0
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod hist_par_tests {
+    use super::*;
+
+    fn lcg(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (1u64 << 31) as f64
+        }
+    }
+
+    /// The parallel fill must reproduce the serial fill BIT FOR BIT — same
+    /// counts, sums and raw counts in every (feature, bin) slot — for the
+    /// unweighted, weighted, root and column-masked paths. Sized above
+    /// `HIST_PAR_MIN_CELLS` so the parallel branch actually runs.
+    #[test]
+    fn parallel_hist_fill_is_bitwise_identical_to_serial() {
+        let (n, p) = (6000usize, 64usize);
+        let mut r = lcg(5);
+        let x = Array2::from_shape_fn((n, p), |_| r() * 10.0 - 5.0);
+        let y = Array1::from_shape_fn(n, |_| (r() * 9.0).floor());
+        let w = Array1::from_shape_fn(n, |_| 0.5 + r());
+        let cache = build_histogram_cache(&x, 255);
+        let all: Vec<u32> = (0..n as u32).collect();
+        let subset: Vec<u32> = (0..n as u32).filter(|i| i % 3 != 1).collect();
+        let cols: Vec<usize> = (0..p).filter(|c| c % 4 != 2).rev().collect();
+
+        let same = |a: &FeatureHists, b: &FeatureHists| {
+            assert_eq!(a.n_bins, b.n_bins);
+            assert_eq!(a.count, b.count, "count slots differ");
+            assert_eq!(a.sum, b.sum, "sum slots differ");
+            assert_eq!(a.raw, b.raw, "raw slots differ");
+        };
+
+        for (idx, wt) in [(&all, None), (&subset, None), (&all, Some(&w)), (&subset, Some(&w))] {
+            same(
+                &FeatureHists::build_impl(&cache, idx, &y, wt, true),
+                &FeatureHists::build_impl(&cache, idx, &y, wt, false),
+            );
+            same(
+                &FeatureHists::build_cols_impl(&cache, idx, &y, wt, &cols, true),
+                &FeatureHists::build_cols_impl(&cache, idx, &y, wt, &cols, false),
+            );
+        }
+        // And the branch really was taken for these sizes.
+        assert!(hist_par_group_size(p, n * p, false).is_some());
+        assert!(hist_par_group_size(p, 1_000, false).is_none(), "small nodes stay serial");
     }
 }

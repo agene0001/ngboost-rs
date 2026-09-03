@@ -919,7 +919,7 @@ where
         for itr in 0..self.n_estimators {
             // Sample data for this iteration
             let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
-                self.sample(&x_train, &y_train, &params, sample_weight);
+                self.sample(&x_train, &y_train, &params, sample_weight, stable_cache.is_none());
             // NOTE: col_idxs is pushed onto self.col_idxs only AFTER the base
             // learners fit successfully (below) — pushing here desynced
             // col_idxs from base_models when a fit errored, and a later
@@ -1237,12 +1237,20 @@ where
 
     // First element: the sampled row ids (in the order the sampled arrays are
     // laid out), or None when rows were not subsampled.
+    /// `materialize_x = false` skips building the sampled X matrix: the
+    /// caller has a full-X fit cache and fits from row ids + a column mask,
+    /// never reading it. The returned X is then a borrowed placeholder that
+    /// MUST NOT be read (the fit loop only touches it on the no-cache
+    /// branches). That copy — an element-by-element gather for column
+    /// subsets — was ~50 % of every boosting round at 263 features (measured
+    /// 2026-09-03: 29.6 → 15 ms/round with col_sample 0.8).
     fn sample<'a>(
         &mut self,
         x: &'a Array2<f64>,
         y: &'a Array1<f64>,
         params: &'a Array2<f64>,
         sample_weight: Option<&'a Array1<f64>>,
+        materialize_x: bool,
     ) -> (
         Option<Vec<u32>>,
         Vec<usize>,
@@ -1310,9 +1318,11 @@ where
             indices.into_iter().take(col_size).collect()
         };
 
-        // Create sampled data
-        let x_sampled = if col_size == n_features {
-            x.select(ndarray::Axis(0), &row_idxs)
+        // Create sampled data (see `materialize_x` on the signature).
+        let x_sampled: Cow<'a, Array2<f64>> = if !materialize_x {
+            Cow::Borrowed(x)
+        } else if col_size == n_features {
+            Cow::Owned(x.select(ndarray::Axis(0), &row_idxs))
         } else {
             let mut result = Array2::zeros((row_idxs.len(), col_idxs.len()));
             for (new_row, &old_row) in row_idxs.iter().enumerate() {
@@ -1320,7 +1330,7 @@ where
                     result[[new_row, new_col]] = x[[old_row, old_col]];
                 }
             }
-            result
+            Cow::Owned(result)
         };
         let y_sampled = y.select(ndarray::Axis(0), &row_idxs);
         let params_sampled = params.select(ndarray::Axis(0), &row_idxs);
@@ -1338,7 +1348,7 @@ where
         (
             row_ids,
             col_idxs,
-            Cow::Owned(x_sampled),
+            x_sampled,
             Cow::Owned(y_sampled),
             Cow::Owned(params_sampled),
             sample_weights_sampled,
@@ -1374,7 +1384,24 @@ where
                         *p -= factor * pred;
                     });
             }
+        } else if let Some(xs) = x.as_slice() {
+            // Column-subsampled trees: map subset-local feature ids through
+            // `col_idxs` at lookup time (`predict_rows`) instead of
+            // materializing `x.select(Axis(1), col_idxs)` — a full copy of
+            // the training (and validation) matrix EVERY round. At 18.6k rows
+            // × 263 features that copy was ~14 ms of a 25 ms round, i.e. more
+            // than the tree fit itself (2026-09-03 measurement). The walk
+            // compares the same values, so predictions are bit-identical.
+            let mut preds = vec![0.0f64; x.nrows()];
+            for (j, learner) in learners.iter().enumerate() {
+                learner.predict_rows(xs, x.ncols(), Some(col_idxs), &mut preds);
+                let mut col = params.column_mut(j);
+                for (p, &pred) in col.iter_mut().zip(preds.iter()) {
+                    *p -= factor * pred;
+                }
+            }
         } else {
+            // Non-contiguous X (rare): keep the materializing path.
             let x_subset = x.select(ndarray::Axis(1), col_idxs);
             for (j, learner) in learners.iter().enumerate() {
                 let preds = learner.predict(&x_subset);
