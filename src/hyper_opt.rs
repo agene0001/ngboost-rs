@@ -397,7 +397,7 @@ where
     D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
     S: Score + 'static,
     B: BaseLearner + Clone + 'static,
-    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B>,
+    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B> + Sync,
 {
     hyper_opt_with_transform(features, labels, hp_dict, config, builder, None)
 }
@@ -421,7 +421,7 @@ where
     D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
     S: Score + 'static,
     B: BaseLearner + Clone + 'static,
-    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B>,
+    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B> + Sync,
 {
     use std::time::Instant;
 
@@ -649,7 +649,7 @@ where
     D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
     S: Score + 'static,
     B: BaseLearner + Clone + 'static,
-    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B>,
+    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B> + Sync,
 {
     let config = HyperOptConfig {
         n_trials,
@@ -834,7 +834,7 @@ where
     D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
     S: Score + 'static,
     B: BaseLearner + Clone + 'static,
-    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B>,
+    F: Fn(&HashMap<String, Value>) -> NGBoost<D, S, B> + Sync,
 {
     let n_samples = features.nrows();
     // `n_folds <= 1` ⇒ single 80/20 holdout (one iteration); otherwise k-fold.
@@ -851,7 +851,15 @@ where
     let mut fold_rounds: Vec<usize> = Vec::with_capacity(n_iters);
     let mut pruned = false;
 
-    for i in 0..n_iters {
+    // One fold: partition, transform, fit, score → (score, rounds). Written
+    // as a closure so the folds can run SEQUENTIALLY (the pruner consulted
+    // after each) or IN PARALLEL on rayon (2026-10-27): a boosting round of
+    // the histogram learner is ~70 % serial — 1 → 12 threads bought only
+    // 1.3–1.5× at 89k × 66 — so one fit holds ~1.5 cores and the other ten
+    // idle for the whole search. Three folds at once use them. The price is
+    // intra-trial pruning: a parallel trial is pruned on its full mean, not
+    // after its first bad fold. `NGBOOST_PARALLEL_FOLDS=0` keeps the old loop.
+    let run_fold = |i: usize| -> (f64, Option<usize>) {
         // Partition fold `i` into (train, test). `TimeSeries` trains only on rows
         // strictly before the test segment (no future leakage); `KFold`/holdout
         // trains on all other rows.
@@ -898,16 +906,14 @@ where
                 match ndarray::concatenate(Axis(0), &[train_features_1, train_features_2]) {
                     Ok(f) => f,
                     Err(_) => {
-                        fold_scores.push(f64::INFINITY);
-                        continue;
+                        return (f64::INFINITY, None);
                     }
                 };
             let train_labels =
                 match ndarray::concatenate(Axis(0), &[train_labels_1, train_labels_2]) {
                     Ok(l) => l,
                     Err(_) => {
-                        fold_scores.push(f64::INFINITY);
-                        continue;
+                        return (f64::INFINITY, None);
                     }
                 };
             let train_idx: Vec<usize> = (0..test_start).chain(test_end..n_samples).collect();
@@ -939,8 +945,7 @@ where
             if std::env::var("NGBOOST_VERBOSE").is_ok() {
                 eprintln!("fold {i}: fold transform failed ({e}); scoring as infinite");
             }
-            fold_scores.push(f64::INFINITY);
-            continue;
+            return (f64::INFINITY, None);
         }
 
         let mut model = builder(trial_params);
@@ -988,10 +993,11 @@ where
             fold_weights.as_ref(),
             val_weights.as_ref(),
         );
+        let mut rounds: Option<usize> = None;
         let score = if fit_result.is_err() {
             f64::INFINITY
         } else {
-            fold_rounds.push(
+            rounds = Some(
                 model
                     .best_val_loss_itr()
                     .map(|b| b + 1)
@@ -1001,15 +1007,39 @@ where
             if s.is_finite() { s } else { f64::INFINITY }
         };
 
-        fold_scores.push(score);
+        (score, rounds)
+    };
 
-        // Pruning is meaningless with a single holdout — there are no further
-        // folds to skip.
-        if !single_holdout {
-            let running_mean = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
-            if pruner_state.should_prune(pruning_strategy, i, running_mean, n_completed_trials) {
-                pruned = true;
-                break;
+    let parallel_folds = !single_holdout
+        && std::env::var("NGBOOST_PARALLEL_FOLDS").map(|v| v != "0").unwrap_or(true);
+    if parallel_folds {
+        use rayon::prelude::*;
+        let results: Vec<(f64, Option<usize>)> = (0..n_iters).into_par_iter().map(run_fold).collect();
+        for (score, rounds) in results {
+            fold_scores.push(score);
+            if let Some(r) = rounds {
+                fold_rounds.push(r);
+            }
+        }
+        let mean = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+        if pruner_state.should_prune(pruning_strategy, n_iters - 1, mean, n_completed_trials) {
+            pruned = true;
+        }
+    } else {
+        for i in 0..n_iters {
+            let (score, rounds) = run_fold(i);
+            fold_scores.push(score);
+            if let Some(r) = rounds {
+                fold_rounds.push(r);
+            }
+            // Pruning is meaningless with a single holdout — there are no further
+            // folds to skip.
+            if !single_holdout {
+                let running_mean = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+                if pruner_state.should_prune(pruning_strategy, i, running_mean, n_completed_trials) {
+                    pruned = true;
+                    break;
+                }
             }
         }
     }
