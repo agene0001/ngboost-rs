@@ -916,7 +916,22 @@ where
         let stable_cache: Option<std::sync::Arc<dyn crate::learners::FitCache>> =
             self.base_learner.build_fit_cache(&x_train);
 
+        // Per-phase wall clock of a boosting round, printed once per fit to
+        // stderr when `NGBOOST_PROFILE=1` (2026-10-28). The 10-27 thread-scaling
+        // bench put ~70 % of a round outside the rayon-parallel split scan;
+        // this names where. Unset: one env read per fit, no timers.
+        let profile = std::env::var("NGBOOST_PROFILE")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let mut prof = [std::time::Duration::ZERO; 6];
+        let mut prof_rounds = 0usize;
+        let mut prof_t = std::time::Instant::now();
+
         for itr in 0..self.n_estimators {
+            if profile {
+                prof_t = std::time::Instant::now();
+                prof_rounds += 1;
+            }
             // Sample data for this iteration
             let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
                 self.sample(&x_train, &y_train, &params, sample_weight, stable_cache.is_none());
@@ -948,6 +963,11 @@ where
                         None => None,
                     }
                 };
+            if profile {
+                let now = std::time::Instant::now();
+                prof[0] += now - prof_t;
+                prof_t = now;
+            }
 
             // Dereference Cow to get &Array references (zero-cost for Borrowed)
             let x_sampled_ref = &*x_sampled;
@@ -991,6 +1011,12 @@ where
                 return Err(
                     "training diverged: non-finite gradients (degenerate distribution parameters, e.g. a scale collapsing to zero on constant targets)",
                 );
+            }
+
+            if profile {
+                let now = std::time::Instant::now();
+                prof[1] += now - prof_t;
+                prof_t = now;
             }
 
             // Fit base learners for each parameter in parallel using rayon
@@ -1069,6 +1095,11 @@ where
                 fitted_learners.push(fitted);
                 predictions_cols.push(preds);
             }
+            if profile {
+                let now = std::time::Instant::now();
+                prof[2] += now - prof_t;
+                prof_t = now;
+            }
 
             // Learner fits succeeded — only now record this iteration's
             // column subset, keeping col_idxs aligned with base_models.
@@ -1092,6 +1123,11 @@ where
             );
             self.scalings.push(scale);
             self.base_models.push(fitted_learners);
+            if profile {
+                let now = std::time::Instant::now();
+                prof[3] += now - prof_t;
+                prof_t = now;
+            }
 
             // Apply learning rate schedule and store it for prediction-time replay
             let progress = itr as f64 / self.n_estimators as f64;
@@ -1119,6 +1155,12 @@ where
                     &mut params,
                     factor,
                 );
+            }
+
+            if profile {
+                let now = std::time::Instant::now();
+                prof[4] += now - prof_t;
+                prof_t = now;
             }
 
             // Update validation parameters if validation data is provided
@@ -1168,6 +1210,12 @@ where
                 }
             }
 
+            if profile {
+                let now = std::time::Instant::now();
+                prof[5] += now - prof_t;
+                prof_t = now;
+            }
+
             // Verbose logging
             if self.should_print_verbose(itr) {
                 let grad_norm: f64 = grads
@@ -1210,6 +1258,22 @@ where
                 }
                 break;
             }
+        }
+
+        if profile && prof_rounds > 0 {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / prof_rounds as f64;
+            let total: std::time::Duration = prof.iter().sum();
+            eprintln!(
+                "ngboost profile: {} rounds, {:.2} ms/round = sample {:.2} | loss+grad {:.2} | tree fit {:.2} | line search {:.2} | param update {:.2} | validation {:.2}",
+                prof_rounds,
+                ms(total),
+                ms(prof[0]),
+                ms(prof[1]),
+                ms(prof[2]),
+                ms(prof[3]),
+                ms(prof[4]),
+                ms(prof[5])
+            );
         }
 
         // When early stopping is enabled, the final `early_stopping_rounds` trees
