@@ -22,12 +22,27 @@ pub struct StudentT {
     pub df: Array1<f64>,
 }
 
+/// Upper cap on the 3-parameter StudentT's degrees of freedom.
+///
+/// On light-tailed data the df MLE is +∞ (the Normal limit), and in log ν
+/// coordinates that boundary is a FINITE natural-gradient distance away:
+/// Fisher I[2,2] ≈ 3.5/ν² while d/dlogν ≈ O(1/ν), so the natural step grows
+/// like ν (≈1e6 at log ν ≈ 15). A single boosting step then threw log ν to
+/// ~1.8e5, exp() overflowed to +∞ and the next gradient was inf/inf = NaN
+/// ("training diverged"; ~5–14% of fits on uniform-noise data). Capping ν
+/// here — with an exactly-zero log ν gradient at the cap, the true chain-rule
+/// derivative of the clamped parameterization — freezes such rows at a
+/// t that is numerically Normal: 1e8 is TLogPdf's own Normal-limit switch.
+const DF_MAX: f64 = 1e8;
+
 impl Distribution for StudentT {
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
         let scale = crate::vmath::exp_column(&params.column(1));
         let var = &scale * &scale;
-        let df = crate::vmath::exp_column(&params.column(2));
+        // `>` (not f64::min) so a NaN log ν stays NaN and is still caught.
+        let df = crate::vmath::exp_column(&params.column(2))
+            .mapv_into(|v| if v > DF_MAX { DF_MAX } else { v });
         StudentT {
             loc,
             scale,
@@ -286,6 +301,16 @@ impl Scorable<LogScore> for StudentT {
                 row[0] = -df_plus_1 * diff / denom;
                 row[1] = 1.0 - df_plus_1 * diff_sq / denom;
 
+                if df >= DF_MAX {
+                    // Clamped (see DF_MAX): log ν no longer moves ν.
+                    row[2] = 0.0;
+                    return;
+                }
+                if df > 100.0 {
+                    row[2] = -t_logpdf_dlognu_large(diff_sq / var, df);
+                    return;
+                }
+
                 let term_1 = (df / 2.0) * digamma(df_plus_1 / 2.0);
                 let term_2 = (-df / 2.0) * digamma(df / 2.0);
                 let term_3 = -0.5;
@@ -301,6 +326,11 @@ impl Scorable<LogScore> for StudentT {
     }
 
     fn metric(&self) -> Array3<f64> {
+        // At the DF_MAX cap the log ν coordinate is frozen (d_score = 0):
+        // I[1,2] is zeroed so loc/scale steps are the plain 2×2 natural
+        // gradient, and I[2,2] keeps its tiny positive value so the 3×3
+        // solve stays nonsingular (the frozen step is 0 / I[2,2] = 0).
+        //
         // Closed-form Fisher information in the internal (loc, log σ, log ν)
         // parameterization (Lange, Little & Taylor 1989, transformed to
         // log-scale coordinates):
@@ -336,7 +366,11 @@ impl Scorable<LogScore> for StudentT {
 
             fi[[i, 0, 0]] = (df + 1.0) / ((df + 3.0) * var_i);
             fi[[i, 1, 1]] = 2.0 * df / (df + 3.0);
-            fi[[i, 1, 2]] = -2.0 * df / ((df + 1.0) * (df + 3.0));
+            fi[[i, 1, 2]] = if df >= DF_MAX {
+                0.0
+            } else {
+                -2.0 * df / ((df + 1.0) * (df + 3.0))
+            };
             fi[[i, 2, 1]] = fi[[i, 1, 2]];
             fi[[i, 2, 2]] = i22;
         }
@@ -443,7 +477,12 @@ impl Scorable<CRPScore> for StudentT {
                 // d(CRPS)/d(log(ν)): FD below ν=1000, Richardson-extrapolated
                 // A(z)/ν tail above (the raw FD sign-flips there; see
                 // t_crps_dlognu).
-                d_params[[i, 2]] = t_crps_dlognu(z, nu, sigma);
+                // Frozen at the DF_MAX cap (see from_params).
+                d_params[[i, 2]] = if nu >= DF_MAX {
+                    0.0
+                } else {
+                    t_crps_dlognu(z, nu, sigma)
+                };
             }
         }
 
@@ -512,6 +551,16 @@ impl Scorable<CRPScore> for StudentT {
                     }
                 }
             }
+
+            // Frozen log ν at the DF_MAX cap (d_score = 0): decouple it so
+            // loc/scale get the plain 2×2 natural gradient; the tiny positive
+            // I[2,2] keeps the solve nonsingular (frozen step = 0).
+            if nu >= DF_MAX {
+                for a in 0..2 {
+                    fi[[i, a, 2]] = 0.0;
+                    fi[[i, 2, a]] = 0.0;
+                }
+            }
         }
 
         fi
@@ -575,6 +624,41 @@ fn compute_crps_scale_metric_constant(nu: f64) -> f64 {
         *guard = Some((nu, integral));
     }
     integral
+}
+
+/// d(log pdf)/d(log ν) of the t for ν > 100, with u = z² = (y−μ)²/σ².
+///
+/// The direct form ν/2·[ψ((ν+1)/2) − ψ(ν/2)] − ½ − ν/2·ln(1+u/ν)
+/// + (ν+1)u/(2ν(1+u/ν)) is a sum of O(1)..O(u) terms whose true total is
+/// O(1/ν): absolute rounding error ~ν·ε swamps it (vs mpmath: 2.6e-5 rel at
+/// ν=1e5, 21% at 1e7, 46× too large at 1e8),
+/// and the natural gradient then multiplies it by 1/I[2,2] ≈ ν²/3.5. Here
+/// both pieces are cancellation-free:
+///   * digamma part = Σ cₖ/ν^(2k+1): 1/4, −1/8, 1/4, −17/16, 31/4 (sympy
+///     asymptotic series; truncation < 1e-17 relative at ν = 100);
+///   * the rest = b/2 − ν/2·h(a), a = u/ν, b = a/(1+a),
+///     h(a) = ln(1+a) − b = Σ_{k≥2} bᵏ/k (series for b < 0.1, else direct).
+fn t_logpdf_dlognu_large(u: f64, nu: f64) -> f64 {
+    let e = 1.0 / nu;
+    let e2 = e * e;
+    let digamma_part =
+        e * (0.25 + e2 * (-0.125 + e2 * (0.25 + e2 * (-17.0 / 16.0 + e2 * (31.0 / 4.0)))));
+
+    let a = u * e;
+    let b = a / (1.0 + a);
+    let h = if b < 0.1 {
+        let mut s = 0.0;
+        let mut bk = b * b;
+        for k in 2..=20 {
+            s += bk / k as f64;
+            bk *= b;
+        }
+        s
+    } else {
+        a.ln_1p() - b
+    };
+
+    digamma_part + 0.5 * b - 0.5 * nu * h
 }
 
 /// d(CRPS)/d(log ν) for the t CRPS, = σ · d(CRPS_std)/d(log ν).
@@ -1774,6 +1858,92 @@ mod tests {
                 "nu={nu}: d/dlognu = {got:e}, expected {truth:e}"
             );
         }
+    }
+
+    /// LogScore d/dlogν above ν = 100 (t_logpdf_dlognu_large) vs 60-digit
+    /// mpmath d(log pdf)/d(log ν). The direct digamma/log form it replaces
+    /// cancels catastrophically here (true value O(1/ν), error ~ν·ε).
+    #[test]
+    fn test_studentt_logscore_df_gradient_large_nu_vs_mpmath() {
+        // (z, nu, d log pdf / d log nu)
+        let cases: [(f64, f64, f64); 35] = [
+            (0.0, 100.5, 0.0024874390698338263),
+            (0.0, 1000.0, 0.00024999987500025),
+            (0.0, 100000.0, 2.499999999875e-6),
+            (0.0, 10000000.0, 2.4999999999999875e-8),
+            (0.0, 99000000.0, 2.5252525252525251e-9),
+            (0.5, 100.5, 0.0035731754466336853),
+            (0.5, 1000.0, 0.00035934883967967747),
+            (0.5, 100000.0, 3.593747395714681e-6),
+            (0.5, 10000000.0, 3.5937499739583215e-8),
+            (0.5, 99000000.0, 3.6300505023934631e-9),
+            (1.0, 100.5, 0.0049586221885768698),
+            (1.0, 1000.0, 0.00049983333323366659),
+            (1.0, 100000.0, 4.9999833333333323e-6),
+            (1.0, 10000000.0, 4.9999998333333333e-8),
+            (1.0, 99000000.0, 5.050505033499983e-9),
+            (2.0, 100.5, -0.016153360135946369),
+            (2.0, 1000.0, -0.00173673051125613),
+            (2.0, 100000.0, -1.7498666730788851e-5),
+            (2.0, 10000000.0, -1.7499986666673079e-7),
+            (2.0, 99000000.0, -1.7676766316362342e-8),
+            (5.0, 100.5, -1.0508893693457022),
+            (5.0, 1000.0, -0.13873922214001855),
+            (5.0, 100000.0, -0.001434510555301567),
+            (5.0, 10000000.0, -1.4349951041805338e-5),
+            (5.0, 99000000.0, -1.4494944499712343e-6),
+            (30.0, 100.5, -69.824734330750735),
+            (30.0, 1000.0, -83.847745717901335),
+            (30.0, 100000.0, -1.9964813362314958),
+            (30.0, 10000000.0, -0.020202549295649415),
+            (30.0, 99000000.0, -0.0020408818138436406),
+            (1000.0, 100.5, -411.82664202551568),
+            (1000.0, 1000.0, -2954.3771396577353),
+            (1000.0, 100000.0, -74439.763637418527),
+            (1000.0, 10000000.0, -22005.3990215993),
+            (1000.0, 99000000.0, -2491.6197483188133),
+        ];
+        for (z, nu, truth) in cases {
+            let params = Array2::from_shape_vec((1, 3), vec![0.0, 0.0, nu.ln()]).unwrap();
+            let dist = StudentT::from_params(&params);
+            let d = Scorable::<LogScore>::d_score(&dist, &Array1::from_vec(vec![z]));
+            // d_score is d(−log pdf), so it is −truth.
+            let got = -d[[0, 2]];
+            assert!(
+                ((got - truth) / truth).abs() < 1e-12,
+                "z={z}, nu={nu}: d/dlognu = {got:e}, expected {truth:e}"
+            );
+        }
+    }
+
+    /// On light-tailed data the df MLE is ∞ and natural-gradient steps on
+    /// log ν grow like ν, so log ν overflowed exp() and the next gradient was
+    /// NaN (tests/distns.rs test_studentt failed ~5–14% of runs). ν is now
+    /// capped at DF_MAX with a frozen (zero) log ν gradient, so a huge or
+    /// +∞ log ν yields finite gradients under both scores.
+    #[test]
+    fn test_studentt_df_cap_freezes_log_df() {
+        for log_df in [DF_MAX.ln() + 1e-9, 179211.5, f64::INFINITY] {
+            let params = Array2::from_shape_vec((1, 3), vec![0.5, -0.2, log_df]).unwrap();
+            let dist = StudentT::from_params(&params);
+            assert_eq!(dist.df[0], DF_MAX);
+            let y = Array1::from_vec(vec![2.1]);
+
+            let g = Scorable::<LogScore>::grad(&dist, &y, true);
+            assert!(g.iter().all(|v| v.is_finite()), "LogScore grad {g:?}");
+            assert_eq!(g[[0, 2]], 0.0);
+            // loc/log σ: the Normal-limit natural gradient, uncoupled from ν.
+            let z = (2.1 - 0.5) / (-0.2f64).exp();
+            assert_relative_eq!(g[[0, 0]], -(2.1 - 0.5), max_relative = 1e-6);
+            assert_relative_eq!(g[[0, 1]], (1.0 - z * z) / 2.0, max_relative = 1e-6);
+
+            let g = Scorable::<CRPScore>::grad(&dist, &y, true);
+            assert!(g.iter().all(|v| v.is_finite()), "CRPScore grad {g:?}");
+            assert_eq!(g[[0, 2]], 0.0);
+        }
+        // NaN log ν must still surface as NaN (not be clamped to DF_MAX).
+        let params = Array2::from_shape_vec((1, 3), vec![0.0, 0.0, f64::NAN]).unwrap();
+        assert!(StudentT::from_params(&params).df[0].is_nan());
     }
 
     #[test]
