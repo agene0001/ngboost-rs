@@ -295,12 +295,28 @@ impl std::fmt::Debug for FoldWeightFn {
     }
 }
 
+/// Per-fold SCORING-row weights: called with the scoring rows' positions in
+/// the original row order, returns one weight per row (or `None` = the plain
+/// mean). They weight the fold's early-stopping monitor AND its score, so a
+/// caller whose final fit down-weights some rows (e.g. short-minute NBA rows)
+/// chooses rounds and ranks hyperparameters on the rows that fit cares about.
+#[derive(Clone)]
+pub struct FoldValWeightFn(pub std::sync::Arc<dyn Fn(&[usize]) -> Option<Vec<f64>> + Send + Sync>);
+
+impl std::fmt::Debug for FoldValWeightFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldValWeightFn(..)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HyperOptConfig {
     /// Number of optimization trials.
     pub n_trials: u32,
     /// See [`FoldWeightFn`]. `None` = unweighted folds (historical behaviour).
     pub fold_weight_fn: Option<FoldWeightFn>,
+    /// See [`FoldValWeightFn`]. `None` = unweighted scoring rows (historical).
+    pub fold_val_weight_fn: Option<FoldValWeightFn>,
     /// Number of cross-validation folds per trial.
     pub n_folds: usize,
     /// How CV folds are partitioned (`KFold` default; `TimeSeries` for forward
@@ -365,6 +381,7 @@ impl Default for HyperOptConfig {
         Self {
             n_trials: 100,
             fold_weight_fn: None,
+            fold_val_weight_fn: None,
             n_folds: 5,
             cv_scheme: CvScheme::KFold,
             seed: 42,
@@ -540,6 +557,7 @@ where
             config.seed + trial as u64,
             fold_transform,
             config.fold_weight_fn.as_ref(),
+            config.fold_val_weight_fn.as_ref(),
         );
 
         // Feed score back to TPE regardless of pruning so the surrogate
@@ -834,6 +852,7 @@ fn cv_with_pruning<D, S, B, F>(
     trial_seed: u64,
     fold_transform: Option<&dyn FoldTransform>,
     fold_weight_fn: Option<&FoldWeightFn>,
+    fold_val_weight_fn: Option<&FoldValWeightFn>,
 ) -> (f64, bool, Vec<f64>, Option<usize>)
 where
     D: Distribution + DistributionMethods + Scorable<S> + Clone + 'static,
@@ -987,9 +1006,17 @@ where
         // exactly the unweighted mean it would take on the `None` branch.
         let fold_weights =
             fold_weight_fn.map(|wf| Array1::from_vec((wf.0)(train_labels.len())));
-        let val_weights = fold_weights
-            .as_ref()
-            .map(|_| Array1::from_elem(test_labels.len(), 1.0));
+        // Caller-supplied scoring-row weights (see `FoldValWeightFn`) weight
+        // the early-stopping monitor and the score; otherwise all-ones as above.
+        let caller_val_weights = fold_val_weight_fn
+            .and_then(|f| (f.0)(&valid_idx))
+            .filter(|w| w.len() == test_labels.len())
+            .map(Array1::from_vec);
+        let val_weights = caller_val_weights.clone().or_else(|| {
+            fold_weights
+                .as_ref()
+                .map(|_| Array1::from_elem(test_labels.len(), 1.0))
+        });
         let fit_result = model.fit_with_validation(
             &train_features,
             &train_labels,
@@ -1008,7 +1035,7 @@ where
                     .map(|b| b + 1)
                     .unwrap_or(model.n_estimators as usize),
             );
-            let s = model.score(&test_features, &test_labels);
+            let s = model.score_weighted(&test_features, &test_labels, caller_val_weights.as_ref());
             if s.is_finite() { s } else { f64::INFINITY }
         };
 

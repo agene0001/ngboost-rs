@@ -1768,6 +1768,12 @@ where
         Scorable::total_score(&dist, y, None)
     }
 
+    /// [`Self::score`] as a sample-weighted mean (`None` = the plain mean).
+    pub fn score_weighted(&self, x: &Array2<f64>, y: &Array1<f64>, weights: Option<&Array1<f64>>) -> f64 {
+        let dist = self.pred_dist(x);
+        Scorable::total_score(&dist, y, weights)
+    }
+
     /// Get number of features the model was trained on
     pub fn n_features(&self) -> Option<usize> {
         self.n_features
