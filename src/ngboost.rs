@@ -200,6 +200,11 @@ where
     pub verbose: bool,
     /// Enable adaptive learning rate for better convergence (deprecated, use lr_schedule).
     pub adaptive_learning_rate: bool,
+    /// Fit each parameter's base learner to the natural gradient weighted by
+    /// the Fisher diagonal (+ tikhonov) — Fisher scoring as in LogitBoost; see
+    /// the fit loop. Default false (upstream NGBoost); `NGBOOST_FISHER_WEIGHTS=1`
+    /// forces it on for every model in the process (benches).
+    pub fisher_weighted_learner: bool,
 
     // --- 0-byte (PhantomData) ---
     _dist: PhantomData<D>,
@@ -247,6 +252,7 @@ where
             verbose: false,
             adaptive_learning_rate: false,
             // 0-byte
+            fisher_weighted_learner: false,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -289,6 +295,7 @@ where
             verbose: false,
             adaptive_learning_rate: false,
             // 0-byte
+            fisher_weighted_learner: false,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -359,6 +366,7 @@ where
             verbose,
             adaptive_learning_rate,
             // 0-byte
+            fisher_weighted_learner: false,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -419,6 +427,7 @@ where
             verbose,
             adaptive_learning_rate,
             // 0-byte
+            fisher_weighted_learner: false,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -476,6 +485,7 @@ where
             verbose,
             adaptive_learning_rate: false,
             // 0-byte
+            fisher_weighted_learner: false,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -538,6 +548,7 @@ where
             verbose,
             adaptive_learning_rate: false,
             // 0-byte
+            fisher_weighted_learner: false,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -920,6 +931,20 @@ where
         // stderr when `NGBOOST_PROFILE=1` (2026-10-28). The 10-27 thread-scaling
         // bench put ~70 % of a round outside the rayon-parallel split scan;
         // this names where. Unset: one env read per fit, no timers.
+        // NGBOOST_FISHER_WEIGHTS=1 (2026-10-31): fit each parameter's base
+        // learner to the natural gradient g/F by least squares WEIGHTED by the
+        // Fisher diagonal F (+ tikhonov) times the sample weight — Fisher
+        // scoring as in LogitBoost (Friedman, Hastie & Tibshirani 2000). A
+        // leaf's weighted mean of g/F with weights F is Σg/ΣF, the Newton /
+        // Fisher-scoring step; the unweighted fit (upstream NGBoost) takes
+        // mean(g/F), whose fixed point is a 1/F-weighted estimating equation:
+        // for the Poisson head Σ(1 − y/λ) = 0 instead of Σ(λ − y) = 0 — still
+        // unbiased, but a λ≈2 row pulls a leaf ~15× harder than a λ≈30 row.
+        // Diagonal metrics only; off by default (measurement first).
+        let fisher_weighted = self.fisher_weighted_learner
+            || std::env::var("NGBOOST_FISHER_WEIGHTS")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false);
         let profile = std::env::var("NGBOOST_PROFILE")
             .map(|v| v != "0")
             .unwrap_or(false);
@@ -1023,6 +1048,29 @@ where
             let grad_cols: Vec<Array1<f64>> =
                 (0..n_params).map(|j| grads.column(j).to_owned()).collect();
 
+            // Fisher-weighted base learners (see `fisher_weighted`): per
+            // parameter j, the minibatch rows' (F_jj + tikhonov) × sample
+            // weight. None = the upstream unweighted (sample-weight-only) fit.
+            let fisher_cols: Option<Vec<Array1<f64>>> = if fisher_weighted
+                && self.natural_gradient
+                && Scorable::<S>::is_diagonal_metric(&batch_dist)
+            {
+                let diag = Scorable::<S>::diagonal_metric(&batch_dist);
+                Some(
+                    (0..n_params)
+                        .map(|j| {
+                            let mut c = diag.column(j).mapv(|v| (v + self.tikhonov_reg).max(1e-12));
+                            if let Some(w) = weight_ref {
+                                c *= w;
+                            }
+                            c
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
             let fit_results: Vec<Result<(Box<dyn TrainedBaseLearner>, Array1<f64>), &'static str>> =
                 if use_cached_subset {
                     // Fit each tree on the (row indices, column mask) subset
@@ -1039,10 +1087,28 @@ where
                     let n_train = x_train_ref.nrows();
                     let learners: Vec<B> =
                         (0..n_params).map(|_| self.base_learner.clone()).collect();
+                    // Fisher weights scattered to full length, aligned with
+                    // the cache's row ids like the gradient (rows outside the
+                    // minibatch are never read).
+                    let weight_full: Vec<Option<Array1<f64>>> = (0..n_params)
+                        .map(|j| {
+                            fisher_cols.as_ref().map(|fc| match rows {
+                                Some(r) => {
+                                    let mut w = Array1::zeros(n_train);
+                                    for (k, &ri) in r.iter().enumerate() {
+                                        w[ri as usize] = fc[j][k];
+                                    }
+                                    w
+                                }
+                                None => fc[j].clone(),
+                            })
+                        })
+                        .collect();
                     learners
                         .into_par_iter()
                         .zip(grad_cols.into_par_iter())
-                        .map(|(learner, grad_j)| {
+                        .zip(weight_full.into_par_iter())
+                        .map(|((learner, grad_j), w_full)| {
                             let grad_full = match rows {
                                 Some(r) => {
                                     let mut g = Array1::zeros(n_train);
@@ -1058,7 +1124,7 @@ where
                             learner.fit_predict_cached_rows_cols(
                                 x_train_ref,
                                 &grad_full,
-                                sample_weight,
+                                w_full.as_ref().or(sample_weight),
                                 cache_ref,
                                 rows,
                                 cols,
@@ -1069,17 +1135,21 @@ where
                     let learners: Vec<B> =
                         (0..n_params).map(|_| self.base_learner.clone()).collect();
                     let cache_ref = iter_cache.as_deref();
+                    let weight_cols: Vec<Option<Array1<f64>>> = (0..n_params)
+                        .map(|j| fisher_cols.as_ref().map(|fc| fc[j].clone()))
+                        .collect();
                     learners
                         .into_par_iter()
                         .zip(grad_cols.into_par_iter())
-                        .map(|(learner, grad_j)| {
+                        .zip(weight_cols.into_par_iter())
+                        .map(|((learner, grad_j), w_j)| {
                             // Fused fit + train-predictions: histogram trees
                             // harvest the predictions during the build
                             // (leaf-scatter) instead of re-walking the tree.
                             learner.fit_predict_cached(
                                 x_sampled_ref,
                                 &grad_j,
-                                weight_ref,
+                                w_j.as_ref().or(weight_ref),
                                 cache_ref,
                             )
                         })
@@ -3397,3 +3467,4 @@ mod missing_support_tests {
         assert!(m.fit(&x, &y).is_err(), "NaN must be rejected without support");
     }
 }
+
