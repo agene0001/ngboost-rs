@@ -62,6 +62,15 @@ const GOLDEN_RATIO: f64 = 1.618033988749895;
 /// predict_and_update_params). Inputs under 2× this stay sequential.
 pub(crate) const PAR_ROW_CHUNK: usize = 256;
 
+/// Rows at which the per-round parameter update goes parallel. Below this the
+/// walk is cheaper than waking the pool every round.
+const PAR_UPDATE_MIN_ROWS: usize = 10_000;
+
+/// `NGBOOST_PARALLEL_UPDATE=0` keeps the per-round update on one thread.
+fn parallel_update_enabled() -> bool {
+    std::env::var("NGBOOST_PARALLEL_UPDATE").map_or(true, |v| v != "0")
+}
+
 /// Training history result containing loss values at each iteration.
 #[derive(Debug, Clone, Default)]
 pub struct EvalsResult {
@@ -1504,10 +1513,35 @@ where
             return;
         }
 
-        // NOTE: deliberately NOT rayon-parallelized. This runs once per boosting
-        // iteration (~tens of µs of work); waking the pool 200×/fit costs more
-        // than the walk itself — measured 15-20% SLOWER end-to-end. get_params_at
-        // parallelizes instead: one dispatch covering all estimators.
+        // Each row's walk is independent, so the rows can split freely: same
+        // f64s as the serial walk below. On 88k rows this update was 3-4.7 ms
+        // of a round (NGBOOST_PROFILE, 2026-11-03).
+        let n_params = learners.len();
+        if x.nrows() >= PAR_UPDATE_MIN_ROWS
+            && params.ncols() == n_params
+            && parallel_update_enabled()
+            && let (Some(xs), Some(ps)) = (x.as_slice(), params.as_slice_mut())
+        {
+            let p = x.ncols();
+            let mapping = (col_idxs.len() != p).then_some(col_idxs);
+            ps.par_chunks_mut(PAR_ROW_CHUNK * n_params)
+                .zip(xs.par_chunks(PAR_ROW_CHUNK * p))
+                .for_each(|(p_chunk, x_chunk)| {
+                    let mut preds = vec![0.0f64; x_chunk.len() / p];
+                    for (j, learner) in learners.iter().enumerate() {
+                        learner.predict_rows(x_chunk, p, mapping, &mut preds);
+                        for (r, &pred) in preds.iter().enumerate() {
+                            p_chunk[r * n_params + j] -= factor * pred;
+                        }
+                    }
+                });
+            return;
+        }
+
+        // Small inputs stay on one thread: at tens of µs per round, waking the
+        // pool 200×/fit cost more than the walk — measured 15-20% SLOWER
+        // end-to-end. get_params_at parallelizes instead: one dispatch covering
+        // all estimators.
         if col_idxs.len() == x.ncols() {
             for (j, learner) in learners.iter().enumerate() {
                 let preds = learner.predict(x);
