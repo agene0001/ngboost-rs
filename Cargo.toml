@@ -49,10 +49,20 @@ accelerate-src = "0.3.2"
 
 [features]
 default = ["parallel"]
-# BLAS backend features - user must choose one
+# BLAS backend features - user must choose exactly one (src/lib.rs enforces
+# this with compile_error! on non-macOS). Each one forwards the matching
+# backend feature to ndarray-linalg/lax, so downstream crates must NOT also
+# depend on ndarray-linalg with a backend feature of their own: Cargo unifies
+# features, and two backends on lax -> E0259 `_src` defined multiple times.
 accelerate = ["accelerate-src"]
-intel-mkl = ["intel-mkl-src", "ndarray-linalg/intel-mkl-static"]
+# `intel-mkl-static-lp64-seq` is the non-deprecated spelling of lax's
+# `intel-mkl-static`; both map to intel-mkl-src/mkl-static-lp64-seq.
+intel-mkl = ["intel-mkl-src", "ndarray-linalg/intel-mkl-static-lp64-seq"]
 openblas = ["openblas-src", "ndarray-linalg/openblas-system"]
+# Opt out of the "no backend selected" compile error because you link a
+# BLAS/LAPACK yourself (blas-src, ndarray-linalg/netlib-*, a system linker
+# flag, ...). You are then responsible for providing the LAPACK symbols.
+external-blas = []
 # Enable parallel training of base learners
 parallel = ["rayon"]
 # Portable SIMD exp via the `wide` crate for non-macOS hot paths (macOS with

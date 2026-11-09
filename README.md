@@ -23,7 +23,12 @@ NGBoost is a modular boosting algorithm that allows you to obtain full probabili
 
 **⚠️ Important: No BLAS backend is enabled by default.**
 
-This library relies on a BLAS/LAPACK backend for matrix operations. To ensure cross-platform compatibility (e.g., macOS vs Windows), no backend is selected by default. You **must** explicitly enable one of the features below in your `Cargo.toml`, otherwise the project will fail to link.
+This library relies on a BLAS/LAPACK backend for matrix operations. To ensure cross-platform compatibility (e.g., macOS vs Windows), no backend is selected by default. You **must** explicitly enable one of the features below in your `Cargo.toml`, otherwise the build fails (on Windows/Linux with a `compile_error!` telling you so; on macOS with unresolved LAPACK symbols such as `dgesv_` / `dgesdd_` at link time).
+
+Two rules that avoid almost every build problem:
+
+1. **Enable exactly one backend feature, and enable it on `ngboost-rs`** (`accelerate`, `intel-mkl` or `openblas`). The feature forwards the right backend selection to `ndarray-linalg`/`lax` and links the library for you.
+2. **Do not add `ndarray-linalg`, `blas-src`, `openblas-src` or `intel-mkl-src` with a backend feature to your own `Cargo.toml`.** Cargo unifies features across the whole dependency graph, so a second backend selection anywhere (e.g. `ndarray-linalg = { features = ["intel-mkl-static"] }` next to `ngboost-rs` with `openblas`) ends in ``error[E0259]: the name `_src` is defined multiple times`` inside `lax`. If your crate needs `ndarray-linalg` for its own linear algebra, depend on it **without** any backend feature and let `ngboost-rs` pick the backend. If you really do link a BLAS yourself, enable `ngboost-rs`'s `external-blas` feature to silence the check.
 
 ### Platform-Specific BLAS Backend
 
@@ -33,7 +38,7 @@ Choose the configuration that matches your operating system and hardware.
 Uses Apple's native Accelerate framework. No additional setup required.
 ```toml
 [dependencies]
-ngboost-rs = { version = "0.1", features = ["accelerate"] }
+ngboost-rs = { version = "1.1", features = ["accelerate"] }
 ```
 
 #### Linux (OpenBLAS)
@@ -52,7 +57,7 @@ sudo pacman -S openblas
 Then in `Cargo.toml`:
 ```toml
 [dependencies]
-ngboost-rs = { version = "0.1", features = ["openblas"] }
+ngboost-rs = { version = "1.1", features = ["openblas"] }
 ```
 
 #### Windows
@@ -62,7 +67,7 @@ ngboost-rs = { version = "0.1", features = ["openblas"] }
 Intel MKL is the easiest option for Windows. It downloads pre-built binaries automatically and works on both Intel and AMD processors.
 ```toml
 [dependencies]
-ngboost-rs = { version = "0.1", features = ["intel-mkl"] }
+ngboost-rs = { version = "1.1", features = ["intel-mkl"] }
 ```
 
 That's it! No additional setup required.
@@ -119,7 +124,7 @@ rustflags = [
 ##### Step 5: Add to Cargo.toml
 ```toml
 [dependencies]
-ngboost-rs = { version = "0.1", features = ["openblas"] }
+ngboost-rs = { version = "1.1", features = ["openblas"] }
 ```
 
 ##### Troubleshooting OpenBLAS on Windows
@@ -143,6 +148,17 @@ You should see `blas.lib` and `lapack.lib` (or similar).
    cargo clean
    cargo build
 ```
+
+### Troubleshooting (all platforms)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `error: ngboost-rs: no BLAS/LAPACK backend selected` | No backend feature enabled (Windows/Linux). | Add `features = ["intel-mkl"]` or `["openblas"]` to the `ngboost-rs` dependency. |
+| Linker errors: `unresolved external symbol dgesv_` / `undefined reference to dgesdd_` / `cblas_dgemm` | No backend feature enabled (macOS), or the backend library is not where the linker looks. | macOS: add `features = ["accelerate"]`. Linux/Windows OpenBLAS: see the vcpkg / package-manager steps above. |
+| ``error[E0259]: the name `_src` is defined multiple times`` in `lax-0.18.x/src/lib.rs` | **Two** backends enabled on `lax` at once (e.g. `ngboost-rs` with `openblas` *plus* a direct `ndarray-linalg` dependency with `intel-mkl-static`, or `features = ["intel-mkl", "openblas"]`). | Keep one backend. Run `cargo tree -e features -i lax` to see which dependency enables the second one and remove it. |
+| `error: ngboost-rs: more than one BLAS backend feature is enabled` | Two of `accelerate` / `intel-mkl` / `openblas` are on (possibly from different crates in a workspace). | Same as above: keep one. |
+
+> **Why did adding `ndarray-linalg = { version = "0.17", features = ["intel-mkl-static"] }` "work"?** Because `0.17` is a *different* major version from the `0.18` that `ngboost-rs` uses, so Cargo built a second, separate copy of `lax` that happened to link MKL into the binary. It satisfies the linker by accident, doubles your compile time, and breaks as soon as both sides use the same version. Use `features = ["intel-mkl"]` on `ngboost-rs` instead.
 
 ---
 

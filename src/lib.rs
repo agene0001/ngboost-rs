@@ -8,6 +8,42 @@ extern crate intel_mkl_src;
 #[cfg(feature = "openblas")]
 extern crate openblas_src;
 
+// Fail fast with one actionable line instead of a wall of unresolved LAPACK
+// symbols (`dgesv_`, `dgesdd_`, ...) at link time. macOS is exempt because this
+// crate's own tests/examples get Accelerate from a target-specific
+// dev-dependency without any feature; downstream macOS users still need
+// `features = ["accelerate"]`. `external-blas` is the escape hatch for users
+// who link a BLAS/LAPACK themselves (e.g. via `blas-src`/`ndarray-linalg`).
+#[cfg(not(any(
+    feature = "accelerate",
+    feature = "intel-mkl",
+    feature = "openblas",
+    feature = "external-blas",
+    target_os = "macos",
+)))]
+compile_error!(
+    "ngboost-rs: no BLAS/LAPACK backend selected. Enable exactly one of the \
+     `accelerate` (macOS), `intel-mkl` (Windows/Linux) or `openblas` features \
+     on ngboost-rs itself -- do NOT add `ndarray-linalg` with a backend feature \
+     to your own Cargo.toml -- or enable `external-blas` if you link one \
+     yourself. See https://github.com/agene0001/ngboost-rs#installation"
+);
+
+// Two backends at once either link duplicate symbols or, for intel-mkl +
+// openblas, fail inside `lax` with `error[E0259]: the name `_src` is defined
+// multiple times` (lax has one `extern crate <backend>_src as _src;` per
+// backend feature, and Cargo unifies features across the whole graph).
+#[cfg(any(
+    all(feature = "accelerate", feature = "intel-mkl"),
+    all(feature = "accelerate", feature = "openblas"),
+    all(feature = "intel-mkl", feature = "openblas"),
+))]
+compile_error!(
+    "ngboost-rs: more than one BLAS backend feature is enabled (accelerate / \
+     intel-mkl / openblas). Enable exactly one; run \
+     `cargo tree -e features -i lax` to see which dependency enables the other."
+);
+
 pub mod api;
 pub mod dist;
 pub mod evaluation;
