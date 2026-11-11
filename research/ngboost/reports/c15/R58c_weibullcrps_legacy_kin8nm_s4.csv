@@ -1,0 +1,6 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,4,auto,449,872.82,2852988176.55738,-0.25531,0.10369,0.19069,0.4198,0.8591,1.1055,0.1636,-0.3819,NaN
+
+# SUMMARY (mean ± sd over 1 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto           449  -0.2553±0.0000    0.1037±0.0000    0.1907±0.0000    0.420   0.859   1.105  -0.382     NaN

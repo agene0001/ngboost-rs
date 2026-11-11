@@ -50,7 +50,36 @@ pub struct Categorical<const K: usize> {
     n_obs: usize,
 }
 
+/// Probability floor inside the Categorical natural-gradient solve. Keeps
+/// the preconditioner D⁻¹ + 11ᵀ/p_0 bounded (|natural gradient| ≤ ~1e6)
+/// when rows saturate on (near-)separable data; inactive otherwise.
+const NATGRAD_P_FLOOR: f64 = 1e-6;
+
 impl<const K: usize> Distribution for Categorical<K> {
+    /// Newton / LogitBoost leaves by default since 1.2.0.
+    ///
+    /// Bernoulli (K = 2): the unweighted natural-gradient leaf under-predicts
+    /// the positive rate on imbalanced data (train mean p̂/mean y 0.94 / 0.90 /
+    /// 0.85 at 12 % / 6 % / 2–3 % positives; 0.87 on the real sprint task);
+    /// weights p(1−p) restore it and gain up to −0.011 log loss, worst
+    /// measured cell +0.0004 (research/ngboost R20/R23/R26/R27).
+    ///
+    /// K > 2: the metric is non-diagonal; each logit's tree is weighted by
+    /// its diagonal entry p_k(1−p_k) (XGBoost's multiclass approximation).
+    /// Never worse on 3 synthetic + 2 real tasks; −0.022 log loss (10/10) on
+    /// support2's 4-class disease task (R28/R31).
+    fn default_fisher_weight_power() -> Option<f64> {
+        Some(1.0)
+    }
+
+    /// K > 2 also takes a per-round intercept step by default (best measured
+    /// arm: −0.032 log loss, 10/10, on the real 4-class task; −0.0105 on
+    /// cat3_nl). Bernoulli does not (β = 1 alone already restores its base
+    /// rate).
+    fn default_refit_intercept() -> bool {
+        K > 2
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         // params is (N, K-1) - each row is one observation's parameters
         let n_obs = params.nrows();
@@ -265,7 +294,11 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
             let mut s_up = 0.0;
             let mut singular = false;
             for j in 0..n_params {
-                let p_j = self.probs[[j + 1, i]];
+                // Floored probability (see NATGRAD_P_FLOOR): on separable
+                // data a class probability saturates toward 0 and the 1/p
+                // natural gradient overflowed ("training diverged: non-finite
+                // gradients", R33 wine). Only saturated rows are affected.
+                let p_j = self.probs[[j + 1, i]].max(NATGRAD_P_FLOOR);
                 let d_j = p_j + reg;
                 if d_j == 0.0 {
                     singular = true;
@@ -274,7 +307,9 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
                 s_ug += p_j * grad[[i, j]] / d_j;
                 s_up += p_j * p_j / d_j;
             }
-            let denom = 1.0 - s_up;
+            // For reg = 0, 1 − s_up = p_0 (the reference class); floor it the
+            // same way (flooring p̃ can push s_up past 1).
+            let denom = (1.0 - s_up).max(NATGRAD_P_FLOOR);
 
             if singular || denom == 0.0 {
                 // Exactly singular (a class probability underflowed to 0):
@@ -304,7 +339,7 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
 
             let corr = s_ug / denom;
             for j in 0..n_params {
-                let p_j = self.probs[[j + 1, i]];
+                let p_j = self.probs[[j + 1, i]].max(NATGRAD_P_FLOOR);
                 let d_j = p_j + reg;
                 grad[[i, j]] = grad[[i, j]] / d_j + (p_j / d_j) * corr;
             }

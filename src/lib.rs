@@ -45,6 +45,8 @@ compile_error!(
 );
 
 pub mod api;
+pub mod auto_mixture;
+pub mod count_auto;
 pub mod dist;
 pub mod evaluation;
 pub mod hyper_opt;
@@ -55,10 +57,13 @@ pub mod survival;
 pub(crate) mod vmath;
 
 // Re-export commonly used types at crate root
+pub use auto_mixture::{AutoMixtureModel, GrowStrategy, KSearch, NGBAutoMixtureRegressor};
+pub use count_auto::{CountModel, DISPERSION_Z_THRESHOLD, dispersion_z};
 pub use ngboost::{
     EvalsResult, LearningRateSchedule, LineSearchMethod, NGBClassifier, NGBExactRegressor,
-    NGBHistRegressor, NGBMultiClassifier, NGBMultiClassifier3, NGBMultiClassifier4,
-    NGBMultiClassifier5, NGBMultiClassifier10, NGBRegressor, NGBoost, NGBoostParams,
+    NGBHistRegressor, NGBMixtureRegressor, NGBMultiClassifier, NGBMultiClassifier3,
+    NGBMultiClassifier4, NGBMultiClassifier5, NGBMultiClassifier10, NGBRegressor, NGBoost,
+    NGBoostParams, ValidationSplit,
 };
 pub use scores::{CRPScore, LogScore, Scorable, Score, natural_gradient_regularized};
 

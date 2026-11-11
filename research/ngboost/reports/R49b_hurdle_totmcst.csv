@@ -1,0 +1,51 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+support_totmcst,0,normal,101,0.05,NaN,11.42925,14133.48989,36982.17791,0.5599,0.9370,0.0169,0.0000,11.4466,0.0169
+support_totmcst,0,hnormal,78,0.09,NaN,11.25131,13782.87650,36641.87570,0.5643,0.9361,0.0157,0.0094,11.3671,0.0169
+support_totmcst,0,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,0,hmix2,58,0.24,NaN,10.89209,12643.21917,36172.29809,0.5191,0.9388,0.0157,0.0100,11.0081,0.0169
+support_totmcst,1,normal,58,0.05,NaN,11.23847,13671.12106,34459.98302,0.6460,0.9476,0.0124,0.0000,11.2437,0.0124
+support_totmcst,1,hnormal,60,0.08,NaN,11.15647,13686.24864,34508.55520,0.6531,0.9494,0.0118,0.0112,11.2480,0.0124
+support_totmcst,1,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,1,hmix2,63,0.26,NaN,10.85787,12617.49358,33920.45165,0.5386,0.9432,0.0118,0.0113,10.9471,0.0124
+support_totmcst,2,normal,65,0.21,NaN,11.32775,14151.91390,36058.87365,0.7338,0.9583,0.0213,0.0000,11.3372,0.0213
+support_totmcst,2,hnormal,71,0.12,NaN,11.18209,13977.94706,36062.51066,0.7090,0.9539,0.0206,0.0096,11.3290,0.0213
+support_totmcst,2,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,2,hmix2,45,0.24,NaN,10.86634,13182.37393,36626.51168,0.5563,0.9521,0.0211,0.0130,11.0148,0.0213
+support_totmcst,3,normal,57,0.05,NaN,11.33050,280634.45180,33708.53160,0.6974,0.9530,0.0160,0.0000,11.3365,0.0160
+support_totmcst,3,hnormal,61,0.11,NaN,11.21188,20162.45875,33663.75875,0.7001,0.9539,0.0164,0.0097,11.3153,0.0160
+support_totmcst,3,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,3,hmix2,54,0.28,NaN,10.89893,13257.36667,34327.19793,0.5448,0.9521,0.0160,0.0100,11.0024,0.0160
+support_totmcst,4,normal,66,0.07,NaN,11.51208,15249.74796,39216.08015,0.6584,0.9388,0.0177,0.0000,11.5236,0.0177
+support_totmcst,4,hnormal,80,0.30,NaN,11.52781,14959.80844,39318.83250,0.6566,0.9414,0.0179,0.0087,11.6457,0.0177
+support_totmcst,4,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,4,hmix2,57,0.44,NaN,10.93408,13665.82098,39676.68846,0.5528,0.9485,0.0176,0.0096,11.0494,0.0177
+support_totmcst,5,normal,42,0.06,NaN,11.25938,12924.39860,31308.58377,0.6886,0.9574,0.0213,0.0000,11.2669,0.0213
+support_totmcst,5,hnormal,41,0.12,NaN,11.11929,12897.53868,31225.61734,0.6957,0.9583,0.0198,0.0124,11.2755,0.0213
+support_totmcst,5,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,5,hmix2,45,0.29,NaN,10.75700,11891.42681,31139.86778,0.5404,0.9547,0.0200,0.0138,10.9072,0.0213
+support_totmcst,6,normal,97,0.10,NaN,11.37117,6586659.52091,36187.22388,0.5812,0.9175,0.0142,0.0000,11.3782,0.0142
+support_totmcst,6,hnormal,107,0.19,NaN,11.27411,27796.64629,35975.20442,0.5785,0.9210,0.0135,0.0104,11.3741,0.0142
+support_totmcst,6,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,6,hmix2,76,0.67,NaN,10.86628,13308.38676,36711.52598,0.5120,0.9264,0.0135,0.0100,10.9650,0.0142
+support_totmcst,7,normal,60,0.07,NaN,11.49215,14705.40426,38940.33433,0.6211,0.9476,0.0089,0.0000,11.4970,0.0089
+support_totmcst,7,hnormal,65,0.13,NaN,11.47000,13550.91024,39048.32153,0.6149,0.9450,0.0087,0.0124,11.5392,0.0089
+support_totmcst,7,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,7,hmix2,51,0.34,NaN,10.95806,12589.53727,39099.08906,0.5209,0.9370,0.0087,0.0133,11.0250,0.0089
+support_totmcst,8,normal,58,0.24,NaN,11.18820,14066.87799,31582.82891,0.6948,0.9610,0.0169,0.0000,11.1924,0.0169
+support_totmcst,8,hnormal,58,0.14,NaN,11.09335,13625.05272,31206.24851,0.6797,0.9663,0.0167,0.0104,11.2129,0.0169
+support_totmcst,8,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,8,hmix2,49,0.29,NaN,10.78491,11695.63901,31028.64639,0.5599,0.9539,0.0163,0.0112,10.9036,0.0169
+support_totmcst,9,normal,109,0.09,NaN,11.17167,13567.30294,35179.93655,0.6025,0.9450,0.0177,0.0000,11.1775,0.0177
+support_totmcst,9,hnormal,90,0.16,NaN,11.08861,13513.96956,35149.27042,0.6096,0.9468,0.0165,0.0105,11.2106,0.0177
+support_totmcst,9,hlognormal,0,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN
+support_totmcst,9,hmix2,87,0.46,NaN,10.78414,12486.69787,34929.09620,0.5040,0.9210,0.0166,0.0102,10.9027,0.0177
+
+# SUMMARY (mean ± sd over 10 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# support_totmcst normal          71  11.3321±0.1200  697976.4229±2070767.7909 35362.4554±2702.7367   0.648   0.946   0.016  11.340   0.016
+# support_totmcst hnormal         71  11.2375±0.1517  15795.3457±4701.6770 35280.0195±2783.2969   0.646   0.947   0.016  11.352   0.016
+# support_totmcst hlognormal       0      NaN±NaN          NaN±NaN          NaN±NaN         NaN     NaN     NaN     NaN     NaN
+# support_totmcst hmix2           58  10.8600±0.0664  12733.7962±629.3849 35363.1373±2917.3768   0.535   0.943   0.016  10.973   0.016
+#   Δ(hnormal − normal): NLL -0.0946 (se 0.0182, wins 9/10) | CRPS -682181.0772 (se 653476.3399) | RMSE -82.4359 (se 54.6742)
+#   Δ(hlognormal − normal): NLL NaN (se NaN, wins 0/10) | CRPS NaN (se NaN) | RMSE NaN (se NaN)
+#   Δ(hmix2 − normal): NLL -0.4721 (se 0.0219, wins 10/10) | CRPS -685242.6267 (se 654767.8145) | RMSE +0.6819 (se 168.7442)

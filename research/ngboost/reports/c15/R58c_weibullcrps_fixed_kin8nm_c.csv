@@ -1,0 +1,9 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,6,auto,338,15.64,-0.65893,-0.37365,0.09289,0.17026,0.4137,0.8469,1.1142,0.1447,-0.3169,NaN
+kin8nm,7,auto,477,19.48,-0.72793,1.55842,0.09033,0.16594,0.4070,0.8353,1.1526,0.1357,-0.3019,NaN
+kin8nm,8,auto,589,21.92,-0.72567,-0.09520,0.09113,0.16560,0.3819,0.8212,1.1770,0.1332,0.1669,NaN
+kin8nm,9,auto,382,14.24,-0.67539,-0.48082,0.08866,0.16173,0.4124,0.8426,1.1119,0.1383,-0.3739,NaN
+
+# SUMMARY (mean ± sd over 4 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto           446   0.1522±0.9515    0.0908±0.0018    0.1659±0.0035    0.404   0.836   1.139  -0.206     NaN

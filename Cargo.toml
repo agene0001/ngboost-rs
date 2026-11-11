@@ -1,6 +1,6 @@
 [package]
 name = "ngboost-rs"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2024"
 authors = ["Felix Agene agene001@umn.edu>"]
 description = "Natural Gradient Boosting for Probabilistic Prediction - A Rust implementation of NGBoost"
@@ -102,6 +102,14 @@ path = "examples/multiclass.rs"
 [[example]]
 name = "advanced_options"
 path = "examples/advanced_options.rs"
+
+[[example]]
+name = "protein_probe"
+path = "examples/protein_probe.rs"
+
+[[example]]
+name = "mixture_sigma_probe"
+path = "examples/mixture_sigma_probe.rs"
 
 [[example]]
 name = "bench_wide"

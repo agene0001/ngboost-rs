@@ -35,7 +35,44 @@ pub struct StudentT {
 /// t that is numerically Normal: 1e8 is TLogPdf's own Normal-limit switch.
 const DF_MAX: f64 = 1e8;
 
+/// statrs' t cdf unwraps an incomplete-beta `Result` and panics on a NaN
+/// argument (seen when a diverged fit produced σ = ∞ or 0; research/ngboost
+/// Cycle 14). Return NaN instead and let the caller's finiteness checks act.
+trait CdfNan {
+    fn cdf_nan(&self, x: f64) -> f64;
+}
+
+impl CdfNan for StudentsTDist {
+    #[inline]
+    fn cdf_nan(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            f64::NAN
+        } else if x == f64::INFINITY {
+            1.0
+        } else if x == f64::NEG_INFINITY {
+            0.0
+        } else {
+            self.cdf(x)
+        }
+    }
+}
+
 impl Distribution for StudentT {
+    fn location_column() -> Option<usize> {
+        Some(0)
+    }
+
+    /// Staged fit by default: −0.05…−0.51 NLL, 49/49 seed wins over 8
+    /// datasets, and the joint fit diverged in 11 of those runs (σ or ν
+    /// blow-ups) while the staged fit never did (research/ngboost R54c).
+    fn default_staged_fit() -> bool {
+        true
+    }
+
+    fn scale_param_index() -> Option<usize> {
+        Some(1)
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
         let scale = crate::vmath::exp_column(&params.column(1));
@@ -203,7 +240,7 @@ impl DistributionMethods for StudentT {
         let mut result = Array1::zeros(y.len());
         for i in 0..y.len() {
             if let Ok(d) = StudentsTDist::new(self.loc[i], self.scale[i], self.df[i]) {
-                result[i] = d.cdf(y[i]);
+                result[i] = d.cdf_nan(y[i]);
             }
         }
         result
@@ -409,7 +446,7 @@ impl Scorable<CRPScore> for StudentT {
             // Standard t distribution with df = nu
             if let Ok(std_t) = StudentsTDist::new(0.0, 1.0, nu) {
                 let f_z = std_t.pdf(z);
-                let big_f_z = std_t.cdf(z);
+                let big_f_z = std_t.cdf_nan(z);
 
                 // Term 1: z * (2*F(z) - 1)
                 let term1 = z * (2.0 * big_f_z - 1.0);
@@ -457,7 +494,7 @@ impl Scorable<CRPScore> for StudentT {
             let z = (y_i - mu) / sigma;
 
             if let Ok(std_t) = StudentsTDist::new(0.0, 1.0, nu) {
-                let big_f_z = std_t.cdf(z);
+                let big_f_z = std_t.cdf_nan(z);
 
                 // d(CRPS)/d(μ) = -σ * d(CRPS_std)/dz / σ = -(2*F(z) - 1)
                 d_params[[i, 0]] = -(2.0 * big_f_z - 1.0);
@@ -490,6 +527,16 @@ impl Scorable<CRPScore> for StudentT {
     }
 
     fn metric(&self) -> Array3<f64> {
+        if !crate::scores::crps_metric_legacy() {
+            return studentt_crps_metric(&self.scale, &self.df);
+        }
+        self.legacy_crps_metric()
+    }
+}
+
+impl StudentT {
+    /// Pre-1.2 CRPS "metric" E_Y[g gᵀ] (wrong units; `crps_metric_legacy`).
+    fn legacy_crps_metric(&self) -> Array3<f64> {
         // Deterministic quadrature for E[g * gᵀ] over Z ~ t_ν.
         //
         // Change of variables z = tan(θ), θ midpoint-uniform on (−π/2, π/2):
@@ -535,7 +582,7 @@ impl Scorable<CRPScore> for StudentT {
                 }
 
                 // g0 = d(CRPS)/d(μ) = -(2F(z)-1)
-                let g0 = -(2.0 * std_t.cdf(z) - 1.0);
+                let g0 = -(2.0 * std_t.cdf_nan(z) - 1.0);
 
                 // g1 = d(CRPS)/d(log(σ))
                 let crps_std = compute_t_crps_std(z, nu);
@@ -712,7 +759,7 @@ fn compute_t_crps_std(z: f64, nu: f64) -> f64 {
 
     if let Ok(std_t) = StudentsTDist::new(0.0, 1.0, nu) {
         let f_z = std_t.pdf(z);
-        let big_f_z = std_t.cdf(z);
+        let big_f_z = std_t.cdf_nan(z);
 
         let term1 = z * (2.0 * big_f_z - 1.0);
         let term2 = 2.0 * f_z * (nu + z * z) / (nu - 1.0);
@@ -819,7 +866,7 @@ fn t_ppf_std_neg_half(p: f64, nu: f64) -> f64 {
         }
         if ln_t.is_finite() {
             let tail = -ln_t.exp();
-            if (std_t.cdf(tail) - p).abs() < (std_t.cdf(x) - p).abs() {
+            if (std_t.cdf_nan(tail) - p).abs() < (std_t.cdf_nan(x) - p).abs() {
                 x = tail;
             }
         }
@@ -836,7 +883,7 @@ fn t_ppf_std_neg_half(p: f64, nu: f64) -> f64 {
     let mut best_af = f64::INFINITY;
     let mut prev_f = f64::NAN;
     for _ in 0..100 {
-        let f = std_t.cdf(x) - p;
+        let f = std_t.cdf_nan(x) - p;
         if f == 0.0 {
             return x;
         }
@@ -887,7 +934,7 @@ fn t_ppf_std_neg_half(p: f64, nu: f64) -> f64 {
     // Exhaustion: the best evaluated iterate always beats an unevaluated
     // bisection midpoint (and NEVER average with the hi = 0.0 sentinel —
     // that returned half the true quantile on cdf-noise plateaus).
-    if std_t.cdf(x).is_finite() && (std_t.cdf(x) - p).abs() < best_af {
+    if std_t.cdf_nan(x).is_finite() && (std_t.cdf_nan(x) - p).abs() < best_af {
         x
     } else {
         best_x
@@ -985,6 +1032,14 @@ impl TFixedDf {
 }
 
 impl Distribution for TFixedDf {
+    fn location_column() -> Option<usize> {
+        Some(0)
+    }
+
+    fn scale_param_index() -> Option<usize> {
+        Some(1)
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         Self::from_params_with_df(params, Self::DEFAULT_FIXED_DF)
     }
@@ -1165,7 +1220,7 @@ impl DistributionMethods for TFixedDf {
             .and(&self.scale)
             .for_each(|r, &y_i, &loc, &scale| {
                 if !loc.is_nan() && scale > 0.0 {
-                    *r = std_t.cdf((y_i - loc) / scale);
+                    *r = std_t.cdf_nan((y_i - loc) / scale);
                 }
             });
         result
@@ -1339,8 +1394,18 @@ impl Scorable<CRPScore> for TFixedDf {
         // CRPScore metric diagonal for T with fixed df (2 params: loc, log_scale)
         // M[0,0] = 1/3, M[1,1] = C_t(nu) * sigma^2
         let n_obs = self.loc.len();
-        let c_t = compute_crps_scale_metric_constant(self.fixed_df);
         let mut diag = Array2::zeros((n_obs, 2));
+        if !crate::scores::crps_metric_legacy() {
+            let [ia, ib, _, _] = t_crps_integrals(self.fixed_df);
+            Zip::from(diag.rows_mut())
+                .and(&self.scale)
+                .for_each(|mut row, &scale| {
+                    row[0] = 2.0 * ia / scale;
+                    row[1] = 2.0 * ib * scale;
+                });
+            return diag;
+        }
+        let c_t = compute_crps_scale_metric_constant(self.fixed_df);
         Zip::from(diag.rows_mut())
             .and(&self.scale)
             .for_each(|mut row, &scale| {
@@ -1372,7 +1437,7 @@ impl Scorable<CRPScore> for TFixedDf {
             .for_each(|s, &y_i, &mu, &sigma| {
                 let z = (y_i - mu) / sigma;
                 let f_z = std_t.pdf(z);
-                let big_f_z = std_t.cdf(z);
+                let big_f_z = std_t.cdf_nan(z);
                 let term1 = z * (2.0 * big_f_z - 1.0);
                 let term2 = 2.0 * f_z * (nu + z * z) * inv_nu_minus_1;
                 *s = sigma * (term1 + term2 - c_nu);
@@ -1403,7 +1468,7 @@ impl Scorable<CRPScore> for TFixedDf {
             .for_each(|mut row, &y_i, &mu, &sigma| {
                 let z = (y_i - mu) / sigma;
                 let f_z = std_t.pdf(z);
-                let big_f_z = std_t.cdf(z);
+                let big_f_z = std_t.cdf_nan(z);
 
                 // d(CRPS)/d(μ) = -(2F(z)-1)
                 let g0 = -(2.0 * big_f_z - 1.0);
@@ -1426,11 +1491,10 @@ impl Scorable<CRPScore> for TFixedDf {
         let n_obs = self.loc.len();
         let mut fi = Array3::zeros((n_obs, 2, 2));
 
-        let c_t = compute_crps_scale_metric_constant(self.fixed_df);
-
+        let d = Scorable::<CRPScore>::diagonal_metric(self);
         for i in 0..n_obs {
-            fi[[i, 0, 0]] = 1.0 / 3.0;
-            fi[[i, 1, 1]] = c_t * self.scale[i] * self.scale[i];
+            fi[[i, 0, 0]] = d[[i, 0]];
+            fi[[i, 1, 1]] = d[[i, 1]];
         }
 
         fi
@@ -1633,7 +1697,7 @@ impl DistributionMethods for TFixedDfFixedVar {
             .and(&self.scale)
             .for_each(|r, &y_i, &loc, &scale| {
                 if !loc.is_nan() && scale > 0.0 {
-                    *r = std_t.cdf((y_i - loc) / scale);
+                    *r = std_t.cdf_nan((y_i - loc) / scale);
                 }
             });
         result
@@ -2096,7 +2160,7 @@ mod tests {
             let params =
                 Array2::from_shape_vec((1, 3), vec![0.0, 0.7_f64.ln(), (nu as f64).ln()]).unwrap();
             let d = StudentT::from_params(&params);
-            let fi = Scorable::<CRPScore>::metric(&d);
+            let fi = d.legacy_crps_metric();
             assert_relative_eq!(fi[[0, 0, 0]], 1.0 / 3.0, max_relative = 1e-4);
             assert_relative_eq!(fi[[0, 1, 1]], m11, max_relative = 1e-3);
             assert_relative_eq!(fi[[0, 2, 2]], m22, max_relative = 1e-3);
@@ -2401,7 +2465,7 @@ mod tests {
                     continue;
                 }
                 let (got, want) = if q < 0.5 {
-                    (std_t.cdf(x), q)
+                    (std_t.cdf_nan(x), q)
                 } else {
                     (std_t.sf(x), 1.0 - q)
                 };
@@ -2448,7 +2512,7 @@ mod tests {
                     continue;
                 }
                 let (got, want) = if q < 0.5 {
-                    (std_t.cdf(x), q)
+                    (std_t.cdf_nan(x), q)
                 } else {
                     (std_t.sf(x), 1.0 - q)
                 };
@@ -2581,7 +2645,7 @@ impl Scorable<CRPScore> for TFixedDfFixedVar {
 
     fn diagonal_metric(&self) -> Array2<f64> {
         // E[(2F(Z)-1)^2] = 1/3 universally for any continuous distribution (1 param)
-        Array2::from_elem((self.loc.len(), 1), 1.0 / 3.0)
+        Array2::from_elem((self.loc.len(), 1), tfixed_var_loc_metric(self.fixed_df))
     }
 
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
@@ -2604,7 +2668,7 @@ impl Scorable<CRPScore> for TFixedDfFixedVar {
             .for_each(|s, &y_i, &mu| {
                 let z = y_i - mu; // scale=1
                 let f_z = std_t.pdf(z);
-                let big_f_z = std_t.cdf(z);
+                let big_f_z = std_t.cdf_nan(z);
                 let term1 = z * (2.0 * big_f_z - 1.0);
                 let term2 = 2.0 * f_z * (nu + z * z) * inv_nu_minus_1;
                 *s = term1 + term2 - c_nu; // sigma=1
@@ -2629,7 +2693,7 @@ impl Scorable<CRPScore> for TFixedDfFixedVar {
             .and(&self.loc)
             .for_each(|d, &y_i, &mu| {
                 let z = y_i - mu; // scale=1
-                let big_f_z = std_t.cdf(z);
+                let big_f_z = std_t.cdf_nan(z);
                 *d = -(2.0 * big_f_z - 1.0);
             });
 
@@ -2639,8 +2703,127 @@ impl Scorable<CRPScore> for TFixedDfFixedVar {
     fn metric(&self) -> Array3<f64> {
         // E[(2F(Z)-1)^2] = 1/3 universally for any continuous distribution.
         let n_obs = self.loc.len();
-        let mut fi = Array3::zeros((n_obs, 1, 1));
-        fi.mapv_inplace(|_| 1.0 / 3.0);
-        fi
+        Array3::from_elem((n_obs, 1, 1), tfixed_var_loc_metric(self.fixed_df))
     }
+}
+
+/// Location entry of the CRPS metric for t_ν with σ = 1: 2∫f². Legacy:
+/// E[(2F − 1)²] = 1/3 for every ν (`crps_metric_legacy`).
+fn tfixed_var_loc_metric(nu: f64) -> f64 {
+    if crate::scores::crps_metric_legacy() {
+        1.0 / 3.0
+    } else {
+        2.0 * t_crps_integrals(nu)[0]
+    }
+}
+
+/// σ-free integrals of the standard t_ν behind its CRPS metric
+/// 2∫∇F∇Fᵀ dt (F = T_ν((t − μ)/σ), dt = σ dz):
+///   A = ∫f², B = ∫z²f², C = ∫ z f ∂T, D = ∫(∂T)², ∂T = ∂T_ν(z)/∂ln ν,
+/// so M = [[2A/σ, 0, 0], [0, 2σB, −2σC], [0, −2σC, 2σD]] in (μ, ln σ, ln ν).
+/// ν ≤ 200: linear interpolation in ln ν on a 400-point table (tan-rule
+/// quadrature, 400 nodes; ∂T by central difference), built once. ν > 200:
+/// A, B by quadrature, C, D from T_ν ≈ Φ − φ(z³ + z)/(4ν):
+/// C ≈ 5/(32√π ν), D ≈ 31/(256√π ν²). research/ngboost Cycle 14.
+fn t_crps_integrals(nu: f64) -> [f64; 4] {
+    const LO: f64 = 1.0001;
+    const HI: f64 = 200.0;
+    const M: usize = 400;
+    if !(nu > 1.0) {
+        return [0.5, 0.5, 0.0, 1.0];
+    }
+    if nu > HI {
+        let [a, b] = t_ab_quadrature(nu);
+        let sp = std::f64::consts::PI.sqrt();
+        return [a, b, 5.0 / (32.0 * sp * nu), 31.0 / (256.0 * sp * nu * nu)];
+    }
+    static TABLE: std::sync::OnceLock<Vec<[f64; 4]>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..M)
+            .map(|k| {
+                let v = (LO.ln() + (HI.ln() - LO.ln()) * k as f64 / (M - 1) as f64).exp();
+                t_integrals_direct(v)
+            })
+            .collect()
+    });
+    let x = (nu.ln() - LO.ln()) / (HI.ln() - LO.ln()) * (M - 1) as f64;
+    let k = (x.floor().max(0.0) as usize).min(M - 2);
+    let f = (x - k as f64).clamp(0.0, 1.0);
+    let mut out = [0.0; 4];
+    for (o, (a, b)) in out.iter_mut().zip(table[k].iter().zip(table[k + 1].iter())) {
+        *o = a + f * (b - a);
+    }
+    out
+}
+
+fn t_ab_quadrature(nu: f64) -> [f64; 2] {
+    let Ok(t) = StudentsTDist::new(0.0, 1.0, nu) else {
+        return [0.5, 0.5];
+    };
+    let n = 400;
+    let pi = std::f64::consts::PI;
+    let (mut a, mut b) = (0.0, 0.0);
+    for j in 0..n {
+        let th = -pi / 2.0 + pi * (j as f64 + 0.5) / n as f64;
+        let z = th.tan();
+        let dz = (1.0 + z * z) * pi / n as f64;
+        let f = t.pdf(z);
+        a += f * f * dz;
+        b += z * z * f * f * dz;
+    }
+    [a, b]
+}
+
+fn t_integrals_direct(nu: f64) -> [f64; 4] {
+    let eps = 1e-5;
+    let (Ok(t), Ok(tp), Ok(tm)) = (
+        StudentsTDist::new(0.0, 1.0, nu),
+        StudentsTDist::new(0.0, 1.0, nu * (1.0 + eps)),
+        StudentsTDist::new(0.0, 1.0, nu * (1.0 - eps)),
+    ) else {
+        return [0.5, 0.5, 0.0, 1.0];
+    };
+    let n = 400;
+    let pi = std::f64::consts::PI;
+    let mut r = [0.0; 4];
+    for j in 0..n {
+        let th = -pi / 2.0 + pi * (j as f64 + 0.5) / n as f64;
+        let z = th.tan();
+        let dz = (1.0 + z * z) * pi / n as f64;
+        let f = t.pdf(z);
+        let dt = (tp.cdf_nan(z) - tm.cdf_nan(z)) / (2.0 * eps);
+        r[0] += f * f * dz;
+        r[1] += z * z * f * f * dz;
+        r[2] += z * f * dt * dz;
+        r[3] += dt * dt * dz;
+    }
+    r
+}
+
+/// CRPS metric of the StudentT head (see `t_crps_integrals`). ν ≤ 1: unit
+/// metric (CRPS undefined, as before); ν ≥ DF_MAX: the frozen ln ν column
+/// gets a unit entry and no coupling (its gradient is 0 there).
+fn studentt_crps_metric(scale: &Array1<f64>, df: &Array1<f64>) -> Array3<f64> {
+    let n = scale.len();
+    let mut fi = Array3::zeros((n, 3, 3));
+    for i in 0..n {
+        let (s, nu) = (scale[i], df[i]);
+        if !(nu > 1.0) || !(s > 0.0) || !s.is_finite() {
+            for a in 0..3 {
+                fi[[i, a, a]] = 1.0;
+            }
+            continue;
+        }
+        let [a, b, c, d] = t_crps_integrals(nu);
+        fi[[i, 0, 0]] = 2.0 * a / s;
+        fi[[i, 1, 1]] = 2.0 * b * s;
+        if nu >= DF_MAX {
+            fi[[i, 2, 2]] = 1.0;
+        } else {
+            fi[[i, 1, 2]] = -2.0 * c * s;
+            fi[[i, 2, 1]] = -2.0 * c * s;
+            fi[[i, 2, 2]] = 2.0 * d * s;
+        }
+    }
+    fi
 }

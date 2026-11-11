@@ -1,0 +1,15 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+support_logcost,6,auto+joint,46,1.70,1.15975,1.16910,0.44115,0.81512,0.4970,0.9152,0.0000,inf,1.1810,NaN
+support_logcost,6,auto+staged,534,10.27,0.97705,1.13928,0.42491,0.78687,0.5012,0.9201,0.0000,inf,1.1504,NaN
+support_logcost,7,auto+joint,34,1.62,1.19325,1.18813,0.44386,0.79323,0.5006,0.9335,0.8818,0.8882,1.2388,NaN
+support_logcost,7,auto+staged,574,9.34,0.95162,1.11940,0.41389,NaN,0.4970,0.9146,NaN,NaN,1.1571,NaN
+support_logcost,8,auto+joint,103,2.01,1.12415,1.18125,0.44627,0.80107,0.4963,0.9146,0.0000,inf,1.2018,NaN
+support_logcost,8,auto+staged,198,5.00,1.06271,1.15850,0.43607,0.78307,0.5012,0.9091,0.9525,0.8170,1.1872,NaN
+support_logcost,9,auto+joint,23,1.27,1.25508,1.27594,0.48191,0.85029,0.4726,0.9354,0.8588,0.9870,1.3026,NaN
+support_logcost,9,auto+staged,479,6.67,0.98971,1.13191,0.42188,0.75496,0.5116,0.9305,0.0000,inf,1.1999,NaN
+
+# SUMMARY (mean ± sd over 4 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# support_logcost auto+joint      52   1.2036±0.0489    0.4533±0.0192    0.8149±0.0253    0.492   0.925   0.435   1.231     NaN
+# support_logcost auto+staged     446   1.1373±0.0164    0.4242±0.0092       NaN±NaN       0.503   0.919     NaN   1.174     NaN
+#   Δ(auto+staged − auto+joint): NLL -0.0663 (se 0.0278, wins 4/4) | CRPS -0.0291 (se 0.0111) | RMSE NaN (se NaN)

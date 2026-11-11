@@ -403,6 +403,19 @@ fn pinv(matrix: &Array2<f64>) -> Option<Array2<f64>> {
     Some(result)
 }
 
+/// `NGBOOST_CRPS_METRIC_LEGACY=1` restores the upstream CRPS "metrics"
+/// (research A/B only). Upstream used either σ × the true metric (Normal,
+/// LogNormal, NormalFixedMean) or the outer product E_Y[g gᵀ] of the CRPS
+/// gradient (HalfNormal, Gamma, Weibull, StudentT family, Poisson), which
+/// carries the wrong units: natural-gradient steps then scale like 1/σ (or
+/// 1/√λ). The default since 1.2.0 is the CRPS metric 2∫∇F∇Fᵀ dt (a sum for
+/// discrete heads), research/ngboost Cycles 13–14.
+pub(crate) fn crps_metric_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY
+        .get_or_init(|| std::env::var("NGBOOST_CRPS_METRIC_LEGACY").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// A trait that connects a Distribution to a Score.
 pub trait Scorable<S: Score> {
     /// Calculates the score for each observation.

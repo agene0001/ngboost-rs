@@ -11,6 +11,10 @@ pub struct Poisson {
 }
 
 impl Distribution for Poisson {
+    fn default_fisher_weight_power() -> Option<f64> {
+        Some(1.0)
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         let rate = crate::vmath::exp_column(&params.column(0));
         Poisson { rate }
@@ -407,7 +411,7 @@ impl Scorable<CRPScore> for Poisson {
         let mut diag = Array2::zeros((n_obs, 1));
         let mut scratch = CrpsScratch::default();
         for i in 0..n_obs {
-            diag[[i, 0]] = poisson_crps_metric_value_with(self.rate[i], &mut scratch);
+            diag[[i, 0]] = poisson_crps_metric(self.rate[i], &mut scratch);
         }
         diag
     }
@@ -488,7 +492,7 @@ impl Scorable<CRPScore> for Poisson {
         let mut fi = Array3::zeros((n_obs, 1, 1));
         let mut scratch = CrpsScratch::default();
         for i in 0..n_obs {
-            fi[[i, 0, 0]] = poisson_crps_metric_value_with(self.rate[i], &mut scratch);
+            fi[[i, 0, 0]] = poisson_crps_metric(self.rate[i], &mut scratch);
         }
         fi
     }
@@ -844,4 +848,30 @@ mod tests {
     fn lambda_f64_ln(v: f64) -> f64 {
         v.ln()
     }
+}
+
+/// CRPS metric of Poisson(λ) in ln λ: 2 Σ_k (∂F(k)/∂ln λ)² with
+/// ∂F(k)/∂ln λ = −λ·pmf(k) (F(k) = Q(k+1, λ)), i.e. 2λ² Σ_k pmf(k)², summed
+/// in the log domain over λ ± 14√λ + 30 (≈ λ^{3/2}/√π for large λ). The
+/// legacy value (`crps_metric_legacy`) was E_Y[g²], off by a λ-dependent
+/// factor (0.5× at λ = 0.5, 3.2× at λ = 30; research/ngboost Cycle 14).
+fn poisson_crps_metric(lambda: f64, scratch: &mut CrpsScratch) -> f64 {
+    if crate::scores::crps_metric_legacy() {
+        return poisson_crps_metric_value_with(lambda, scratch);
+    }
+    use statrs::function::gamma::ln_gamma;
+    if !(lambda > 0.0) || !lambda.is_finite() {
+        return 1.0;
+    }
+    let sd = lambda.sqrt();
+    let lo = (lambda - 14.0 * sd - 30.0).floor().max(0.0) as u64;
+    let hi = (lambda + 14.0 * sd + 30.0).ceil() as u64;
+    let ln_l = lambda.ln();
+    let mut acc = 0.0;
+    for k in lo..=hi {
+        let kf = k as f64;
+        let lp = kf * ln_l - lambda - ln_gamma(kf + 1.0);
+        acc += (2.0 * lp).exp();
+    }
+    (2.0 * lambda * lambda * acc).max(1e-300)
 }

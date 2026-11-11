@@ -1,0 +1,16 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+bimodal,100,base,193,0.34,1.95816,2.10636,NaN,4.43110,0.5433,0.9050,0.9704,4.4685,NaN,NaN
+bimodal,101,base,233,0.63,1.92611,2.04173,NaN,4.20395,0.5283,0.9167,0.9301,4.4331,NaN,NaN
+bimodal,102,base,269,0.44,1.91401,2.09597,NaN,4.35480,0.5183,0.8950,0.9654,4.3914,NaN,NaN
+bimodal,103,base,211,0.52,1.98722,2.09658,NaN,4.55440,0.4933,0.9067,0.9794,4.5674,NaN,NaN
+bimodal,104,base,275,0.49,1.89819,2.08932,NaN,4.08644,0.4933,0.9183,0.9141,4.3620,NaN,NaN
+protein,100,base,1284,5.77,2.24567,2.44517,NaN,4.84139,0.4363,0.8996,1.0383,4.4821,NaN,NaN
+protein,101,base,595,2.87,2.33458,2.51502,NaN,4.95639,0.4717,0.9117,1.0052,4.8241,NaN,NaN
+protein,102,base,555,2.62,2.37731,2.45289,NaN,4.89970,0.4783,0.9304,0.9875,4.8554,NaN,NaN
+protein,103,base,1502,5.88,2.21973,2.39136,NaN,4.73047,0.4462,0.9012,1.0187,4.4421,NaN,NaN
+protein,104,base,915,3.29,2.29304,2.44115,NaN,4.73853,0.4550,0.9113,0.9961,4.6218,NaN,NaN
+
+# SUMMARY (mean ± sd over 5 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# bimodal  base           236   2.0860±0.0255       NaN±NaN       4.3261±0.1846    0.515   0.908   0.952     NaN     NaN
+# protein  base           970   2.4491±0.0441       NaN±NaN       4.8333±0.0990    0.458   0.911   1.009     NaN     NaN

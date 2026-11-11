@@ -1,0 +1,24 @@
+R54e_st_kin8nm 0 --dist studentt --variants auto+joint,auto+staged --datasets kin8nm --seed0 6 --seeds 4
+R54e_st_het_a 0 --dist studentt --variants auto+joint,auto+staged --datasets het_a --seed0 6 --seeds 4
+R54e_st_het_b 0 --dist studentt --variants auto+joint,auto+staged --datasets het_b --seed0 6 --seeds 4
+R54e_st_homo 0 --dist studentt --variants auto+joint,auto+staged --datasets homo --seed0 6 --seeds 4
+R54e_st_tnoise 0 --dist studentt --variants auto+joint,auto+staged --datasets tnoise --seed0 6 --seeds 4
+R54e_st_lognorm_het 0 --dist studentt --variants auto+joint,auto+staged --datasets lognorm_het --seed0 6 --seeds 4
+R54e_st_support_logcost 0 --dist studentt --variants auto+joint,auto+staged --datasets support_logcost --seed0 6 --seeds 4
+R54e_st_protein 0 --dist studentt --variants auto+joint,auto+staged --datasets protein --seed0 5 --seeds 5
+R55b_stcrps_fixed 0 --dist studenttcrps --variants auto --datasets tnoise,het_a,kin8nm --seeds 10
+R55b_stcrps_legacy 1 --dist studenttcrps --variants auto --datasets tnoise,het_a,kin8nm --seeds 10
+R58_gammacrps_fixed_lognorm_het 0 --dist gammacrps --variants auto --datasets lognorm_het --seeds 10
+R58_gammacrps_legacy_lognorm_het 1 --dist gammacrps --variants auto --datasets lognorm_het --seeds 10
+R58_gammacrps_fixed_support_cost 0 --dist gammacrps --variants auto --datasets support_cost --seeds 10
+R58_gammacrps_legacy_support_cost 1 --dist gammacrps --variants auto --datasets support_cost --seeds 10
+R58_gammacrps_fixed_kin8nm 0 --dist gammacrps --variants auto --datasets kin8nm --seeds 6
+R58_gammacrps_legacy_kin8nm 1 --dist gammacrps --variants auto --datasets kin8nm --seeds 6
+R58_weibullcrps_fixed_lognorm_het 0 --dist weibullcrps --variants auto --datasets lognorm_het --seeds 10
+R58_weibullcrps_legacy_lognorm_het 1 --dist weibullcrps --variants auto --datasets lognorm_het --seeds 10
+R58_weibullcrps_fixed_support_cost 0 --dist weibullcrps --variants auto --datasets support_cost --seeds 10
+R58_weibullcrps_legacy_support_cost 1 --dist weibullcrps --variants auto --datasets support_cost --seeds 10
+R58_weibullcrps_fixed_kin8nm 0 --dist weibullcrps --variants auto --datasets kin8nm --seeds 6
+R58_weibullcrps_legacy_kin8nm 1 --dist weibullcrps --variants auto --datasets kin8nm --seeds 6
+R58_gamma_logscore 0 --dist gamma --variants auto --datasets lognorm_het,support_cost,kin8nm --seeds 10
+R58_weibull_logscore 0 --dist weibull --variants auto --datasets lognorm_het,support_cost,kin8nm --seeds 10

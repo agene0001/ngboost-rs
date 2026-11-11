@@ -242,7 +242,7 @@ impl Scorable<CRPScore> for HalfNormal {
         Zip::from(diag.column_mut(0))
             .and(&self.scale)
             .for_each(|d, &sigma| {
-                *d = C_HN * sigma * sigma;
+                *d = halfnormal_crps_metric(sigma, C_HN);
             });
         diag
     }
@@ -306,7 +306,7 @@ impl Scorable<CRPScore> for HalfNormal {
         Zip::from(fi.outer_iter_mut())
             .and(&self.scale)
             .for_each(|mut fi_i, &sigma| {
-                fi_i[[0, 0]] = C_HN * sigma * sigma;
+                fi_i[[0, 0]] = halfnormal_crps_metric(sigma, C_HN);
             });
 
         fi
@@ -633,5 +633,16 @@ mod tests {
             let score = Scorable::<CRPScore>::score(&dist, &y);
             assert_relative_eq!(score[0], expected, epsilon = 1e-6);
         }
+    }
+}
+
+/// CRPS metric 2∫(∂F/∂ln σ)² dt of the half-normal: F = 2Φ(t/σ) − 1,
+/// ∂F/∂ln σ = −2uφ(u) ⇒ 8σ∫₀^∞ u²φ(u)² du = σ/√π. (The legacy value
+/// `c_hn`·σ² was E_Y[g²], σ times too large; `crps_metric_legacy`.)
+fn halfnormal_crps_metric(sigma: f64, c_hn: f64) -> f64 {
+    if crate::scores::crps_metric_legacy() {
+        c_hn * sigma * sigma
+    } else {
+        sigma * 0.5641895835477563
     }
 }

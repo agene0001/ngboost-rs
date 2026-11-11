@@ -1,0 +1,39 @@
+== R54c+e StudentT: staged − joint
+dataset     n    NLL A    NLL B         ΔNLL (B−A)   wins         ΔCRPS (B−A)    ΔRMSE    cov90 A→B
+het_a      10   1.8420   1.4012   -0.4408 (se 0.0272) 10/10       +nan (se nan)     +nan 0.926→0.924
+het_b      10   1.0741   0.7052   -0.3689 (se 0.0962) 10/10       +nan (se nan)     +nan 0.937→0.910
+homo       10   1.9146   1.6323   -0.2823 (se 0.0450)  9/10  -832426090905456844482489388279241441716642737857338542129152.0000 (se 832426090905456844482489388279241441716642737857338542129152.0000)     +nan 0.922→0.862
+kin8nm     10  -0.1927  -0.5222   -0.3295 (se 0.0168) 10/10  -347137034793822957503695028224.0000 (se 347137034793822957503695028224.0000)     +nan 0.918→0.906
+lognorm_het 10   2.4437   2.2899   -0.1538 (se 0.0232) 10/10       +nan (se nan)     +nan 0.915→0.908
+protein    10   3.0451   2.7104   -0.3347 (se 0.0134) 10/10    -0.7480 (se 0.0262)     +nan 0.927→0.894
+support_logcost 10   1.2061   1.1471   -0.0590 (se 0.0121) 10/10    +0.3760 (se 0.4045)     +nan 0.918→0.909
+tnoise     10   1.7930   1.3337   -0.4593 (se 0.0484) 10/10    -0.3383 (se 0.0348)     +nan 0.934→0.911
+== R55b StudentT CRPS: fixed − legacy
+dataset     n    NLL A    NLL B         ΔNLL (B−A)   wins         ΔCRPS (B−A)    ΔRMSE    cov90 A→B
+het_a      10   2.2851   1.9499   -0.3353 (se 0.0357) 10/10  -1666667.0216 (se 5241100.6322)     +nan 0.929→0.932
+kin8nm     10   0.0295  -0.1270   -0.1564 (se 0.0143) 10/10  +610128.1053 (se 610128.1258)     +nan 0.930→0.933
+tnoise     10 764094183825079984027054638249043130580992.0000   1.8907 -764094183825079984027054638249043130580992.0000 (se 764094183825079984027054638249043130580992.0000) 10/10  +1666666.2656 (se 1666666.6538)     +nan 0.925→0.929
+== R58 gammacrps lognorm_het: fixed − legacy
+lognorm_het 10   2.6530   2.3660   -0.2869 (se 0.0221) 10/10    -0.4916 (se 0.0364)   -0.681 0.935→0.923
+== R58 gammacrps support_cost: fixed − legacy
+support_cost 10  11.2804  10.8906   -0.3898 (se 0.0083) 10/10  -4241.3550 (se 89.9908) -6564.318 0.939→0.922
+== R58 gammacrps kin8nm: fixed − legacy
+kin8nm     10   0.0199  -0.1251   -0.1450 (se 0.0138) 10/10    -0.0208 (se 0.0018)   -0.035 0.926→0.923
+== R58 weibullcrps lognorm_het: fixed − legacy
+lognorm_het 10      inf   3.0112      -inf (se nan)  7/10    -0.4893 (se 0.2104) -2362.403 0.870→0.852
+== R58 weibullcrps support_cost: fixed − legacy
+support_cost 10  11.3075  11.6540   +0.3465 (se 0.6502)  9/10  -5216.0741 (se 96.5451) -7998.047 0.938→0.891
+== R58 weibullcrps kin8nm: fixed − legacy
+kin8nm     10      inf  -0.0674      -inf (se nan)  5/10    -0.0130 (se 0.0008)   -0.026 0.876→0.826
+== R58 gammacrps fixed − gamma LogScore, lognorm_het
+lognorm_het 10   2.2979   2.3660   +0.0681 (se 0.0179)  1/10    +0.0414 (se 0.0399)   -1.449 0.857→0.923
+== R58 gammacrps fixed − gamma LogScore, support_cost
+support_cost 10  10.8859  10.8906   +0.0047 (se 0.0050)  4/10   -66.5937 (se 38.0164)  +36.204 0.912→0.922
+== R58 gammacrps fixed − gamma LogScore, kin8nm
+kin8nm     10  -0.1317  -0.1251   +0.0066 (se 0.0155)  5/10    -0.0063 (se 0.0059)   -0.473 0.932→0.923
+== R58 weibullcrps fixed − weibull LogScore, lognorm_het
+lognorm_het 10   2.3329   3.0112   +0.6783 (se 0.3321)  2/10    -0.2949 (se 0.1406) -1091.011 0.905→0.852
+== R58 weibullcrps fixed − weibull LogScore, support_cost
+support_cost 10  10.9237  11.6540   +0.7303 (se 0.6450)  1/10  -186.6491 (se 43.8234) -248.414 0.929→0.891
+== R58 weibullcrps fixed − weibull LogScore, kin8nm
+kin8nm     10  -0.4123  -0.0674   +0.3449 (se 0.1920)  2/10    -0.0049 (se 0.0007)   -0.009 0.839→0.826

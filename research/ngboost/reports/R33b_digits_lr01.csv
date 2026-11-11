@@ -1,0 +1,17 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+digits,100,fwp0+noicpt,145,0.48,0.29168,0.41144,0.19023,NaN,0.8698,NaN,0.0590,NaN,0.0237,NaN
+digits,100,base,396,1.10,0.00087,0.07855,0.03338,NaN,0.9778,NaN,0.0141,NaN,0.0127,NaN
+digits,101,fwp0+noicpt,82,0.26,0.35950,0.47964,0.20413,NaN,0.8587,NaN,0.0908,NaN,0.0142,NaN
+digits,101,base,328,0.91,0.00156,0.15545,0.07394,NaN,0.9501,NaN,0.0195,NaN,0.0032,NaN
+digits,102,fwp0+noicpt,185,0.61,0.26005,0.46597,0.21732,NaN,0.8643,NaN,0.0461,NaN,0.0221,NaN
+digits,102,base,326,1.01,0.00193,0.13823,0.05604,NaN,0.9640,NaN,0.0109,NaN,0.0084,NaN
+digits,103,fwp0+noicpt,308,0.71,0.24647,0.43196,0.19514,NaN,0.8726,NaN,0.0386,NaN,0.0178,NaN
+digits,103,base,538,1.31,0.00011,0.06786,0.03522,NaN,0.9806,NaN,0.0146,NaN,0.0111,NaN
+digits,104,fwp0+noicpt,303,0.79,0.23268,0.32194,0.15960,NaN,0.8892,NaN,0.0337,NaN,0.0114,NaN
+digits,104,base,787,1.47,0.00000,0.08708,0.04170,NaN,0.9778,NaN,0.0198,NaN,0.0075,NaN
+
+# SUMMARY (mean ± sd over 5 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# digits   fwp0+noicpt     205   0.4222±0.0622    0.1933±0.0215       NaN±NaN       0.871     NaN   0.054   0.018     NaN
+# digits   base           475   0.1054±0.0389    0.0481±0.0170       NaN±NaN       0.970     NaN   0.016   0.009     NaN
+#   Δ(base − fwp0+noicpt): NLL -0.3168 (se 0.0217, wins 5/5) | CRPS -0.1452 (se 0.0089) | RMSE NaN (se NaN)

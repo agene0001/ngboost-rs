@@ -224,7 +224,10 @@ let probabilities = pred_dist.class_probs();  // Shape: (n_samples, n_classes)
 | `LogNormal` | loc, scale | Positive, right-skewed data |
 | `Exponential` | scale | Waiting times, survival |
 | `Gamma` | shape, rate | Positive continuous data |
-| `Poisson` | rate | Count data |
+| `Poisson` | rate | Count data (Fisher-weighted / Newton leaves by default since 1.2.0, see `docs/fisher_weight_power.md`) |
+| `NegativeBinomial` | mean, dispersion | Over-dispersed count data (Var = μ + μ²/r; LogScore, CRPScore) |
+| `NormalMixture2`, `NormalMixture3`, `NormalMixture<K>` | weights, K × (loc, scale) | Conditionally multimodal targets (`NGBMixtureRegressor` = K = 2; `NGBAutoMixtureRegressor` picks K ∈ 1..4 (cold and warm-grown candidates) by validation NLL; see `docs/normal_mixture.md`) |
+| `Hurdle<D>`, `HurdleNormal`, `HurdleLogNormal` | logit P(Y=0), D's parameters | Exact zeros plus a continuous part: intermittent demand, rainfall, claims, costs (see `docs/hurdle.md`) |
 | `Laplace` | loc, scale | Heavy-tailed data |
 | `Weibull` | shape, scale | Survival analysis |
 | `HalfNormal` | scale | Positive data near zero |
@@ -252,7 +255,11 @@ let probabilities = pred_dist.class_probs();  // Shape: (n_samples, n_classes)
 NGBoost supports different scoring rules for training:
 
 - **LogScore**: Negative log-likelihood (default, most common)
-- **CRPScore**: Continuous Ranked Probability Score (proper scoring rule)
+- **CRPScore**: Continuous Ranked Probability Score (proper scoring rule).
+  Since 1.2.0 every head's CRPS metric is the true 2∫∇F∇Fᵀ dt. Upstream's
+  metrics for Normal, LogNormal, NormalFixedMean, HalfNormal, Gamma, Weibull,
+  the t family and Poisson had the wrong units, so steps scaled with 1/σ
+  (`docs/crps_metrics.md`).
 ```rust
 use ngboost_rs::scores::{LogScore, CRPScore};
 
@@ -262,6 +269,120 @@ let model: NGBoost<Normal, LogScore, StumpLearner> = NGBoost::new(100, 0.1, Stum
 // Using CRPScore
 let model: NGBoost<Normal, CRPScore, StumpLearner> = NGBoost::new(100, 0.1, StumpLearner);
 ```
+
+## Scale recalibration (default on since 1.2.0)
+
+Early-stopped NGBoost is systematically overconfident out of sample (90 %
+intervals cover ≈ 85 %). Since 1.2.0, whenever a validation set is present
+(`fit_with_validation`, or early stopping with `validation_fraction`), the
+model fits `log σ ← a + b·log σ` on it at the end of `fit` and folds the map
+into the stored model — lower held-out NLL on every benchmark dataset, μ
+untouched, saved-model format unchanged. `model.scale_calibration` shows
+`(column, a, b)`; set `auto_calibrate_scale = false` for the pre-1.2 /
+upstream behaviour. Details and evidence: [`docs/scale_calibration.md`](docs/scale_calibration.md).
+
+`NegativeBinomial` gets the same map on its dispersion, `log r ← a + b·log r`,
+but only with **≥ 300 validation rows**. In-sample r is too large (intervals
+too narrow) for the same reason σ is too small. The map gave −0.002…−0.026 NLL
+on 5 count DGPs and 3 count time series (7–10/10 seed wins each), and was
+never worse. With 100 rows it was a coin flip where r is weakly identified
+(R59–R63).
+
+**Time series** (`examples/ts_bench.rs`, lag features, chronological test
+block; research Cycle 16):
+
+- **Validate on the most recent block**, not a random subset, with
+  `fit_with_validation` or `validation_split = ValidationSplit::Chronological`.
+  Across 7 synthetic (head, series) pairs, a random validation split was
+  worse in 5 (+0.01…+0.14 NLL, 1–4/10 seed wins) and about even in 2. It
+  was also worse on co2 (0/5 origins). On the two small real series (elnino,
+  sunspots; 30–70 validation rows) it scored better, but noisily.
+- **Keep the recalibration on.** Fitted on the recent block it absorbs
+  variance drift. Turning it off cost +0.04 / +0.24 NLL on synthetic Normal
+  series (stationary / drifting) and +0.02 / +0.67 on co2 / elnino.
+- **Refit on everything before forecasting.**
+  `model.refit_full(&x_all, &y_all, None, None)` refits on train +
+  validation (in time order) for the kept number of rounds and carries the
+  recalibration over. Poisson: −0.01 / −0.05 NLL on stationary / drifting
+  series (7–8/10), −0.63 on sunspots. NegativeBinomial: −0.002…−0.028.
+  Normal (joint fit): neutral. Staged fits cannot be replayed, so fit with
+  `staged_fit = Some(false)` if you want to refit.
+
+Fisher-weighted base learners (`fisher_weight_power`): **on by default for
+Poisson, NegativeBinomial and Categorical (binary and multi-class)** (the unweighted natural-gradient leaf under-predicts totals when
+rates are heterogeneous, and the Bernoulli one under-predicts the positive
+rate by 6–15 % on imbalanced data; β = 1 is the XGBoost/LogitBoost
+second-order tree),
+opt-in and dataset-dependent for Normal — numbers and an evaluation protocol
+in [`docs/fisher_weight_power.md`](docs/fisher_weight_power.md). If your
+counts are over-dispersed (√mean((y−λ̂)²/λ̂) ≫ 1 on a holdout), use the
+`NegativeBinomial` head instead of Poisson. Measured negative results and
+open problems: [`docs/known_limitations.md`](docs/known_limitations.md).
+
+## Count targets: Poisson or NegativeBinomial?
+
+`CountModel::fit_auto` fits a Poisson model and tests its validation
+predictions for over-dispersion (Dean–Lawless score statistic, z > 1.645).
+If the test fires, it switches to a NegativeBinomial head with the same
+settings:
+
+```rust
+use ngboost_rs::CountModel;
+let mut template = NGBoost::<Poisson, LogScore, _>::new(500, 0.05, default_base_learner());
+template.early_stopping_rounds = Some(50);
+let (model, z) = CountModel::fit_auto(&template, &x_train, &y_train, &x_val, &y_val)?;
+let (lo, hi) = model.interval(&x_test, 0.1);   // 90 % interval
+```
+
+Measured (`research/ngboost`, R64):
+- **Over-dispersed counts** (2 NB time series, 2 iid NB sets, sunspots): it
+  picked NB every time, for −0.07…−1.9 NLL. 90 % coverage went from
+  0.53–0.81 to 0.87–0.91.
+- **Poisson series with a drifting level:** NB on 10/10, −0.09 NLL,
+  coverage 0.82 → 0.88.
+- **True Poisson data:** where λ is easy it stayed Poisson (0/10 and 2/10
+  switches, cost ≤ +0.002). Where λ̂ is hard to estimate it switched on
+  6–9/10 seeds, and NB won there (−0.006, −0.014).
+
+## Staged fit (default since 1.2.0 for Normal, LogNormal, StudentT)
+
+The joint fit under-trains the location. Its early stopping fires when the
+scale, fitted to shrinking in-sample residuals, turns overconfident — long
+before the location has converged.
+
+With early stopping and validation data, `fit_with_validation` (and `fit`
+with `validation_fraction`) now fits in stages:
+
+1. the location first;
+2. then the other parameters;
+3. then the location again, weighted by its Fisher entry (feasible GLS);
+4. then the rest again.
+
+The result is an ordinary model (same format and prediction).
+
+Measured against the joint fit:
+
+- **Normal:** −0.02…−0.15 NLL on 7 of 10 datasets, neutral on 3 (10 seeds).
+- **LogNormal:** −0.01…−0.12 (9–10/10).
+- **StudentT:** −0.06…−0.46 on all 8 datasets (79/80 seed wins, 10 seeds).
+  The joint fit put ν ≤ 1 (undefined mean and CRPS) or close to it on some
+  rows in 15 of 80 runs, the staged fit in 1. The staged fit's 90 %
+  intervals are a little narrower (coverage 0.86–0.92).
+
+Cost ≈ 1.3–3.7× the tree fits. Opt out with `staged_fit = Some(false)`.
+The default stages only when the scale recalibration will also run
+(`auto_calibrate_scale` on and ≥ 40 validation rows). The staged scale is
+fitted to the residuals of a longer-trained location and is too narrow
+until recalibrated: without it the staged fit lost +0.04…+0.21 NLL on 4 of
+5 datasets at n = 3000, and up to +14 at n = 700.
+Laplace and NegativeBinomial (mean, then dispersion) can opt in, but both
+are mixed. NegativeBinomial's CRPS improves (−0.10 on over-dispersed data),
+but NLL only matches the dispersion recalibration alone, it costs 2–3×, and
+it lost badly on a 300-row real series. On time series, the staged Normal
+fit was NLL-neutral against joint (CRPS mostly better) and lost on the
+small elnino series (5/5 origins). The Normal LogScore path also
+caps outlier log-σ steps (|z| > 7.1 only). Evidence:
+[`docs/normal_head.md`](docs/normal_head.md).
 
 ## Uncertainty Quantification
 
@@ -368,14 +489,42 @@ Debug builds are intentionally slower but compile faster during development.
 
 ## Comparison with Python NGBoost
 
-This Rust implementation aims to be compatible with the [Python NGBoost library](https://github.com/stanfordmlgroup/ngboost):
+This Rust implementation started as a port of the [Python NGBoost library](https://github.com/stanfordmlgroup/ngboost). Since 1.2.0 it also carries measured improvements as defaults (see `docs/`), each with an opt-out.
+
+### Reproducing upstream (1.1.2) behaviour
+
+Upgrading from 1.1.2: see [`CHANGELOG.md`](CHANGELOG.md) for every changed
+default, its opt-out, and the one source-level change (`NGBoostParams`
+struct literals).
+
+Set all of these to get fits that are bit-identical to 1.1.2, the last
+release whose defaults matched upstream NGBoost:
+
+```rust
+model.auto_calibrate_scale = false;     // validation-set scale recalibration
+model.fisher_weight_power = Some(0.0);  // Fisher-weighted trees (Poisson, NegativeBinomial, Categorical)
+model.refit_intercept = Some(false);    // per-round intercept refit (Categorical K > 2)
+model.staged_fit = Some(false);         // staged fit (Normal, LogNormal, StudentT)
+```
+
+and, process-wide (read once at first use):
+
+```bash
+NGBOOST_NORMAL_GUARD=0          # Normal log-σ step guard
+NGBOOST_CRPS_METRIC_LEGACY=1    # upstream CRPS metrics (wrong units; see docs/crps_metrics.md)
+```
+
+`tests/test_upstream_parity.rs` checks this on 26 head/score combinations
+against hashes recorded from a 1.1.2 build (with the defaults, 20 of the 26
+differ). The two env switches exist for A/B comparison; the old CRPS metrics
+are a bug, not an alternative.
 
 | Feature | Python | Rust |
 |---------|--------|------|
 | Core Algorithm | ✅ | ✅ |
 | Natural Gradient | ✅ | ✅ |
 | LogScore | ✅ | ✅ |
-| CRPScore | ✅ | ✅ (Normal, Laplace) |
+| CRPScore | ✅ | ✅ (every univariate head except Cauchy; see `docs/crps_metrics.md`) |
 | Regression Distributions | 16 | 16 |
 | Classification | ✅ | ✅ |
 | Survival/Censoring | ✅ | Not yet |

@@ -55,6 +55,22 @@ pub enum LineSearchMethod {
     },
 }
 
+/// How `validation_fraction` carves the automatic early-stopping split out
+/// of the training rows when no explicit validation set is passed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ValidationSplit {
+    /// Uniformly random rows (sklearn `train_test_split` semantics; what
+    /// Python ngboost does).
+    #[default]
+    Random,
+    /// The LAST `validation_fraction` of the rows, in their given order — for
+    /// time series whose rows are chronological. Early stopping and the
+    /// default scale recalibration then see only the future of the training
+    /// block instead of rows interleaved with it (which, on autocorrelated
+    /// data, are nearly in-sample and make both too optimistic).
+    Chronological,
+}
+
 /// Golden ratio constant for golden section search.
 const GOLDEN_RATIO: f64 = 1.618033988749895;
 
@@ -65,6 +81,17 @@ pub(crate) const PAR_ROW_CHUNK: usize = 256;
 /// Rows at which the per-round parameter update goes parallel. Below this the
 /// walk is cheaper than waking the pool every round.
 const PAR_UPDATE_MIN_ROWS: usize = 10_000;
+
+/// Automatic scale recalibration (`auto_calibrate_scale`) needs at least this
+/// many validation rows to run at all (or the head's
+/// `Distribution::auto_calibration_min_rows`, if larger) …
+const AUTO_CALIBRATION_MIN_ROWS: usize = 40;
+/// … and this many before it also fits the slope b (below: shift only, b = 1).
+/// From the validation-size sweep (`research/ngboost/reports/R9_*`): with 20
+/// rows even the shift is a coin flip, from 40 it wins on every dataset; the
+/// slope is unstable on heavy-tailed residuals below a few hundred rows
+/// (protein: worse than shift-only at 80–160, better from 400 up).
+const AUTO_CALIBRATION_SLOPE_MIN_ROWS: usize = 300;
 
 /// `NGBOOST_PARALLEL_UPDATE=0` keeps the per-round update on one thread.
 fn parallel_update_enabled() -> bool {
@@ -112,6 +139,22 @@ pub struct NGBoostParams {
     pub tikhonov_reg: f64,
     /// Line search method.
     pub line_search_method: LineSearchMethod,
+    /// Automatic post-hoc scale recalibration on validation data (default true).
+    #[serde(default = "default_true")]
+    pub auto_calibrate_scale: bool,
+    /// How `validation_fraction` splits the rows (default Random).
+    #[serde(default)]
+    pub validation_split: ValidationSplit,
+    /// Fisher-power base-learner weighting exponent (research option; default None).
+    #[serde(default)]
+    pub fisher_weight_power: Option<f64>,
+    /// Staged location-then-scale fit (`None` = the distribution's default).
+    #[serde(default)]
+    pub staged_fit: Option<bool>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for NGBoostParams {
@@ -131,6 +174,10 @@ impl Default for NGBoostParams {
             lr_schedule: LearningRateSchedule::Constant,
             tikhonov_reg: 0.0,
             line_search_method: LineSearchMethod::Binary,
+            auto_calibrate_scale: true,
+            validation_split: ValidationSplit::Random,
+            fisher_weight_power: None,
+            staged_fit: None,
         }
     }
 }
@@ -214,6 +261,73 @@ where
     /// the fit loop. Default false (upstream NGBoost); `NGBOOST_FISHER_WEIGHTS=1`
     /// forces it on for every model in the process (benches).
     pub fisher_weighted_learner: bool,
+    /// Research (2026-11-09): exponent β on the Fisher-diagonal base-learner
+    /// weights, w_ij = (F_jj + tikhonov)^β × sample weight. `None` keeps the
+    /// boolean `fisher_weighted_learner` semantics (β = 1 when set, unweighted
+    /// otherwise). β = 0 is the upstream unweighted fit, β = 1 the Fisher
+    /// scoring step, β ∈ (0, 1) interpolates (for Normal/LogScore the loc tree
+    /// is then weighted by σ^(-2β); cf. the β-NLL interpolation of Seitzer et
+    /// al., ICLR 2022, with their β equal to 1 − ours). Training-time only.
+    /// `None` defers to [`Distribution::default_fisher_weight_power`]
+    /// (Poisson / NegativeBinomial / Categorical incl. Bernoulli: 1.0,
+    /// everything else unweighted); `Some(0.0)` forces the unweighted fit for any
+    /// distribution. An explicit `Some(β)` also applies to non-diagonal
+    /// metrics (Categorical K > 2, Gamma, Weibull, …), weighting each column
+    /// by its diagonal Fisher entry — XGBoost's multiclass approximation.
+    pub fisher_weight_power: Option<f64>,
+    /// Research (2026-11-09): cap the dynamic range of the Fisher weights
+    /// before the exponent — each column's weights are clamped to
+    /// [median/κ, median·κ] over the round's rows (κ = this value). Limits how
+    /// much low-variance rows can outvote high-variance ones (the mechanism
+    /// behind β = 1's regression on bounded/skewed targets). `None` = no cap.
+    pub fisher_weight_cap: Option<f64>,
+    /// Research option (default false): a separate binary line search per
+    /// parameter column (each column's step with the others held fixed),
+    /// folded into that column's learner via `scale_output`, then the usual
+    /// joint line search on the combined step as a safeguard. Lets a
+    /// location column take the step it would take alone instead of the one
+    /// its scale column tolerates (research/ngboost Cycle 13).
+    pub per_param_line_search: bool,
+    /// Staged location-then-scale fit (feasible GLS) in `fit_with_validation`
+    /// / `fit` when early stopping data is present: `None` = the
+    /// distribution's default ([`Distribution::default_staged_fit`]; true
+    /// for Normal, LogNormal and StudentT under LogScore since 1.2.0),
+    /// `Some(false)` = the joint upstream fit. See [`NGBoost::fit_staged`].
+    pub staged_fit: Option<bool>,
+    /// Columns whose gradients are zeroed during training (staged fit only).
+    frozen_columns: Vec<usize>,
+    /// Whether the last `fit_with_validation` ran the staged fit (`refit_full`
+    /// cannot replay it).
+    last_fit_staged: bool,
+    /// Research (2026-11-09): after every boosting round take one unshrunk
+    /// Fisher-scoring step on a per-column constant, c_j = −Σ w g_j / Σ w F_jj
+    /// over all training rows, so the intercept score equation (e.g.
+    /// Σ(λ − y) = 0 for Poisson, Σ(p − y) = 0 for Bernoulli) keeps holding
+    /// while the trees are only partly converged. Folded into `init_params`
+    /// (no format change; steps from rounds removed by early-stopping
+    /// truncation are undone). `None` defers to
+    /// [`Distribution::default_refit_intercept`].
+    pub refit_intercept: Option<bool>,
+    /// Fit log σ ← a + b·log σ on the validation data at the end of `fit` /
+    /// `partial_fit` (after early-stopping truncation) whenever validation
+    /// data exists and the distribution has a log-scale column
+    /// ([`Distribution::scale_param_index`]). Default **true** since 1.2.0:
+    /// early-stopped NGBoost is systematically overconfident out of sample
+    /// and this head lowered held-out NLL on every benchmark dataset — see
+    /// [`Self::calibrate_param_affine`] for the method and evidence and
+    /// [`Self::scale_calibration`] for what was applied. Fewer than 300
+    /// validation rows fit only the shift (b = 1); fewer than 40 skip. Set
+    /// false to reproduce upstream NGBoost / pre-1.2 behaviour. Not applied
+    /// without validation data (training residuals would move σ the wrong
+    /// way). Time series: pass a chronological validation block or use
+    /// [`ValidationSplit::Chronological`].
+    pub auto_calibrate_scale: bool,
+    /// How `validation_fraction` carves the automatic validation split.
+    pub validation_split: ValidationSplit,
+    /// (column, a, b) applied by the automatic recalibration in the last
+    /// `fit`/`partial_fit`, or `None` if it did not run. Informational; the
+    /// map itself is folded into `init_params` and the stored learners.
+    pub scale_calibration: Option<(usize, f64, f64)>,
 
     // --- 0-byte (PhantomData) ---
     _dist: PhantomData<D>,
@@ -262,6 +376,16 @@ where
             adaptive_learning_rate: false,
             // 0-byte
             fisher_weighted_learner: false,
+            fisher_weight_power: None,
+            fisher_weight_cap: None,
+            per_param_line_search: false,
+            staged_fit: None,
+            frozen_columns: Vec::new(),
+            last_fit_staged: false,
+            refit_intercept: None,
+            auto_calibrate_scale: true,
+            validation_split: ValidationSplit::Random,
+            scale_calibration: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -305,6 +429,16 @@ where
             adaptive_learning_rate: false,
             // 0-byte
             fisher_weighted_learner: false,
+            fisher_weight_power: None,
+            fisher_weight_cap: None,
+            per_param_line_search: false,
+            staged_fit: None,
+            frozen_columns: Vec::new(),
+            last_fit_staged: false,
+            refit_intercept: None,
+            auto_calibrate_scale: true,
+            validation_split: ValidationSplit::Random,
+            scale_calibration: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -376,6 +510,16 @@ where
             adaptive_learning_rate,
             // 0-byte
             fisher_weighted_learner: false,
+            fisher_weight_power: None,
+            fisher_weight_cap: None,
+            per_param_line_search: false,
+            staged_fit: None,
+            frozen_columns: Vec::new(),
+            last_fit_staged: false,
+            refit_intercept: None,
+            auto_calibrate_scale: true,
+            validation_split: ValidationSplit::Random,
+            scale_calibration: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -437,6 +581,16 @@ where
             adaptive_learning_rate,
             // 0-byte
             fisher_weighted_learner: false,
+            fisher_weight_power: None,
+            fisher_weight_cap: None,
+            per_param_line_search: false,
+            staged_fit: None,
+            frozen_columns: Vec::new(),
+            last_fit_staged: false,
+            refit_intercept: None,
+            auto_calibrate_scale: true,
+            validation_split: ValidationSplit::Random,
+            scale_calibration: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -495,6 +649,16 @@ where
             adaptive_learning_rate: false,
             // 0-byte
             fisher_weighted_learner: false,
+            fisher_weight_power: None,
+            fisher_weight_cap: None,
+            per_param_line_search: false,
+            staged_fit: None,
+            frozen_columns: Vec::new(),
+            last_fit_staged: false,
+            refit_intercept: None,
+            auto_calibrate_scale: true,
+            validation_split: ValidationSplit::Random,
+            scale_calibration: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -558,6 +722,16 @@ where
             adaptive_learning_rate: false,
             // 0-byte
             fisher_weighted_learner: false,
+            fisher_weight_power: None,
+            fisher_weight_cap: None,
+            per_param_line_search: false,
+            staged_fit: None,
+            frozen_columns: Vec::new(),
+            last_fit_staged: false,
+            refit_intercept: None,
+            auto_calibrate_scale: true,
+            validation_split: ValidationSplit::Random,
+            scale_calibration: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -616,7 +790,404 @@ where
         sample_weight: Option<&Array1<f64>>,
         val_sample_weight: Option<&Array1<f64>>,
     ) -> Result<(), &'static str> {
+        let n_val = match (x_val, y_val) {
+            (Some(_), Some(yv)) => Some(yv.len()),
+            _ => None,
+        };
+        self.last_fit_staged = self.uses_staged_fit(y.len(), n_val);
+        if self.last_fit_staged {
+            return self.fit_staged(x, y, x_val, y_val, sample_weight, val_sample_weight);
+        }
         self.fit_internal(x, y, x_val, y_val, sample_weight, val_sample_weight, true)
+    }
+
+    /// A new, unfitted model of head `D2` with this model's hyperparameters
+    /// (rounds, learning rate, base learner, sampling, early stopping,
+    /// validation split, line search, Fisher weighting, staging,
+    /// recalibration, seed). Used by [`Self::refit_full`] and to fit a
+    /// second head with the same settings (e.g. Poisson → NegativeBinomial,
+    /// `crate::count_auto`).
+    pub fn unfitted_like<D2>(&self) -> NGBoost<D2, S, B>
+    where
+        D2: Distribution + Scorable<S> + Clone,
+    {
+        let mut m = NGBoost::<D2, S, B>::with_full_options(
+            self.n_estimators,
+            self.learning_rate,
+            self.base_learner.clone(),
+            self.natural_gradient,
+            self.minibatch_frac,
+            self.col_sample,
+            self.verbose,
+            self.verbose_eval,
+            self.tol,
+            self.early_stopping_rounds,
+            self.validation_fraction,
+            self.lr_schedule,
+            self.tikhonov_reg,
+            self.line_search_method,
+            self.random_state,
+        );
+        m.adaptive_learning_rate = self.adaptive_learning_rate;
+        m.fisher_weighted_learner = self.fisher_weighted_learner;
+        m.fisher_weight_power = self.fisher_weight_power;
+        m.fisher_weight_cap = self.fisher_weight_cap;
+        m.per_param_line_search = self.per_param_line_search;
+        m.staged_fit = self.staged_fit;
+        m.refit_intercept = self.refit_intercept;
+        m.auto_calibrate_scale = self.auto_calibrate_scale;
+        m.validation_split = self.validation_split;
+        m
+    }
+
+    /// Refit on `x, y` — typically train ∪ validation, in time order — for
+    /// `rounds` boosting rounds (`None`: as many as this fitted model kept),
+    /// without early stopping, and fold this model's end-of-fit scale
+    /// recalibration (a, b) into the result. Returns a new model with the
+    /// same hyperparameters; `self` is unchanged.
+    ///
+    /// Use it when the validation rows are too valuable to leave out of the
+    /// final model, e.g. the most recent block of a time series. The refit
+    /// model has no held-out rows of its own, so it reuses the round count
+    /// and the recalibration chosen on the original split. Measured on
+    /// Poisson series (research Cycles 16–17): −0.01 / −0.05 NLL on
+    /// stationary / drifting series (7–8/10); neutral for Normal; mixed for
+    /// NegativeBinomial.
+    ///
+    /// Only joint fits can be replayed: a staged fit (the default for
+    /// Normal, LogNormal and StudentT with validation data) returns an
+    /// error. Fit with `staged_fit = Some(false)` to use this.
+    pub fn refit_full(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        sample_weight: Option<&Array1<f64>>,
+        rounds: Option<u32>,
+    ) -> Result<Self, &'static str> {
+        if self.base_models.is_empty() || self.init_params.is_none() {
+            return Err("refit_full: fit the model first");
+        }
+        if self.last_fit_staged {
+            return Err(
+                "refit_full: staged fits cannot be replayed; fit with staged_fit = Some(false)",
+            );
+        }
+        let k = rounds.unwrap_or(self.base_models.len() as u32).max(1);
+        let mut m = self.unfitted_like::<D>();
+        m.n_estimators = k;
+        m.early_stopping_rounds = None;
+        m.staged_fit = Some(false);
+        m.auto_calibrate_scale = false;
+        m.fit_with_validation(x, y, None, None, sample_weight, None)?;
+        if let Some((_, a, b)) = self.scale_calibration {
+            let cols = D::scale_param_columns();
+            for round in m.base_models.iter_mut() {
+                for &c in &cols {
+                    if !round[c].scale_output(b) {
+                        return Err(
+                            "refit_full: base learner type does not support output scaling",
+                        );
+                    }
+                }
+            }
+            let init = m.init_params.as_mut().unwrap();
+            for &c in &cols {
+                init[c] = a + b * init[c];
+            }
+            m.scale_calibration = self.scale_calibration;
+        }
+        // the returned model carries the source's settings for later fits
+        m.n_estimators = self.n_estimators;
+        m.early_stopping_rounds = self.early_stopping_rounds;
+        m.staged_fit = self.staged_fit;
+        m.auto_calibrate_scale = self.auto_calibrate_scale;
+        Ok(m)
+    }
+
+    /// Whether `fit_with_validation` would run the staged fit on `n_rows`
+    /// training rows with `n_val` explicit validation rows (`None`: the
+    /// `validation_fraction` split of `n_rows`): enabled, a location column
+    /// exists, early stopping is on, and there is validation data.
+    ///
+    /// `staged_fit = Some(true)` forces it. The default (`None`: per
+    /// distribution, LogScore only) also requires that the end-of-fit scale
+    /// recalibration will run (`auto_calibrate_scale`, a scale column, and
+    /// at least `Distribution::auto_calibration_min_rows` (≥ 40) validation
+    /// rows). The staged scale stage is fitted to the residuals of a
+    /// longer-trained location, so it is too narrow until recalibrated:
+    /// uncalibrated it lost +0.04…+0.21 NLL on 4 of 5 datasets at n = 3000
+    /// and up to +14 at n = 700 (research Cycle 17, R65–R66).
+    pub fn uses_staged_fit(&self, n_rows: usize, n_val: Option<usize>) -> bool {
+        let split = self.validation_fraction > 0.0 && self.validation_fraction < 1.0;
+        let val_rows = match n_val {
+            Some(v) => v,
+            None if split => {
+                (((n_rows as f64) * self.validation_fraction).ceil() as usize).min(n_rows)
+            }
+            None => 0,
+        };
+        let enabled = self.staged_fit.unwrap_or_else(|| {
+            D::default_staged_fit()
+                && std::any::TypeId::of::<S>() == std::any::TypeId::of::<LogScore>()
+                && self.auto_calibrate_scale
+                && !D::scale_param_columns().is_empty()
+                && val_rows >= AUTO_CALIBRATION_MIN_ROWS.max(D::auto_calibration_min_rows())
+        });
+        enabled
+            && D::location_column().is_some()
+            && self.early_stopping_rounds.is_some()
+            && (n_val.is_some() || split)
+    }
+
+    /// Staged ("location first, then the rest", feasible-GLS) fit for
+    /// location–scale heads (research/ngboost Cycle 13).
+    ///
+    /// The joint fit under-trains the location: its early stopping fires
+    /// when the scale, fitted to in-sample residuals that shrink as the
+    /// location overfits, turns overconfident — the validation-RMSE optimum
+    /// comes 3–7× later than the NLL optimum. Stages (each with early
+    /// stopping on the same validation rows; frozen columns get zero steps):
+    /// 1. location only (other columns at their marginal constants);
+    /// 2. the other columns' constants refitted given the location, then the
+    ///    other columns boosted with the location frozen;
+    /// 3. a fresh location fit weighted by its Fisher entry from stage 2
+    ///    (1/σ̂² for Normal; normalised to mean 1, times sample weights);
+    /// 4. as stage 2 on the stage-3 location, then the default
+    ///    recalibration. The model is stages 3 + 4: ordinary rounds, same
+    ///    format and prediction as a joint fit.
+    ///
+    /// Without explicit validation data the rows are split once
+    /// (`validation_fraction`, `validation_split`) for all stages. Measured
+    /// for Normal over 10 datasets × 10 seeds: −0.07…−0.16 NLL on synthetic
+    /// data and kin8nm, −0.025 protein, −0.011 a real cost target, never
+    /// significantly worse; ≈ 1.3–3.7× the tree fits (docs/normal_head.md).
+    pub fn fit_staged(
+        &mut self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        x_val: Option<&Array2<f64>>,
+        y_val: Option<&Array1<f64>>,
+        sample_weight: Option<&Array1<f64>>,
+        val_sample_weight: Option<&Array1<f64>>,
+    ) -> Result<(), &'static str> {
+        let loc = D::location_column().ok_or("fit_staged: distribution has no location column")?;
+        if x_val.is_some() != y_val.is_some() {
+            return Err("fit_staged: pass both x_val and y_val or neither");
+        }
+        D::validate_targets(y)?;
+        // one validation split for every stage (only when early stopping
+        // would otherwise split; without early stopping each stage simply
+        // runs n_estimators rounds)
+        let split;
+        let needs_split = x_val.is_none()
+            && self.early_stopping_rounds.is_some()
+            && self.validation_fraction > 0.0
+            && self.validation_fraction < 1.0;
+        let (x, y, x_val, y_val, sample_weight, val_sample_weight) = if needs_split {
+            split = self.split_validation(x, y, sample_weight)?;
+            let (xt, yt, xv, yv, wt, wv) = &split;
+            (xt, yt, Some(xv), Some(yv), wt.as_ref(), wv.as_ref())
+        } else {
+            (x, y, x_val, y_val, sample_weight, val_sample_weight)
+        };
+        let (xv, yv) = (x_val, y_val);
+        let n_params = D::fit(y).len();
+        let others: Vec<usize> = (0..n_params).filter(|&j| j != loc).collect();
+        let calibrate = self.auto_calibrate_scale;
+
+        // stages 1–2
+        self.auto_calibrate_scale = false;
+        let r = self
+            .staged_location(x, y, xv, yv, sample_weight, val_sample_weight, &others)
+            .and_then(|_| {
+                self.staged_rest(x, y, xv, yv, sample_weight, val_sample_weight, loc, &others)
+            });
+        if let Err(e) = r {
+            self.frozen_columns.clear();
+            self.auto_calibrate_scale = calibrate;
+            return Err(e);
+        }
+        // stage 3 weights: the location's Fisher entry (1/σ̂² for Normal)
+        let fisher_loc = |m: &Self, xx: &Array2<f64>| {
+            Scorable::<S>::diagonal_metric(&m.pred_dist(xx))
+                .column(loc)
+                .to_owned()
+        };
+        let w_tr = fisher_loc(self, x);
+        let norm = w_tr.mean().unwrap_or(f64::NAN);
+        if !(norm.is_finite() && norm > 0.0) || w_tr.iter().any(|v| !v.is_finite()) {
+            self.frozen_columns.clear();
+            self.auto_calibrate_scale = calibrate;
+            return Err("fit_staged: degenerate stage-2 Fisher weights");
+        }
+        // With Fisher-weighted learners (β > 0, e.g. the count heads) stage 3
+        // already weights each row by its own location Fisher entry under the
+        // stage-3 model, whose other columns sit at their marginal constants.
+        // Divide that out so the leaf is Σ g/Σ F under the stage-2 fit (the
+        // FGLS estimating equation) rather than F² weighting. For Normal the
+        // stage-3 entry 1/σ̄² is constant, and β defaults to none: unchanged.
+        let beta = self
+            .fisher_weight_power
+            .or(self.fisher_weighted_learner.then_some(1.0))
+            .or(D::default_fisher_weight_power())
+            .unwrap_or(0.0);
+        let init3 = D::fit(y);
+        let stage3_fisher = |m: &Self, xx: &Array2<f64>| -> Option<Array1<f64>> {
+            if beta == 0.0 {
+                return None;
+            }
+            let mut p = m.pred_param(xx);
+            for &j in &others {
+                p.column_mut(j).fill(init3[j]);
+            }
+            let f = Scorable::<S>::diagonal_metric(&D::from_params(&p))
+                .column(loc)
+                .mapv(|v| (v + m.tikhonov_reg).max(1e-12).powf(beta));
+            Some(f)
+        };
+        let w_tr = match stage3_fisher(self, x) {
+            Some(f) => w_tr / &f,
+            None => w_tr,
+        };
+        let norm = if beta == 0.0 {
+            norm
+        } else {
+            w_tr.mean().unwrap_or(f64::NAN)
+        };
+        if !(norm.is_finite() && norm > 0.0) || w_tr.iter().any(|v| !v.is_finite()) {
+            self.frozen_columns.clear();
+            self.auto_calibrate_scale = calibrate;
+            return Err("fit_staged: degenerate stage-2 Fisher weights");
+        }
+        let mut w_tr = w_tr / norm;
+        if let Some(w) = sample_weight {
+            w_tr *= w;
+        }
+        let w_val = xv.map(|xv| {
+            let mut v = fisher_loc(self, xv);
+            if let Some(f) = stage3_fisher(self, xv) {
+                v /= &f;
+            }
+            v /= norm;
+            if let Some(w) = val_sample_weight {
+                v *= w;
+            }
+            v
+        });
+        // stages 3–4
+        let r = self
+            .staged_location(x, y, xv, yv, Some(&w_tr), w_val.as_ref(), &others)
+            .and_then(|_| {
+                self.auto_calibrate_scale = calibrate;
+                self.staged_rest(x, y, xv, yv, sample_weight, val_sample_weight, loc, &others)
+            });
+        self.frozen_columns.clear();
+        self.auto_calibrate_scale = calibrate;
+        r
+    }
+
+    /// Staged fit, location stage: a fresh fit with the other columns frozen
+    /// at their marginal constants.
+    #[allow(clippy::too_many_arguments)]
+    fn staged_location(
+        &mut self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        xv: Option<&Array2<f64>>,
+        yv: Option<&Array1<f64>>,
+        w: Option<&Array1<f64>>,
+        wv: Option<&Array1<f64>>,
+        others: &[usize],
+    ) -> Result<(), &'static str> {
+        self.frozen_columns = others.to_vec();
+        self.fit_internal(x, y, xv, yv, w, wv, true)
+    }
+
+    /// Staged fit, scale stage: refit the other columns' constants given the
+    /// current location (coordinate-wise 1-D minimisation of the training
+    /// score, folded into `init_params`), then boost them with the location
+    /// frozen.
+    #[allow(clippy::too_many_arguments)]
+    fn staged_rest(
+        &mut self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        xv: Option<&Array2<f64>>,
+        yv: Option<&Array1<f64>>,
+        w: Option<&Array1<f64>>,
+        wv: Option<&Array1<f64>>,
+        loc: usize,
+        others: &[usize],
+    ) -> Result<(), &'static str> {
+        let base = self.pred_param(x);
+        let mut shift = vec![0.0; base.ncols()];
+        for _pass in 0..2 {
+            for &j in others {
+                let mut f = |a: f64, _b: f64| {
+                    let mut p = base.clone();
+                    for (k, &c) in shift.iter().enumerate() {
+                        let c = if k == j { a } else { c };
+                        if c != 0.0 {
+                            p.column_mut(k).mapv_inplace(|v| v + c);
+                        }
+                    }
+                    Scorable::<S>::total_score(&D::from_params(&p), y, w)
+                };
+                shift[j] = minimize_2d(&mut f, (shift[j], 1.0), true).0;
+            }
+        }
+        if let Some(init) = self.init_params.as_mut() {
+            for &j in others {
+                if shift[j].is_finite() {
+                    init[j] += shift[j];
+                }
+            }
+        }
+        self.frozen_columns = vec![loc];
+        self.fit_internal(x, y, xv, yv, w, wv, false)
+    }
+
+    /// The `validation_fraction` split of `fit_internal`, done once.
+    #[allow(clippy::type_complexity)]
+    fn split_validation(
+        &mut self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        w: Option<&Array1<f64>>,
+    ) -> Result<
+        (
+            Array2<f64>,
+            Array1<f64>,
+            Array2<f64>,
+            Array1<f64>,
+            Option<Array1<f64>>,
+            Option<Array1<f64>>,
+        ),
+        &'static str,
+    > {
+        let n = x.nrows();
+        let n_val = (((n as f64) * self.validation_fraction).ceil() as usize).min(n);
+        let n_train = n - n_val;
+        if n_train == 0 || n_val == 0 {
+            return Err("validation_fraction leaves no training or validation data");
+        }
+        let mut idx: Vec<usize> = (0..n).collect();
+        if self.validation_split == ValidationSplit::Random {
+            for i in (1..idx.len()).rev() {
+                let j = self.rng.random_range(0..=i);
+                idx.swap(i, j);
+            }
+        }
+        let (tr, va) = (&idx[..n_train], &idx[n_train..]);
+        let ax = ndarray::Axis(0);
+        Ok((
+            x.select(ax, tr),
+            y.select(ax, tr),
+            x.select(ax, va),
+            y.select(ax, va),
+            w.map(|v| v.select(ax, tr)),
+            w.map(|v| v.select(ax, va)),
+        ))
     }
 
     /// Validates hyperparameters before fitting.
@@ -780,6 +1351,7 @@ where
         // Python rebuilds evals_result on EVERY fit/partial_fit call — it
         // holds the most recent run's loss curves, not a cumulative history.
         self.evals_result = EvalsResult::default();
+        self.scale_calibration = None;
         self.n_features = Some(x.ncols());
 
         // A full fit with early stopping but no possible validation data
@@ -820,12 +1392,16 @@ where
                 return Err("validation_fraction leaves no training data");
             }
 
-            // Shuffle indices for random split (matches Python's train_test_split)
             let mut indices: Vec<usize> = (0..n_samples).collect();
-            for i in (1..indices.len()).rev() {
-                let j = self.rng.random_range(0..=i);
-                indices.swap(i, j);
+            if self.validation_split == ValidationSplit::Random {
+                // Shuffle indices for random split (matches Python's train_test_split)
+                for i in (1..indices.len()).rev() {
+                    let j = self.rng.random_range(0..=i);
+                    indices.swap(i, j);
+                }
             }
+            // ValidationSplit::Chronological keeps the given order: train =
+            // the first n_train rows, validation = the tail.
 
             let train_indices: Vec<usize> = indices[0..n_train].to_vec();
             let val_indices: Vec<usize> = indices[n_train..].to_vec();
@@ -880,9 +1456,14 @@ where
             }
         }
 
-        // Match Python: always re-fit init_params from the current training data.
-        // Python's partial_fit calls fit_init_params_to_marginal(Y) every time.
-        self.init_params = Some(D::fit(&y_train));
+        // Fit init_params from the marginal only when starting from scratch.
+        // Python's partial_fit re-fits them on every call, which silently
+        // changes what the existing trees predict on replay and — since 1.2.0
+        // folds the scale recalibration and intercept steps into
+        // init_params — would discard those shifts. Deliberate deviation.
+        if reset_state || self.base_models.is_empty() || self.init_params.is_none() {
+            self.init_params = Some(D::fit(&y_train));
+        }
         let n_params = self.init_params.as_ref().unwrap().len();
 
         // For partial_fit, replay all existing base models to reconstruct current params
@@ -954,6 +1535,10 @@ where
             || std::env::var("NGBOOST_FISHER_WEIGHTS")
                 .map(|v| v.trim() == "1")
                 .unwrap_or(false);
+        let refit_intercept = self
+            .refit_intercept
+            .unwrap_or_else(D::default_refit_intercept);
+        let mut intercept_steps: Vec<Array1<f64>> = Vec::new();
         let profile = std::env::var("NGBOOST_PROFILE")
             .map(|v| v != "0")
             .unwrap_or(false);
@@ -967,8 +1552,14 @@ where
                 prof_rounds += 1;
             }
             // Sample data for this iteration
-            let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) =
-                self.sample(&x_train, &y_train, &params, sample_weight, stable_cache.is_none());
+            let (row_idxs, col_idxs, x_sampled, y_sampled, params_sampled, weight_sampled) = self
+                .sample(
+                    &x_train,
+                    &y_train,
+                    &params,
+                    sample_weight,
+                    stable_cache.is_none(),
+                );
             // NOTE: col_idxs is pushed onto self.col_idxs only AFTER the base
             // learners fit successfully (below) — pushing here desynced
             // col_idxs from base_models when a fit errored, and a later
@@ -1021,7 +1612,7 @@ where
             self.evals_result.train.push(train_loss);
 
             // Compute gradients on minibatch (matches Python: D.grad(Y_batch, ...))
-            let grads = if self.natural_gradient && self.tikhonov_reg > 0.0 {
+            let mut grads = if self.natural_gradient && self.tikhonov_reg > 0.0 {
                 // Fast path: diagonal metric uses fused d_score + diagonal_metric
                 if Scorable::<S>::is_diagonal_metric(&batch_dist) {
                     Scorable::<S>::diagonal_natural_grad(
@@ -1046,6 +1637,10 @@ where
                     "training diverged: non-finite gradients (degenerate distribution parameters, e.g. a scale collapsing to zero on constant targets)",
                 );
             }
+            // staged fit: frozen columns get zero steps (their trees fit 0)
+            for &j in &self.frozen_columns {
+                grads.column_mut(j).fill(0.0);
+            }
 
             if profile {
                 let now = std::time::Instant::now();
@@ -1060,15 +1655,50 @@ where
             // Fisher-weighted base learners (see `fisher_weighted`): per
             // parameter j, the minibatch rows' (F_jj + tikhonov) × sample
             // weight. None = the upstream unweighted (sample-weight-only) fit.
-            let fisher_cols: Option<Vec<Array1<f64>>> = if fisher_weighted
+            // `fisher_weight_power` (research, opt-in) generalizes the weights to
+            // (F_jj + tikhonov)^β; β = 1 reproduces the boolean path bit-for-bit.
+            // Precedence: explicit `fisher_weight_power` > boolean flag /
+            // env var > the distribution's default (Poisson: 1.0; see
+            // `Distribution::default_fisher_weight_power`).
+            let fisher_power: Option<f64> = self
+                .fisher_weight_power
+                .or(fisher_weighted.then_some(1.0))
+                .or(D::default_fisher_weight_power());
+            // A 1×1 metric is trivially diagonal (Bernoulli = Categorical<2>
+            // routes its natural gradient through the dense path, but its
+            // Fisher weight p(1−p) is still a scalar per row).
+            let fisher_cols: Option<Vec<Array1<f64>>> = if let Some(beta) = fisher_power
                 && self.natural_gradient
-                && Scorable::<S>::is_diagonal_metric(&batch_dist)
+                && (Scorable::<S>::is_diagonal_metric(&batch_dist)
+                    || n_params == 1
+                    // explicit opt-in (or a distribution default) on a
+                    // non-diagonal metric: weight each column by its diagonal
+                    // Fisher entry (XGBoost's multiclass diagonal-Hessian
+                    // approximation). The legacy boolean flag stays diagonal-only.
+                    || self
+                        .fisher_weight_power
+                        .or(D::default_fisher_weight_power())
+                        .is_some())
             {
                 let diag = Scorable::<S>::diagonal_metric(&batch_dist);
                 Some(
                     (0..n_params)
                         .map(|j| {
-                            let mut c = diag.column(j).mapv(|v| (v + self.tikhonov_reg).max(1e-12));
+                            let raw = diag.column(j).mapv(|v| (v + self.tikhonov_reg).max(1e-12));
+                            // optional dynamic-range cap around the column median
+                            let (lo, hi) = match self.fisher_weight_cap {
+                                Some(kappa) if kappa.is_finite() && kappa >= 1.0 => {
+                                    let mut v: Vec<f64> = raw.to_vec();
+                                    v.sort_by(|a, b| a.total_cmp(b));
+                                    let med = v[v.len() / 2];
+                                    (med / kappa, med * kappa)
+                                }
+                                _ => (0.0, f64::INFINITY),
+                            };
+                            let mut c = raw.mapv(|f| {
+                                let f = f.clamp(lo, hi);
+                                if beta == 1.0 { f } else { f.powf(beta) }
+                            });
                             if let Some(w) = weight_ref {
                                 c *= w;
                             }
@@ -1184,7 +1814,29 @@ where
             // column subset, keeping col_idxs aligned with base_models.
             self.col_idxs.push(col_idxs);
 
-            let proj_grad = to_2d_array(predictions_cols);
+            let mut proj_grad = to_2d_array(predictions_cols);
+
+            if self.per_param_line_search && n_params > 1 {
+                for j in 0..n_params {
+                    let mut step = Array2::zeros(proj_grad.raw_dim());
+                    step.column_mut(j).assign(&proj_grad.column(j));
+                    let f = self.line_search(
+                        &step,
+                        params_sampled_ref,
+                        y_sampled_ref,
+                        weight_ref,
+                        self.train_loss_monitor.is_none().then_some(train_loss),
+                    );
+                    if f != 1.0 {
+                        if !fitted_learners[j].scale_output(f) {
+                            return Err(
+                                "per_param_line_search needs base learners that support scale_output",
+                            );
+                        }
+                        proj_grad.column_mut(j).mapv_inplace(|v| v * f);
+                    }
+                }
+            }
 
             // Pass precomputed train_loss to avoid redundant from_params + total_score
             // in line search. Only valid when no custom train_loss_monitor changes the score.
@@ -1240,6 +1892,36 @@ where
                 let now = std::time::Instant::now();
                 prof[4] += now - prof_t;
                 prof_t = now;
+            }
+
+            // Per-round intercept step (`refit_intercept`): one Fisher-scoring
+            // step on a constant per column over ALL training rows, applied to
+            // train and validation params and folded into init_params.
+            if refit_intercept {
+                let full = D::from_params(&params);
+                let g = Scorable::<S>::d_score(&full, y_train);
+                let f = Scorable::<S>::diagonal_metric(&full);
+                let mut step = Array1::zeros(n_params);
+                for j in 0..n_params {
+                    let (sg, sf) = match sample_weight {
+                        Some(w) => ((&g.column(j) * w).sum(), (&f.column(j) * w).sum()),
+                        None => (g.column(j).sum(), f.column(j).sum()),
+                    };
+                    let c = -sg / (sf + self.tikhonov_reg * y_train.len() as f64);
+                    if c.is_finite() && sf > 0.0 && !self.frozen_columns.contains(&j) {
+                        step[j] = c;
+                    }
+                }
+                for (j, &c) in step.iter().enumerate() {
+                    if c != 0.0 {
+                        params.column_mut(j).mapv_inplace(|v| v + c);
+                        if let Some(vp) = val_params.as_mut() {
+                            vp.column_mut(j).mapv_inplace(|v| v + c);
+                        }
+                    }
+                }
+                // folded into init_params after the loop (self is borrowed here)
+                intercept_steps.push(step);
             }
 
             // Update validation parameters if validation data is provided
@@ -1367,11 +2049,44 @@ where
             if let Some(best) = best_iter_this_run {
                 let keep = best + 1;
                 if keep < self.base_models.len() {
+                    // Intercept steps of the dropped rounds are not folded in
+                    // (step indices are run-local).
+                    intercept_steps.truncate(keep.saturating_sub(model_offset));
                     self.base_models.truncate(keep);
                     self.scalings.truncate(keep);
                     self.effective_learning_rates.truncate(keep);
                     self.col_idxs.truncate(keep);
                 }
+            }
+        }
+
+        // Fold the kept rounds' intercept steps into init_params: the final
+        // prediction is init + Σ trees + Σ steps, and a constant per column
+        // commutes with the trees.
+        if !intercept_steps.is_empty() {
+            let init = self.init_params.as_mut().unwrap();
+            for st in &intercept_steps {
+                *init += st;
+            }
+        }
+
+        // Default post-hoc scale recalibration (`auto_calibrate_scale`): with
+        // validation data and a log-scale column, fit log σ ← a + b·log σ on
+        // the validation split and fold it into the model. Runs AFTER the
+        // truncation above so the kept model is what gets calibrated. A
+        // failure (unsupported custom learner, degenerate data) never fails
+        // the fit — the model is simply left uncalibrated.
+        if self.auto_calibrate_scale
+            && let (Some(xv), Some(yv)) = (x_val, y_val)
+            && let cols = D::scale_param_columns()
+            && let Some(&col) = cols.first()
+            && yv.len() >= AUTO_CALIBRATION_MIN_ROWS.max(D::auto_calibration_min_rows())
+        {
+            let fit_slope = yv.len() >= AUTO_CALIBRATION_SLOPE_MIN_ROWS;
+            if let Ok((a, b)) =
+                self.calibrate_param_affine_impl(xv, yv, &cols, val_sample_weight, fit_slope)
+            {
+                self.scale_calibration = Some((col, a, b));
             }
         }
 
@@ -1803,7 +2518,12 @@ where
     }
 
     /// [`Self::score`] as a sample-weighted mean (`None` = the plain mean).
-    pub fn score_weighted(&self, x: &Array2<f64>, y: &Array1<f64>, weights: Option<&Array1<f64>>) -> f64 {
+    pub fn score_weighted(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        weights: Option<&Array1<f64>>,
+    ) -> f64 {
         let dist = self.pred_dist(x);
         Scorable::total_score(&dist, y, weights)
     }
@@ -1961,6 +2681,11 @@ where
     /// second parameter, but only Normal hits the stated target exactly. For
     /// non-scale parameterizations (e.g. Gamma's log-rate) it would distort
     /// the predicted mean instead — do not use it there.
+    ///
+    /// **Since 1.2.0** the score-optimal affine version of this
+    /// ([`Self::calibrate_param_affine`]) runs automatically at the end of
+    /// `fit` whenever validation data is present (`auto_calibrate_scale`);
+    /// this moment-matching method is kept for compatibility.
     pub fn calibrate_uncertainty(
         &mut self,
         x_val: &Array2<f64>,
@@ -2005,6 +2730,163 @@ where
         }
 
         Ok(())
+    }
+
+    /// Post-hoc **affine** recalibration of one internal parameter column on
+    /// held-out data (research, 2026-11-09; opt-in — never called by `fit`).
+    ///
+    /// Finds (a, b) minimizing the model's score on `(x_val, y_val)` after
+    /// replacing parameter column `col` by `a + b·p_col`, then folds the map
+    /// into the model: `init_params[col] ← a + b·init_params[col]` and every
+    /// stored column-`col` learner's output is multiplied by `b`
+    /// ([`TrainedBaseLearner::scale_output`]). The serialized format is
+    /// unchanged, and `pred_dist`, staged predictions and `partial_fit` all
+    /// see the recalibrated model. `evals_result` keeps the pre-calibration
+    /// loss curves.
+    ///
+    /// With `col = 1` on a (loc, log scale) family this is a temperature-style
+    /// scaling of σ with a slope: b = 1 is a pure multiplicative inflation
+    /// (the score-optimal version of [`Self::calibrate_uncertainty`], which
+    /// matches moments instead); b < 1 shrinks over-dispersed σ̂. Measured on
+    /// NGBoost(Normal, LogScore): early-stopped models are systematically
+    /// overconfident out of sample (√(mean err²/mean σ̂²) ≈ 1.1–1.3, 90 %
+    /// intervals covering ≈ 85 %), and this head lowered held-out NLL on 6/6
+    /// benchmark datasets (see `research/ngboost/`).
+    ///
+    /// Column semantics are the distribution's: for a column that is not a
+    /// log-scale (e.g. Gamma's log-rate) the map still minimizes the score
+    /// but distorts the predicted mean — only use it on scale-like columns.
+    /// Fit it on the validation data you early-stopped on, never the test
+    /// set. The 2-parameter problem is solved by damped Newton with finite
+    /// differences and backtracking (never accepts a worse score, keeps
+    /// b > 0); it is convex for the Normal log score. Returns (a, b);
+    /// (0, 1) means no change was made.
+    pub fn calibrate_param_affine(
+        &mut self,
+        x_val: &Array2<f64>,
+        y_val: &Array1<f64>,
+        col: usize,
+        sample_weight: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64), &'static str> {
+        self.calibrate_param_affine_impl(x_val, y_val, &[col], sample_weight, true)
+    }
+
+    /// Shared body of [`Self::calibrate_param_affine`] and the automatic
+    /// end-of-fit calibration. `fit_slope = false` fixes b = 1 and fits only
+    /// the shift a (the score-optimal common inflation factor), which is what
+    /// small validation sets get.
+    fn calibrate_param_affine_impl(
+        &mut self,
+        x_val: &Array2<f64>,
+        y_val: &Array1<f64>,
+        cols: &[usize],
+        sample_weight: Option<&Array1<f64>>,
+        fit_slope: bool,
+    ) -> Result<(f64, f64), &'static str> {
+        if cols.is_empty() {
+            return Err("calibration needs at least one column");
+        }
+        if self.base_models.is_empty() || self.init_params.is_none() {
+            return Err("Model must be trained before calibration");
+        }
+        if x_val.nrows() != y_val.len() {
+            return Err("Number of samples in validation X and y must match");
+        }
+        if x_val.nrows() < 2 {
+            return Err("calibration needs at least 2 validation rows");
+        }
+        if let Some(nf) = self.n_features
+            && x_val.ncols() != nf
+        {
+            return Err("Number of features in training and validation data must match");
+        }
+        if y_val.iter().any(|v| !v.is_finite()) {
+            return Err("Input y contains NaN or infinite values");
+        }
+        if let Some(w) = sample_weight {
+            if w.len() != y_val.len() {
+                return Err("sample_weight length must match the number of samples");
+            }
+            if w.iter().any(|&v| !v.is_finite() || v < 0.0) || w.sum() <= 0.0 {
+                return Err("sample_weight contains negative or non-finite values");
+            }
+        }
+        let n_params = self.init_params.as_ref().unwrap().len();
+        if cols.iter().any(|&c| c >= n_params) {
+            return Err("calibration column index out of range");
+        }
+        // Every stored learner of these columns must support output scaling.
+        // Probe with the bit-exact no-op factor 1.0 before anything mutates.
+        for round in self.base_models.iter_mut() {
+            for &col in cols {
+                let supported = match round.get_mut(col) {
+                    Some(l) => l.scale_output(1.0),
+                    None => false,
+                };
+                if !supported {
+                    return Err("base learner type does not support output scaling");
+                }
+            }
+        }
+
+        // One shared (a, b) for all listed columns: p_c ← a + b·p_c.
+        let raw = self.pred_param(x_val);
+        let base_cols: Vec<Array1<f64>> = cols.iter().map(|&c| raw.column(c).to_owned()).collect();
+        let mut work = raw;
+        let mut objective = |a: f64, b: f64| -> f64 {
+            if !(b > 0.0) || !a.is_finite() || !b.is_finite() {
+                return f64::INFINITY;
+            }
+            for (&col, base_col) in cols.iter().zip(&base_cols) {
+                ndarray::Zip::from(work.column_mut(col))
+                    .and(base_col)
+                    .for_each(|p, &c| *p = a + b * c);
+            }
+            let s = Scorable::<S>::total_score(&D::from_params(&work), y_val, sample_weight);
+            if s.is_finite() { s } else { f64::INFINITY }
+        };
+        let (a, b) = minimize_2d(&mut objective, (0.0, 1.0), !fit_slope);
+        if a == 0.0 && b == 1.0 {
+            return Ok((a, b));
+        }
+        let init = self.init_params.as_mut().unwrap();
+        for &col in cols {
+            init[col] = a + b * init[col];
+        }
+        for round in self.base_models.iter_mut() {
+            for &col in cols {
+                round[col].scale_output(b);
+            }
+        }
+        Ok((a, b))
+    }
+
+    /// [`Self::calibrate_param_affine`] applied jointly to several columns with
+    /// ONE shared (a, b): every listed column c becomes a + b·p_c. Used for
+    /// distributions with several log-scale columns (e.g. both component
+    /// scales of [`crate::dist::NormalMixture2`]), so the relative widths of
+    /// the components are preserved.
+    pub fn calibrate_params_affine(
+        &mut self,
+        x_val: &Array2<f64>,
+        y_val: &Array1<f64>,
+        cols: &[usize],
+        sample_weight: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64), &'static str> {
+        self.calibrate_param_affine_impl(x_val, y_val, cols, sample_weight, true)
+    }
+
+    /// [`Self::calibrate_param_affine`] on column 1 — the log-scale of the
+    /// (loc, scale) families (Normal, Laplace, LogNormal, Cauchy, StudentT):
+    /// log σ ← a + b·log σ, fitted on validation data. Not meaningful for
+    /// one-parameter distributions or where column 1 is not a log-scale
+    /// (Gamma, Weibull, …).
+    pub fn calibrate_scale_affine(
+        &mut self,
+        x_val: &Array2<f64>,
+        y_val: &Array1<f64>,
+    ) -> Result<(f64, f64), &'static str> {
+        self.calibrate_param_affine(x_val, y_val, 1, None)
     }
 
     /// Compute aggregated feature importances across all distribution parameters.
@@ -2367,6 +3249,84 @@ pub struct SerializedNGBoost {
     pub random_state: Option<u64>,
 }
 
+/// Damped Newton with central finite differences and backtracking for a
+/// smooth scalar objective of two variables (used by post-hoc affine
+/// recalibration). A step is only taken when it strictly decreases the
+/// objective, so the result is never worse than `start`; non-finite
+/// objective values are treated as +∞ barriers. `fix_b` restricts the search
+/// to the first variable (one-dimensional Newton in `a`).
+fn minimize_2d(f: &mut dyn FnMut(f64, f64) -> f64, start: (f64, f64), fix_b: bool) -> (f64, f64) {
+    let (mut a, mut b) = start;
+    let mut fv = f(a, b);
+    if !fv.is_finite() {
+        return start;
+    }
+    let h = 1e-4;
+    for _ in 0..100 {
+        let fpa = f(a + h, b);
+        let fma = f(a - h, b);
+        if !(fpa.is_finite() && fma.is_finite()) {
+            break;
+        }
+        let ga = (fpa - fma) / (2.0 * h);
+        let haa = (fpa - 2.0 * fv + fma) / (h * h);
+        let (da, db) = if fix_b {
+            if haa > 0.0 {
+                (ga / haa, 0.0)
+            } else {
+                (0.1 * ga.signum(), 0.0)
+            }
+        } else {
+            let fpb = f(a, b + h);
+            let fmb = f(a, b - h);
+            let fpp = f(a + h, b + h);
+            let fpm = f(a + h, b - h);
+            let fmp = f(a - h, b + h);
+            let fmm = f(a - h, b - h);
+            if ![fpb, fmb, fpp, fpm, fmp, fmm].iter().all(|v| v.is_finite()) {
+                break;
+            }
+            let gb = (fpb - fmb) / (2.0 * h);
+            let hbb = (fpb - 2.0 * fv + fmb) / (h * h);
+            let hab = (fpp - fpm - fmp + fmm) / (4.0 * h * h);
+            let det = haa * hbb - hab * hab;
+            if haa > 0.0 && det > 0.0 {
+                // Newton direction H⁻¹g
+                ((hbb * ga - hab * gb) / det, (haa * gb - hab * ga) / det)
+            } else {
+                // Not positive definite here: a short normalized gradient step
+                let s = ga.abs().max(gb.abs()).max(1e-300);
+                (0.1 * ga / s, 0.1 * gb / s)
+            }
+        };
+        if !(da.is_finite() && db.is_finite()) || (da * da + db * db).sqrt() < 1e-12 {
+            break;
+        }
+        let mut t = 1.0;
+        let mut accepted = false;
+        for _ in 0..40 {
+            let (na, nb) = (a - t * da, b - t * db);
+            let nf = f(na, nb);
+            if nf < fv {
+                let rel = (fv - nf) / fv.abs().max(1.0);
+                a = na;
+                b = nb;
+                fv = nf;
+                accepted = true;
+                if rel < 1e-13 {
+                    return (a, b);
+                }
+                break;
+            }
+            t *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    (a, b)
+}
+
 fn to_2d_array(cols: Vec<Array1<f64>>) -> Array2<f64> {
     if cols.is_empty() {
         return Array2::zeros((0, 0));
@@ -2382,6 +3342,27 @@ fn to_2d_array(cols: Vec<Array1<f64>>) -> Array2<f64> {
 }
 
 // High-level API
+
+impl<B> NGBoost<Normal, LogScore, B>
+where
+    B: BaseLearner + Clone,
+{
+    /// The staged (location-then-scale, feasible-GLS) Normal fit, forced
+    /// regardless of `staged_fit` — since 1.2.0 the default of
+    /// `fit_with_validation` for Normal anyway. See [`NGBoost::fit_staged`]
+    /// and `docs/normal_head.md`.
+    pub fn fit_two_stage(
+        &mut self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        x_val: Option<&Array2<f64>>,
+        y_val: Option<&Array1<f64>>,
+        sample_weight: Option<&Array1<f64>>,
+        val_sample_weight: Option<&Array1<f64>>,
+    ) -> Result<(), &'static str> {
+        self.fit_staged(x, y, x_val, y_val, sample_weight, val_sample_weight)
+    }
+}
 
 /// High-level NGBoost regressor (Normal distribution, LogScore).
 ///
@@ -2414,6 +3395,15 @@ pub type NGBExactRegressor =
 /// use ngboost_rs::{NGBHistRegressor, learners::HistogramLearner};
 /// let mut model = NGBHistRegressor::new(500, 0.01, HistogramLearner::new(3));
 /// ```
+/// NGBoost with the two-component Normal mixture head
+/// ([`crate::dist::NormalMixture2`]) — for conditionally multimodal targets.
+/// See `docs/normal_mixture.md`.
+pub type NGBMixtureRegressor = NGBoost<
+    crate::dist::NormalMixture2,
+    crate::scores::LogScore,
+    crate::learners::HistogramLearner,
+>;
+
 pub type NGBHistRegressor =
     NGBoost<crate::dist::Normal, crate::scores::LogScore, crate::learners::HistogramLearner>;
 
@@ -2441,6 +3431,19 @@ impl NGBRegressor {
     ) -> Result<(), &'static str> {
         self.model
             .fit_with_validation(x, y, x_val, y_val, None, None)
+    }
+
+    /// Staged mean-then-scale (feasible-GLS) fit; see
+    /// [`NGBoost::fit_two_stage`]. Usually better than `fit_with_validation`
+    /// for the Normal head (research/ngboost Cycle 13).
+    pub fn fit_two_stage(
+        &mut self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        x_val: Option<&Array2<f64>>,
+        y_val: Option<&Array1<f64>>,
+    ) -> Result<(), &'static str> {
+        self.model.fit_two_stage(x, y, x_val, y_val, None, None)
     }
 
     /// Fits an NGBoost model to the data appending base models to the existing ones.
@@ -2594,6 +3597,16 @@ impl NGBRegressor {
         self.model.calibrate_uncertainty(x_val, y_val)
     }
 
+    /// Post-hoc affine recalibration of the predicted log-scale on validation
+    /// data, log σ ← a + b·log σ; see [`NGBoost::calibrate_scale_affine`].
+    pub fn calibrate_scale_affine(
+        &mut self,
+        x_val: &Array2<f64>,
+        y_val: &Array1<f64>,
+    ) -> Result<(f64, f64), &'static str> {
+        self.model.calibrate_scale_affine(x_val, y_val)
+    }
+
     /// Get the number of estimators (boosting iterations)
     pub fn n_estimators(&self) -> u32 {
         self.model.n_estimators
@@ -2741,6 +3754,10 @@ impl NGBRegressor {
             lr_schedule: self.model.lr_schedule,
             tikhonov_reg: self.model.tikhonov_reg,
             line_search_method: self.model.line_search_method,
+            auto_calibrate_scale: self.model.auto_calibrate_scale,
+            validation_split: self.model.validation_split,
+            staged_fit: self.model.staged_fit,
+            fisher_weight_power: self.model.fisher_weight_power,
         }
     }
 
@@ -2760,6 +3777,10 @@ impl NGBRegressor {
         self.model.lr_schedule = params.lr_schedule;
         self.model.tikhonov_reg = params.tikhonov_reg;
         self.model.line_search_method = params.line_search_method;
+        self.model.auto_calibrate_scale = params.auto_calibrate_scale;
+        self.model.validation_split = params.validation_split;
+        self.model.staged_fit = params.staged_fit;
+        self.model.fisher_weight_power = params.fisher_weight_power;
         if let Some(seed) = params.random_state {
             self.model.set_random_state(seed);
         }
@@ -3057,6 +4078,10 @@ impl<const K: usize> NGBMultiClassifier<K> {
             lr_schedule: self.model.lr_schedule,
             tikhonov_reg: self.model.tikhonov_reg,
             line_search_method: self.model.line_search_method,
+            auto_calibrate_scale: self.model.auto_calibrate_scale,
+            validation_split: self.model.validation_split,
+            staged_fit: self.model.staged_fit,
+            fisher_weight_power: self.model.fisher_weight_power,
         }
     }
 
@@ -3075,6 +4100,10 @@ impl<const K: usize> NGBMultiClassifier<K> {
         self.model.lr_schedule = params.lr_schedule;
         self.model.tikhonov_reg = params.tikhonov_reg;
         self.model.line_search_method = params.line_search_method;
+        self.model.auto_calibrate_scale = params.auto_calibrate_scale;
+        self.model.validation_split = params.validation_split;
+        self.model.staged_fit = params.staged_fit;
+        self.model.fisher_weight_power = params.fisher_weight_power;
         if let Some(seed) = params.random_state {
             self.model.set_random_state(seed);
         }
@@ -3408,6 +4437,10 @@ impl NGBClassifier {
             lr_schedule: self.model.lr_schedule,
             tikhonov_reg: self.model.tikhonov_reg,
             line_search_method: self.model.line_search_method,
+            auto_calibrate_scale: self.model.auto_calibrate_scale,
+            validation_split: self.model.validation_split,
+            staged_fit: self.model.staged_fit,
+            fisher_weight_power: self.model.fisher_weight_power,
         }
     }
 
@@ -3427,6 +4460,10 @@ impl NGBClassifier {
         self.model.lr_schedule = params.lr_schedule;
         self.model.tikhonov_reg = params.tikhonov_reg;
         self.model.line_search_method = params.line_search_method;
+        self.model.auto_calibrate_scale = params.auto_calibrate_scale;
+        self.model.validation_split = params.validation_split;
+        self.model.staged_fit = params.staged_fit;
+        self.model.fisher_weight_power = params.fisher_weight_power;
         if let Some(seed) = params.random_state {
             self.model.set_random_state(seed);
         }
@@ -3504,7 +4541,9 @@ mod missing_support_tests {
         let mut m: NGBoost<Poisson, LogScore, RidgeLearner> =
             NGBoost::new(5, 0.1, RidgeLearner::new(1.0));
         m.set_random_state(7);
-        assert!(m.fit(&x, &y).is_err(), "NaN must be rejected without support");
+        assert!(
+            m.fit(&x, &y).is_err(),
+            "NaN must be rejected without support"
+        );
     }
 }
-

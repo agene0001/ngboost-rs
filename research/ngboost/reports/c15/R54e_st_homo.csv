@@ -1,0 +1,15 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+homo,6,auto+joint,16,0.35,1.97722,2.01439,1.03737,1.88607,0.4300,0.9333,0.8536,2.1183,2.0276,NaN
+homo,6,auto+staged,413,2.85,1.30111,1.58395,0.65550,NaN,0.4733,0.9283,NaN,NaN,1.6148,NaN
+homo,7,auto+joint,21,0.41,1.96094,2.00286,1.02412,1.85624,0.4550,0.9467,0.8116,2.1898,2.0568,NaN
+homo,7,auto+staged,903,5.06,0.78169,2.08830,0.73896,1.20002,0.2300,0.5817,1.9775,0.6068,2.1140,NaN
+homo,8,auto+joint,2000,14.48,1.83469,1.91306,0.96318,1.76856,0.4433,0.9250,0.9111,1.8553,1.9228,NaN
+homo,8,auto+staged,354,2.98,1.26632,1.59229,0.66612,1.17388,0.4433,0.9067,0.9787,1.1993,1.5673,NaN
+homo,9,auto+joint,48,0.78,1.92552,1.99027,1.01974,1.85355,0.4117,0.9267,0.8705,2.0339,2.0099,NaN
+homo,9,auto+staged,437,3.16,1.25796,1.58187,0.65533,1.16397,0.4850,0.9117,0.9172,1.2689,1.5917,NaN
+
+# SUMMARY (mean ± sd over 4 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# homo     auto+joint     521   1.9801±0.0458    1.0111±0.0328    1.8411±0.0506    0.435   0.933   0.862   2.004     NaN
+# homo     auto+staged     527   1.7116±0.2512    0.6790±0.0403       NaN±NaN       0.408   0.832     NaN   1.722     NaN
+#   Δ(auto+staged − auto+joint): NLL -0.2685 (se 0.1203, wins 3/4) | CRPS -0.3321 (se 0.0241) | RMSE NaN (se NaN)

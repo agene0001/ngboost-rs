@@ -16,6 +16,20 @@ pub struct LogNormal {
 }
 
 impl Distribution for LogNormal {
+    fn location_column() -> Option<usize> {
+        Some(0)
+    }
+
+    /// Staged fit by default (LogNormal = Normal on ln y; measured −0.011…
+    /// −0.118 NLL, 9–10/10 seeds on three targets, research/ngboost R54d).
+    fn default_staged_fit() -> bool {
+        true
+    }
+
+    fn scale_param_index() -> Option<usize> {
+        Some(1)
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
         let scale = crate::vmath::exp_column(&params.column(1));
@@ -273,14 +287,12 @@ impl Scorable<CRPScore> for LogNormal {
 
     fn diagonal_metric(&self) -> Array2<f64> {
         // CRPS metric diagonal (2 params: loc, log_scale)
-        const INV_2_SQRT_PI: f64 = 0.28209479177387814;
         let n_obs = self.loc.len();
         let mut diag = Array2::zeros((n_obs, 2));
         Zip::from(diag.rows_mut())
             .and(&self.scale)
             .for_each(|mut row, &scale| {
-                row[0] = 2.0 * INV_2_SQRT_PI;
-                row[1] = scale * scale * INV_2_SQRT_PI;
+                (row[0], row[1]) = crate::dist::normal::normal_crps_metric(scale);
             });
         diag
     }
@@ -336,15 +348,13 @@ impl Scorable<CRPScore> for LogNormal {
 
     fn metric(&self) -> Array3<f64> {
         // CRPS metric for LogNormal — vectorized
-        const INV_2_SQRT_PI: f64 = 0.28209479177387814;
         let n_obs = self.loc.len();
         let mut fi = Array3::zeros((n_obs, 2, 2));
 
         Zip::from(fi.outer_iter_mut())
             .and(&self.scale)
             .for_each(|mut fi_i, &scale| {
-                fi_i[[0, 0]] = 2.0 * INV_2_SQRT_PI;
-                fi_i[[1, 1]] = scale * scale * INV_2_SQRT_PI;
+                (fi_i[[0, 0]], fi_i[[1, 1]]) = crate::dist::normal::normal_crps_metric(scale);
             });
 
         fi

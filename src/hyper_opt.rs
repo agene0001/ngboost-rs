@@ -889,68 +889,68 @@ where
         // trains on all other rows.
         let (train_features, train_labels, test_features, test_labels, train_idx, valid_idx) =
             if time_series {
-            let train_end = (i + 1) * ts_seg;
-            let test_end = if i == n_iters - 1 {
-                n_samples
-            } else {
-                train_end + ts_seg
-            };
-            (
-                features.slice(s![..train_end, ..]).to_owned(),
-                labels.slice(s![..train_end]).to_owned(),
-                features.slice(s![train_end..test_end, ..]).to_owned(),
-                labels.slice(s![train_end..test_end]).to_owned(),
-                (0..train_end).collect::<Vec<usize>>(),
-                (train_end..test_end).collect::<Vec<usize>>(),
-            )
-        } else {
-            let (test_start, test_end) = if single_holdout {
-                // Last 20% is the held-out validation/scoring fold.
-                (((n_samples as f64) * 0.8) as usize, n_samples)
-            } else {
-                // sklearn-style sizes: the first n % k folds take one extra
-                // row so fold sizes differ by at most 1. (The old code gave
-                // the whole remainder to the last fold — up to k-1 rows of
-                // imbalance, underweighted by the unweighted fold-score mean.)
-                let rem = n_samples % n_iters;
-                let start = i * fold_size + i.min(rem);
-                let end = start + fold_size + usize::from(i < rem);
-                (start, end)
-            };
-
-            let test_features = features.slice(s![test_start..test_end, ..]).to_owned();
-            let test_labels = labels.slice(s![test_start..test_end]).to_owned();
-
-            let train_features_1 = features.slice(s![..test_start, ..]);
-            let train_features_2 = features.slice(s![test_end.., ..]);
-            let train_labels_1 = labels.slice(s![..test_start]);
-            let train_labels_2 = labels.slice(s![test_end..]);
-
-            let train_features =
-                match ndarray::concatenate(Axis(0), &[train_features_1, train_features_2]) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        return (f64::INFINITY, None);
-                    }
+                let train_end = (i + 1) * ts_seg;
+                let test_end = if i == n_iters - 1 {
+                    n_samples
+                } else {
+                    train_end + ts_seg
                 };
-            let train_labels =
-                match ndarray::concatenate(Axis(0), &[train_labels_1, train_labels_2]) {
-                    Ok(l) => l,
-                    Err(_) => {
-                        return (f64::INFINITY, None);
-                    }
+                (
+                    features.slice(s![..train_end, ..]).to_owned(),
+                    labels.slice(s![..train_end]).to_owned(),
+                    features.slice(s![train_end..test_end, ..]).to_owned(),
+                    labels.slice(s![train_end..test_end]).to_owned(),
+                    (0..train_end).collect::<Vec<usize>>(),
+                    (train_end..test_end).collect::<Vec<usize>>(),
+                )
+            } else {
+                let (test_start, test_end) = if single_holdout {
+                    // Last 20% is the held-out validation/scoring fold.
+                    (((n_samples as f64) * 0.8) as usize, n_samples)
+                } else {
+                    // sklearn-style sizes: the first n % k folds take one extra
+                    // row so fold sizes differ by at most 1. (The old code gave
+                    // the whole remainder to the last fold — up to k-1 rows of
+                    // imbalance, underweighted by the unweighted fold-score mean.)
+                    let rem = n_samples % n_iters;
+                    let start = i * fold_size + i.min(rem);
+                    let end = start + fold_size + usize::from(i < rem);
+                    (start, end)
                 };
-            let train_idx: Vec<usize> = (0..test_start).chain(test_end..n_samples).collect();
-            let valid_idx: Vec<usize> = (test_start..test_end).collect();
-            (
-                train_features,
-                train_labels,
-                test_features,
-                test_labels,
-                train_idx,
-                valid_idx,
-            )
-        };
+
+                let test_features = features.slice(s![test_start..test_end, ..]).to_owned();
+                let test_labels = labels.slice(s![test_start..test_end]).to_owned();
+
+                let train_features_1 = features.slice(s![..test_start, ..]);
+                let train_features_2 = features.slice(s![test_end.., ..]);
+                let train_labels_1 = labels.slice(s![..test_start]);
+                let train_labels_2 = labels.slice(s![test_end..]);
+
+                let train_features =
+                    match ndarray::concatenate(Axis(0), &[train_features_1, train_features_2]) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            return (f64::INFINITY, None);
+                        }
+                    };
+                let train_labels =
+                    match ndarray::concatenate(Axis(0), &[train_labels_1, train_labels_2]) {
+                        Ok(l) => l,
+                        Err(_) => {
+                            return (f64::INFINITY, None);
+                        }
+                    };
+                let train_idx: Vec<usize> = (0..test_start).chain(test_end..n_samples).collect();
+                let valid_idx: Vec<usize> = (test_start..test_end).collect();
+                (
+                    train_features,
+                    train_labels,
+                    test_features,
+                    test_labels,
+                    train_idx,
+                    valid_idx,
+                )
+            };
 
         // Fit-inside-the-fold preprocessing: runs AFTER the split, so the
         // transform only ever sees this fold's training rows. A failure makes
@@ -989,7 +989,9 @@ where
         // if one was provided. Using the same fold for both early-stopping and
         // scoring makes each trial's score mildly optimistic, but consistently
         // so across trials — TPE ranking (the only thing that matters here) is
-        // unaffected.
+        // unaffected. The same holds for the default end-of-fit scale
+        // recalibration (`auto_calibrate_scale`): it is fitted on this fold,
+        // so each trial is scored as the calibrated model it would deploy as.
         if model.early_stopping_rounds.is_none() {
             model.early_stopping_rounds = Some(CV_EARLY_STOPPING_ROUNDS);
         }
@@ -1004,8 +1006,7 @@ where
         // "you forgot to weight validation"). All-ones is a provable no-op —
         // `total_score` computes (scores*w).sum()/w.sum(), which for w = 1 is
         // exactly the unweighted mean it would take on the `None` branch.
-        let fold_weights =
-            fold_weight_fn.map(|wf| Array1::from_vec((wf.0)(train_labels.len())));
+        let fold_weights = fold_weight_fn.map(|wf| Array1::from_vec((wf.0)(train_labels.len())));
         // Caller-supplied scoring-row weights (see `FoldValWeightFn`) weight
         // the early-stopping monitor and the score; otherwise all-ones as above.
         let caller_val_weights = fold_val_weight_fn
@@ -1043,10 +1044,13 @@ where
     };
 
     let parallel_folds = !single_holdout
-        && std::env::var("NGBOOST_PARALLEL_FOLDS").map(|v| v != "0").unwrap_or(true);
+        && std::env::var("NGBOOST_PARALLEL_FOLDS")
+            .map(|v| v != "0")
+            .unwrap_or(true);
     if parallel_folds {
         use rayon::prelude::*;
-        let results: Vec<(f64, Option<usize>)> = (0..n_iters).into_par_iter().map(run_fold).collect();
+        let results: Vec<(f64, Option<usize>)> =
+            (0..n_iters).into_par_iter().map(run_fold).collect();
         for (score, rounds) in results {
             fold_scores.push(score);
             if let Some(r) = rounds {
@@ -1068,7 +1072,8 @@ where
             // folds to skip.
             if !single_holdout {
                 let running_mean = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
-                if pruner_state.should_prune(pruning_strategy, i, running_mean, n_completed_trials) {
+                if pruner_state.should_prune(pruning_strategy, i, running_mean, n_completed_trials)
+                {
                     pruned = true;
                     break;
                 }
@@ -1178,10 +1183,26 @@ mod warm_start_tests {
     #[test]
     fn value_to_raw_inverts_raw_to_value() {
         let cases = vec![
-            HyperParamType::Float { low: 0.01, high: 0.5, log: false },
-            HyperParamType::Float { low: 1e-6, high: 1e-1, log: true },
-            HyperParamType::Int { low: 2, high: 12, log: false },
-            HyperParamType::Int { low: 10, high: 1000, log: true },
+            HyperParamType::Float {
+                low: 0.01,
+                high: 0.5,
+                log: false,
+            },
+            HyperParamType::Float {
+                low: 1e-6,
+                high: 1e-1,
+                log: true,
+            },
+            HyperParamType::Int {
+                low: 2,
+                high: 12,
+                log: false,
+            },
+            HyperParamType::Int {
+                low: 10,
+                high: 1000,
+                log: true,
+            },
             HyperParamType::Categorical {
                 choices: vec![Value::from("a"), Value::from("b"), Value::from("c")],
             },
@@ -1197,7 +1218,10 @@ mod warm_start_tests {
             match (&probe, &back) {
                 (Value::Number(a), Value::Number(b)) => {
                     let (a, b) = (a.as_f64().unwrap(), b.as_f64().unwrap());
-                    assert!((a - b).abs() < 1e-9 * a.abs().max(1.0), "{a} != {b} for {pt:?}");
+                    assert!(
+                        (a - b).abs() < 1e-9 * a.abs().max(1.0),
+                        "{a} != {b} for {pt:?}"
+                    );
                 }
                 _ => assert_eq!(&probe, &back, "categorical round-trip failed for {pt:?}"),
             }
@@ -1209,11 +1233,19 @@ mod warm_start_tests {
     /// on, and which would make a cache entry able to break a search).
     #[test]
     fn out_of_range_values_are_clamped_not_rejected() {
-        let pt = HyperParamType::Float { low: 0.1, high: 0.5, log: false };
+        let pt = HyperParamType::Float {
+            low: 0.1,
+            high: 0.5,
+            log: false,
+        };
         assert_eq!(value_to_raw(&pt, &Value::from(9.9)), Some(0.5));
         assert_eq!(value_to_raw(&pt, &Value::from(-9.9)), Some(0.1));
 
-        let pt = HyperParamType::Int { low: 2, high: 8, log: false };
+        let pt = HyperParamType::Int {
+            low: 2,
+            high: 8,
+            log: false,
+        };
         assert_eq!(value_to_raw(&pt, &Value::from(99)), Some(8.0));
     }
 
@@ -1231,14 +1263,22 @@ mod warm_start_tests {
     /// Wrong JSON type is a miss, never a panic — cache entries are untrusted.
     #[test]
     fn wrong_type_is_a_miss() {
-        let pt = HyperParamType::Float { low: 0.0, high: 1.0, log: false };
+        let pt = HyperParamType::Float {
+            low: 0.0,
+            high: 1.0,
+            log: false,
+        };
         assert_eq!(value_to_raw(&pt, &Value::from("not a number")), None);
     }
 
     /// An int spec must accept a float that round-tripped through JSON.
     #[test]
     fn int_accepts_a_json_float() {
-        let pt = HyperParamType::Int { low: 1, high: 10, log: false };
+        let pt = HyperParamType::Int {
+            low: 1,
+            high: 10,
+            log: false,
+        };
         assert_eq!(value_to_raw(&pt, &Value::from(8.0)), Some(8.0));
     }
 }
@@ -1262,8 +1302,7 @@ mod tests {
     #[test]
     fn weighted_folds_produce_a_real_search_not_silent_infinities() {
         let n = 120usize;
-        let features =
-            Array::from_shape_fn((n, 2), |(i, j)| (i as f64) * 0.01 + (j as f64) * 0.5);
+        let features = Array::from_shape_fn((n, 2), |(i, j)| (i as f64) * 0.01 + (j as f64) * 0.5);
         let labels = Array::from_shape_fn(n, |i| (i as f64) * 0.02);
         let mut hp = HashMap::new();
         hp.insert(

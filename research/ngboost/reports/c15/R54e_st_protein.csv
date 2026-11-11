@@ -1,0 +1,17 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+protein,5,auto+joint,36,7.03,3.03434,3.06398,3.03231,5.47966,0.3774,0.9239,0.9533,5.5590,3.0550,NaN
+protein,5,auto+staged,2038,90.37,2.53582,2.68214,2.17584,NaN,0.5044,0.8930,NaN,NaN,2.6799,NaN
+protein,6,auto+joint,22,3.82,3.06533,3.06638,3.01743,5.42278,0.3853,0.9275,0.9490,5.6240,3.0533,NaN
+protein,6,auto+staged,2033,41.51,2.54184,2.66458,2.17097,4.19576,0.4920,0.8846,0.0000,inf,2.6336,NaN
+protein,7,auto+joint,36,2.11,3.00881,3.01381,2.92467,5.30507,0.3873,0.9296,0.9616,5.3487,3.0209,NaN
+protein,7,auto+staged,2032,39.11,2.54215,2.67322,2.16786,4.21272,0.5156,0.8993,0.0000,inf,2.6960,NaN
+protein,8,auto+joint,50,2.50,3.01932,3.01809,2.92971,NaN,0.3859,0.9253,NaN,NaN,3.0275,NaN
+protein,8,auto+staged,2034,40.46,2.54030,2.65527,2.14014,4.13963,0.5103,0.8942,0.0000,inf,2.6735,NaN
+protein,9,auto+joint,26,2.74,3.02500,3.02090,2.93478,5.31848,0.3731,0.9288,0.9533,5.4355,3.0276,NaN
+protein,9,auto+staged,2035,37.00,2.54651,2.66459,2.13025,4.11628,0.5089,0.8933,0.0000,inf,2.6693,NaN
+
+# SUMMARY (mean ± sd over 5 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# protein  auto+joint      34   3.0366±0.0262    2.9678±0.0525       NaN±NaN       0.382   0.927     NaN   3.037     NaN
+# protein  auto+staged    2034   2.6680±0.0102    2.1570±0.0204       NaN±NaN       0.506   0.893     NaN   2.670     NaN
+#   Δ(auto+staged − auto+joint): NLL -0.3687 (se 0.0106, wins 5/5) | CRPS -0.8108 (se 0.0184) | RMSE NaN (se NaN)

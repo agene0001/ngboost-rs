@@ -1,0 +1,30 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+support_dzclass,100,base,711,1.18,0.57009,0.67025,0.36794,NaN,0.7404,NaN,0.0198,NaN,0.0319,NaN
+support_dzclass,100,fwp1,1166,1.98,0.50682,0.63744,0.35153,NaN,0.7607,NaN,0.0191,NaN,0.0122,NaN
+support_dzclass,101,base,577,0.97,0.56645,0.69784,0.38067,NaN,0.7261,NaN,0.0285,NaN,0.0392,NaN
+support_dzclass,101,fwp1,761,1.33,0.52347,0.65365,0.36022,NaN,0.7420,NaN,0.0270,NaN,0.0150,NaN
+support_dzclass,102,base,513,0.78,0.57173,0.62800,0.34597,NaN,0.7673,NaN,0.0254,NaN,0.0198,NaN
+support_dzclass,102,fwp1,639,1.13,0.53272,0.61322,0.34164,NaN,0.7689,NaN,0.0420,NaN,0.0208,NaN
+support_dzclass,103,base,572,0.92,0.56268,0.64172,0.35922,NaN,0.7453,NaN,0.0092,NaN,0.0208,NaN
+support_dzclass,103,fwp1,645,1.11,0.53559,0.62625,0.35181,NaN,0.7503,NaN,0.0362,NaN,0.0188,NaN
+support_dzclass,104,base,451,0.82,0.56992,0.66559,0.36364,NaN,0.7431,NaN,0.0151,NaN,0.0249,NaN
+support_dzclass,104,fwp1,665,1.15,0.52910,0.63799,0.35055,NaN,0.7563,NaN,0.0288,NaN,0.0087,NaN
+flchain_cause,100,base,78,0.06,1.23346,1.28046,0.69611,NaN,0.3977,NaN,0.0280,NaN,0.0124,NaN
+flchain_cause,100,fwp1,79,0.07,1.23485,1.28082,0.69778,NaN,0.3931,NaN,0.0333,NaN,0.0129,NaN
+flchain_cause,101,base,102,0.07,1.22809,1.29147,0.70662,NaN,0.3770,NaN,0.0262,NaN,0.0362,NaN
+flchain_cause,101,fwp1,143,0.10,1.20219,1.28712,0.70743,NaN,0.3655,NaN,0.0327,NaN,0.0375,NaN
+flchain_cause,102,base,85,0.06,1.22393,1.27363,0.69644,NaN,0.3954,NaN,0.0314,NaN,0.0087,NaN
+flchain_cause,102,fwp1,87,0.19,1.22759,1.27184,0.69520,NaN,0.3977,NaN,0.0274,NaN,0.0131,NaN
+flchain_cause,103,base,66,0.06,1.23832,1.29758,0.70719,NaN,0.3816,NaN,0.0406,NaN,0.0188,NaN
+flchain_cause,103,fwp1,119,0.10,1.19913,1.28858,0.70479,NaN,0.3793,NaN,0.0146,NaN,0.0194,NaN
+flchain_cause,104,base,100,0.07,1.21478,1.28596,0.69656,NaN,0.3977,NaN,0.0298,NaN,0.0326,NaN
+flchain_cause,104,fwp1,118,0.10,1.20857,1.28058,0.69428,NaN,0.4023,NaN,0.0232,NaN,0.0315,NaN
+
+# SUMMARY (mean ± sd over 5 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# support_dzclass base           565   0.6607±0.0270    0.3635±0.0127       NaN±NaN       0.744     NaN   0.020   0.027     NaN
+# support_dzclass fwp1           775   0.6337±0.0150    0.3511±0.0066       NaN±NaN       0.756     NaN   0.031   0.015     NaN
+#   Δ(fwp1 − base): NLL -0.0270 (se 0.0055, wins 5/5) | CRPS -0.0123 (se 0.0029) | RMSE NaN (se NaN)
+# flchain_cause base            86   1.2858±0.0093    0.7006±0.0058       NaN±NaN       0.390     NaN   0.031   0.022     NaN
+# flchain_cause fwp1           109   1.2818±0.0066    0.6999±0.0059       NaN±NaN       0.388     NaN   0.026   0.023     NaN
+#   Δ(fwp1 − base): NLL -0.0040 (se 0.0016, wins 4/5) | CRPS -0.0007 (se 0.0008) | RMSE NaN (se NaN)

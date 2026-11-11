@@ -1,0 +1,27 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+support_dzclass,0,fwp0+noicpt,175,0.34,0.55037,0.65517,0.36814,NaN,0.7267,NaN,0.0336,NaN,0.0115,NaN
+support_dzclass,0,base,301,0.70,0.47093,0.61382,0.34878,NaN,0.7470,NaN,0.0143,NaN,0.0124,NaN
+support_dzclass,1,fwp0+noicpt,117,0.21,0.56504,0.65797,0.36343,NaN,0.7459,NaN,0.0111,NaN,0.0284,NaN
+support_dzclass,1,base,162,0.32,0.49774,0.61167,0.34151,NaN,0.7547,NaN,0.0244,NaN,0.0072,NaN
+support_dzclass,2,fwp0+noicpt,132,0.38,0.56221,0.63067,0.34781,NaN,0.7514,NaN,0.0074,NaN,0.0111,NaN
+support_dzclass,2,base,287,0.50,0.46430,0.58861,0.32830,NaN,0.7722,NaN,0.0210,NaN,0.0084,NaN
+support_dzclass,3,fwp0+noicpt,82,0.21,0.57078,0.63380,0.35033,NaN,0.7536,NaN,0.0168,NaN,0.0238,NaN
+support_dzclass,3,base,278,0.53,0.47478,0.59198,0.33320,NaN,0.7733,NaN,0.0315,NaN,0.0080,NaN
+support_dzclass,4,fwp0+noicpt,116,0.22,0.56606,0.65002,0.36776,NaN,0.7377,NaN,0.0252,NaN,0.0219,NaN
+support_dzclass,4,base,162,0.54,0.51125,0.62546,0.35512,NaN,0.7475,NaN,0.0173,NaN,0.0046,NaN
+support_dzclass,5,fwp0+noicpt,134,0.23,0.55168,0.63015,0.34829,NaN,0.7519,NaN,0.0141,NaN,0.0194,NaN
+support_dzclass,5,base,161,0.40,0.50992,0.60518,0.33724,NaN,0.7634,NaN,0.0274,NaN,0.0079,NaN
+support_dzclass,6,fwp0+noicpt,204,0.51,0.54964,0.64493,0.35420,NaN,0.7464,NaN,0.0218,NaN,0.0236,NaN
+support_dzclass,6,base,394,0.84,0.46096,0.61122,0.34443,NaN,0.7530,NaN,0.0199,NaN,0.0098,NaN
+support_dzclass,7,fwp0+noicpt,84,0.17,0.57528,0.65895,0.36898,NaN,0.7360,NaN,0.0067,NaN,0.0255,NaN
+support_dzclass,7,base,300,0.59,0.47577,0.62842,0.34835,NaN,0.7541,NaN,0.0153,NaN,0.0158,NaN
+support_dzclass,8,fwp0+noicpt,65,0.15,0.59274,0.65034,0.36270,NaN,0.7503,NaN,0.0287,NaN,0.0133,NaN
+support_dzclass,8,base,297,0.53,0.47874,0.62145,0.34808,NaN,0.7602,NaN,0.0145,NaN,0.0112,NaN
+support_dzclass,9,fwp0+noicpt,106,0.41,0.56082,0.63832,0.36226,NaN,0.7442,NaN,0.0166,NaN,0.0256,NaN
+support_dzclass,9,base,312,0.55,0.46510,0.63467,0.35747,NaN,0.7475,NaN,0.0206,NaN,0.0094,NaN
+
+# SUMMARY (mean ± sd over 10 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# support_dzclass fwp0+noicpt     122   0.6450±0.0111    0.3594±0.0084       NaN±NaN       0.744     NaN   0.018   0.020     NaN
+# support_dzclass base           265   0.6132±0.0150    0.3443±0.0093       NaN±NaN       0.757     NaN   0.021   0.009     NaN
+#   Δ(base − fwp0+noicpt): NLL -0.0318 (se 0.0040, wins 10/10) | CRPS -0.0151 (se 0.0018) | RMSE NaN (se NaN)

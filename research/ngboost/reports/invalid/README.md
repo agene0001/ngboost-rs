@@ -1,0 +1,1 @@
+Runs in this folder ignored their --seeds/--lr/--max-rows flags (zsh did not split $COMMON; the parser silently dropped the trailing argument): 3 seeds, full 45k-row protein. Superseded by the files of the same name one level up. Kept for the record; not logged to experiments.csv.

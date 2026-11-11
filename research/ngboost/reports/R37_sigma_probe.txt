@@ -1,0 +1,25 @@
+auto_calibrate_scale = false: 681 rounds, calibration None, test NLL 2.2216
+ after 68 rounds:
+  test comp 0: weight median 0.2745 (p99 0.7769) | σ median 0.610 p99 0.816 max 1.488
+  test comp 1: weight median 0.2352 (p99 0.6551) | σ median 1.537 p99 2.158 max 2.620
+  test comp 2: weight median 0.4400 (p99 0.9141) | σ median 2.996 p99 4.899 max 5.769
+ after 170 rounds:
+  test comp 0: weight median 0.2674 (p99 0.8341) | σ median 0.516 p99 0.859 max 3.582
+  test comp 1: weight median 0.2406 (p99 0.7457) | σ median 1.491 p99 2.238 max 2.791
+  test comp 2: weight median 0.4262 (p99 0.9661) | σ median 2.863 p99 4.389 max 6.046
+ after 340 rounds:
+  test comp 0: weight median 0.2602 (p99 0.8856) | σ median 0.452 p99 0.806 max 3.300
+  test comp 1: weight median 0.2446 (p99 0.7933) | σ median 1.437 p99 2.247 max 205043344.874
+  test comp 2: weight median 0.4135 (p99 0.9730) | σ median 2.759 p99 4.036 max 6.385
+ after 510 rounds:
+  test comp 0: weight median 0.2575 (p99 0.9042) | σ median 0.421 p99 0.763 max 2.700
+  test comp 1: weight median 0.2406 (p99 0.8055) | σ median 1.389 p99 2.150 max 183103819.177
+  test comp 2: weight median 0.4036 (p99 0.9801) | σ median 2.645 p99 3.891 max 6.442
+ after 681 rounds:
+  test comp 0: weight median 0.2491 (p99 0.9164) | σ median 0.403 p99 0.743 max 3.638
+  test comp 1: weight median 0.2422 (p99 0.7903) | σ median 1.348 p99 2.111 max 181101375.900
+  test comp 2: weight median 0.4026 (p99 0.9820) | σ median 2.572 p99 3.840 max 6.487
+auto_calibrate_scale = true: 681 rounds, calibration Some((3, 0.12953950709086826, 1.0000474709947236)), test NLL 2.2082
+  test comp 0: weight median 0.2491 (p99 0.9164) | σ median 0.459 p99 0.846 max 4.142
+  test comp 1: weight median 0.2422 (p99 0.7903) | σ median 1.535 p99 2.403 max 206334597.300
+  test comp 2: weight median 0.4026 (p99 0.9820) | σ median 2.928 p99 4.371 max 7.385

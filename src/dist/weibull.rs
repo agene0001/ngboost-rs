@@ -416,6 +416,16 @@ impl Scorable<CRPScore> for Weibull {
     }
 
     fn metric(&self) -> Array3<f64> {
+        if !crate::scores::crps_metric_legacy() {
+            return weibull_crps_metric(&self.shape, &self.scale);
+        }
+        self.legacy_crps_metric()
+    }
+}
+
+impl Weibull {
+    /// Pre-1.2 CRPS "metric" E_Y[g gᵀ] (wrong units; `crps_metric_legacy`).
+    fn legacy_crps_metric(&self) -> Array3<f64> {
         // Deterministic quadrature for E[g * g^T] over Y ~ Weibull(k, λ).
         //
         // Exponential transform (same log-domain machinery as the Gamma CRPS
@@ -830,7 +840,7 @@ mod tests {
         for (k, lam, m00, m01, m11, tol) in cases {
             let params = Array2::from_shape_vec((1, 2), vec![k.ln(), lam.ln()]).unwrap();
             let dist = Weibull::from_params(&params);
-            let m = Scorable::<CRPScore>::metric(&dist);
+            let m = dist.legacy_crps_metric();
             for (got, expect, name) in [
                 (m[[0, 0, 0]], m00, "m00"),
                 (m[[0, 0, 1]], m01, "m01"),
@@ -965,4 +975,44 @@ mod tests {
             );
         }
     }
+}
+
+/// CRPS metric 2∫∇F∇Fᵀ dt of Weibull(k, λ) in (ln k, ln λ). With
+/// w = (t/λ)^k, F = 1 − e^{−w}, ∂F/∂ln k = e^{−w} w ln w, ∂F/∂ln λ =
+/// −k e^{−w} w and dt = (t/k) ds in s = ln w: midpoint rule over
+/// [ln 1e-13, ln 53], 400 nodes. Scales with λ (units of y).
+/// research/ngboost Cycle 14.
+fn weibull_crps_metric(shape: &Array1<f64>, scale: &Array1<f64>) -> Array3<f64> {
+    let n = shape.len();
+    let mut fi = Array3::zeros((n, 2, 2));
+    const N: usize = 400;
+    let (s_lo, s_hi) = (1e-13f64.ln(), 53f64.ln());
+    let ds = (s_hi - s_lo) / N as f64;
+    for i in 0..n {
+        let (k, lam) = (shape[i], scale[i]);
+        if !(k > 0.0 && lam > 0.0 && k.is_finite() && lam.is_finite()) {
+            fi[[i, 0, 0]] = 1.0;
+            fi[[i, 1, 1]] = 1.0;
+            continue;
+        }
+        let mut m = [[0.0f64; 2]; 2];
+        for j in 0..N {
+            let s = s_lo + (j as f64 + 0.5) * ds;
+            let w = s.exp();
+            let e = (-w).exp() * w;
+            let g = [e * s, -k * e];
+            let dt = lam * (s / k).exp() / k * ds;
+            for p in 0..2 {
+                for q in 0..2 {
+                    m[p][q] += g[p] * g[q] * dt;
+                }
+            }
+        }
+        for p in 0..2 {
+            for q in 0..2 {
+                fi[[i, p, q]] = 2.0 * m[p][q];
+            }
+        }
+    }
+    fi
 }

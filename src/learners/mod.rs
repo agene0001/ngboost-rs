@@ -203,6 +203,17 @@ pub trait TrainedBaseLearner: Send + Sync {
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
         None
     }
+
+    /// Multiply every prediction of this learner by `factor`, in place.
+    /// Used by post-hoc affine recalibration
+    /// (`NGBoost::calibrate_param_affine`), which folds the slope into the
+    /// stored learners so a saved model needs no extra state. Returns
+    /// `false` — and must not modify anything — when the learner type does
+    /// not support it. `factor = 1.0` is a bit-exact no-op usable as a
+    /// support probe.
+    fn scale_output(&mut self, _factor: f64) -> bool {
+        false
+    }
 }
 
 /// Serializable wrapper enum for trained learners.
@@ -265,6 +276,16 @@ impl TrainedBaseLearner for SerializableTrainedLearner {
             SerializableTrainedLearner::HistogramTree(h) => h.split_feature(),
             SerializableTrainedLearner::Ridge(_) => None, // Linear models don't split
             SerializableTrainedLearner::ArenaTree(a) => a.split_feature(),
+        }
+    }
+
+    fn scale_output(&mut self, factor: f64) -> bool {
+        match self {
+            SerializableTrainedLearner::Stump(s) => s.scale_output(factor),
+            SerializableTrainedLearner::DecisionTree(t) => t.scale_output(factor),
+            SerializableTrainedLearner::HistogramTree(h) => h.scale_output(factor),
+            SerializableTrainedLearner::Ridge(r) => r.scale_output(factor),
+            SerializableTrainedLearner::ArenaTree(a) => a.scale_output(factor),
         }
     }
 
@@ -405,6 +426,12 @@ impl TrainedBaseLearner for TrainedStumpLearner {
         } else {
             Some(self.feature_index)
         }
+    }
+
+    fn scale_output(&mut self, factor: f64) -> bool {
+        self.left_value *= factor;
+        self.right_value *= factor;
+        true
     }
 
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
@@ -611,6 +638,14 @@ impl TrainedBaseLearner for TrainedRidgeLearner {
         } else {
             Some(Array1::zeros(self.n_features))
         }
+    }
+
+    fn scale_output(&mut self, factor: f64) -> bool {
+        for c in self.coefficients.iter_mut() {
+            *c *= factor;
+        }
+        self.intercept *= factor;
+        true
     }
 
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
@@ -1199,8 +1234,18 @@ impl FeatureHists {
             let raw = raw.get_or_insert_with(|| vec![0.0; p * n_bins]);
             if let Some(gsz) = gsz {
                 fill_hists_par(
-                    &cache.binned, p, indices, y, Some(weights), None, n_bins, gsz,
-                    &mut count, &mut sum, Some(raw), true,
+                    &cache.binned,
+                    p,
+                    indices,
+                    y,
+                    Some(weights),
+                    None,
+                    n_bins,
+                    gsz,
+                    &mut count,
+                    &mut sum,
+                    Some(raw),
+                    true,
                 );
             } else {
                 for &i in indices {
@@ -1244,8 +1289,18 @@ impl FeatureHists {
             count.copy_from_slice(counts);
             if let Some(gsz) = gsz {
                 fill_hists_par(
-                    &cache.binned, p, indices, y, None, None, n_bins, gsz,
-                    &mut count, &mut sum, None, false,
+                    &cache.binned,
+                    p,
+                    indices,
+                    y,
+                    None,
+                    None,
+                    n_bins,
+                    gsz,
+                    &mut count,
+                    &mut sum,
+                    None,
+                    false,
                 );
             } else {
                 for &i in indices {
@@ -1259,8 +1314,18 @@ impl FeatureHists {
             }
         } else if let Some(gsz) = gsz {
             fill_hists_par(
-                &cache.binned, p, indices, y, None, None, n_bins, gsz,
-                &mut count, &mut sum, None, true,
+                &cache.binned,
+                p,
+                indices,
+                y,
+                None,
+                None,
+                n_bins,
+                gsz,
+                &mut count,
+                &mut sum,
+                None,
+                true,
             );
         } else {
             for &i in indices {
@@ -1328,8 +1393,18 @@ impl FeatureHists {
             let raw = raw.get_or_insert_with(|| vec![0.0; k * n_bins]);
             if let Some(gsz) = gsz {
                 fill_hists_par(
-                    &cache.binned, p, indices, y, Some(weights), Some(cols), n_bins, gsz,
-                    &mut count, &mut sum, Some(raw), true,
+                    &cache.binned,
+                    p,
+                    indices,
+                    y,
+                    Some(weights),
+                    Some(cols),
+                    n_bins,
+                    gsz,
+                    &mut count,
+                    &mut sum,
+                    Some(raw),
+                    true,
                 );
             } else {
                 for &i in indices {
@@ -1383,8 +1458,18 @@ impl FeatureHists {
             }
             if let Some(gsz) = gsz {
                 fill_hists_par(
-                    &cache.binned, p, indices, y, None, Some(cols), n_bins, gsz,
-                    &mut count, &mut sum, None, false,
+                    &cache.binned,
+                    p,
+                    indices,
+                    y,
+                    None,
+                    Some(cols),
+                    n_bins,
+                    gsz,
+                    &mut count,
+                    &mut sum,
+                    None,
+                    false,
                 );
             } else {
                 for &i in indices {
@@ -1398,8 +1483,18 @@ impl FeatureHists {
             }
         } else if let Some(gsz) = gsz {
             fill_hists_par(
-                &cache.binned, p, indices, y, None, Some(cols), n_bins, gsz,
-                &mut count, &mut sum, None, true,
+                &cache.binned,
+                p,
+                indices,
+                y,
+                None,
+                Some(cols),
+                n_bins,
+                gsz,
+                &mut count,
+                &mut sum,
+                None,
+                true,
             );
         } else {
             for &i in indices {
@@ -1881,6 +1976,17 @@ pub enum HistTreeNode {
 }
 
 impl HistTreeNode {
+    /// Multiply every leaf value by `factor` (see `TrainedBaseLearner::scale_output`).
+    fn scale_leaves(&mut self, factor: f64) {
+        match self {
+            HistTreeNode::Leaf { value } => *value *= factor,
+            HistTreeNode::Split { left, right, .. } => {
+                left.scale_leaves(factor);
+                right.scale_leaves(factor);
+            }
+        }
+    }
+
     /// Predict for a single row using direct array indexing (no allocation)
     #[inline]
     fn predict_row(&self, x: &Array2<f64>, row_idx: usize) -> f64 {
@@ -2115,6 +2221,13 @@ impl TrainedBaseLearner for TrainedHistogramTree {
         let mut pairs = Vec::new();
         self.root.collect_split_importances(&mut pairs);
         importances_from_splits(&pairs, self.n_features)
+    }
+
+    fn scale_output(&mut self, factor: f64) -> bool {
+        self.root.scale_leaves(factor);
+        // Drop the flattened prediction cache; it is rebuilt lazily from `root`.
+        self.flat = std::sync::OnceLock::new();
+        true
     }
 
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
@@ -2455,6 +2568,17 @@ pub enum TreeNode {
 }
 
 impl TreeNode {
+    /// Multiply every leaf value by `factor` (see `TrainedBaseLearner::scale_output`).
+    fn scale_leaves(&mut self, factor: f64) {
+        match self {
+            TreeNode::Leaf { value } => *value *= factor,
+            TreeNode::Split { left, right, .. } => {
+                left.scale_leaves(factor);
+                right.scale_leaves(factor);
+            }
+        }
+    }
+
     /// Predict for a single row using direct array indexing (no allocation)
     #[inline]
     fn predict_row(&self, x: &Array2<f64>, row_idx: usize) -> f64 {
@@ -2622,6 +2746,15 @@ impl TrainedBaseLearner for ArenaDecisionTree {
             .map(|n| (n.feature_index as usize, n.improvement))
             .collect();
         importances_from_splits(&pairs, self.n_features)
+    }
+
+    fn scale_output(&mut self, factor: f64) -> bool {
+        for n in self.nodes.iter_mut() {
+            if n.is_leaf() {
+                n.threshold_or_value *= factor;
+            }
+        }
+        true
     }
 
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
@@ -2873,6 +3006,11 @@ impl TrainedBaseLearner for TrainedDecisionTree {
         let mut pairs = Vec::new();
         self.root.collect_split_importances(&mut pairs);
         importances_from_splits(&pairs, self.n_features)
+    }
+
+    fn scale_output(&mut self, factor: f64) -> bool {
+        self.root.scale_leaves(factor);
+        true
     }
 
     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
@@ -4455,7 +4593,9 @@ mod hist_par_tests {
     fn lcg(seed: u64) -> impl FnMut() -> f64 {
         let mut state = seed;
         move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as f64) / (1u64 << 31) as f64
         }
     }
@@ -4483,7 +4623,12 @@ mod hist_par_tests {
             assert_eq!(a.raw, b.raw, "raw slots differ");
         };
 
-        for (idx, wt) in [(&all, None), (&subset, None), (&all, Some(&w)), (&subset, Some(&w))] {
+        for (idx, wt) in [
+            (&all, None),
+            (&subset, None),
+            (&all, Some(&w)),
+            (&subset, Some(&w)),
+        ] {
             same(
                 &FeatureHists::build_impl(&cache, idx, &y, wt, true),
                 &FeatureHists::build_impl(&cache, idx, &y, wt, false),
@@ -4495,6 +4640,9 @@ mod hist_par_tests {
         }
         // And the branch really was taken for these sizes.
         assert!(hist_par_group_size(p, n * p, false).is_some());
-        assert!(hist_par_group_size(p, 1_000, false).is_none(), "small nodes stay serial");
+        assert!(
+            hist_par_group_size(p, 1_000, false).is_none(),
+            "small nodes stay serial"
+        );
     }
 }

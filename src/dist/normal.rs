@@ -42,6 +42,18 @@ impl Normal {
 }
 
 impl Distribution for Normal {
+    fn location_column() -> Option<usize> {
+        Some(0)
+    }
+
+    fn default_staged_fit() -> bool {
+        true
+    }
+
+    fn scale_param_index() -> Option<usize> {
+        Some(1)
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
         let log_scale = params.column(1).to_owned();
@@ -206,6 +218,36 @@ impl DistributionMethods for Normal {
     }
 }
 
+/// Step guard (research/ngboost Cycle 13, default since 1.2.0): cap on a
+/// row's log-σ natural-gradient step under LogScore, |ñ| = |1 − z²| / m ≤
+/// cap, by raising the metric entry m above its Fisher value 2 only for rows
+/// with |z| > √(2·cap + 1) ≈ 7.1. The uncapped step (z² − 1)/2 overshoots the
+/// row's optimum ln|z| by orders of magnitude on outliers: with
+/// `min_samples_leaf = 1` a single-row leaf drove ln σ to 40 on log-normal
+/// data (test CRPS 4·10¹³). Measured bit-identical on 8/10 benchmark
+/// datasets, better where it engages (worst-seed CRPS 423 → 3; see
+/// `docs/normal_head.md`).
+/// Used by Normal and NormalFixedMean.
+const NORMAL_GUARD_LOG_SIGMA_STEP: f64 = 25.0;
+
+/// `NGBOOST_NORMAL_GUARD=0` disables the guard, `=<cap>` overrides the cap
+/// (research A/B).
+fn normal_guard_cap() -> Option<f64> {
+    static CAP: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("NGBOOST_NORMAL_GUARD") {
+        Ok(v) => v.trim().parse::<f64>().ok().filter(|c| *c > 0.0),
+        Err(_) => Some(NORMAL_GUARD_LOG_SIGMA_STEP),
+    })
+}
+
+#[inline]
+fn guarded_log_sigma_metric(g: f64) -> f64 {
+    match normal_guard_cap() {
+        Some(cap) => (g.abs() / cap).max(2.0),
+        None => 2.0,
+    }
+}
+
 impl Scorable<LogScore> for Normal {
     fn is_diagonal_metric(&self) -> bool {
         true
@@ -240,7 +282,7 @@ impl Scorable<LogScore> for Normal {
                 d_row[0] = err / var;
                 d_row[1] = 1.0 - (err * err) / var;
                 m_row[0] = 1.0 / var;
-                m_row[1] = 2.0;
+                m_row[1] = guarded_log_sigma_metric(d_row[1]);
             });
 
         (d_params, diag)
@@ -307,20 +349,34 @@ impl Scorable<LogScore> for Normal {
     }
 }
 
+/// CRPS metric 2∫∇F(t)∇F(t)ᵀ dt of N(μ, σ) in (μ, log σ): diag(1/(√π σ),
+/// σ/(2√π)) — exactly the expected Hessian of the CRPS. Upstream NGBoost
+/// (and this crate before research Cycle 13) used diag(1/√π, σ²/(2√π)),
+/// σ times too large in both entries, which divides every row's natural
+/// gradient by σ: steps blow up where σ is small and crawl where it is large
+/// (target units matter). `NGBOOST_CRPS_METRIC_LEGACY=1` restores it (A/B).
+/// Shared by Normal, NormalFixedMean and LogNormal (CRPS on ln y).
+pub(crate) fn normal_crps_metric(scale: f64) -> (f64, f64) {
+    const INV_2_SQRT_PI: f64 = 0.28209479177387814;
+    if crate::scores::crps_metric_legacy() {
+        (2.0 * INV_2_SQRT_PI, scale * scale * INV_2_SQRT_PI)
+    } else {
+        (2.0 * INV_2_SQRT_PI / scale, scale * INV_2_SQRT_PI)
+    }
+}
+
 impl Scorable<CRPScore> for Normal {
     fn is_diagonal_metric(&self) -> bool {
         true
     }
 
     fn diagonal_metric(&self) -> Array2<f64> {
-        const INV_2_SQRT_PI: f64 = 0.28209479177387814;
         let n_obs = self.loc.len();
         let mut diag = Array2::zeros((n_obs, 2));
         Zip::from(diag.rows_mut())
             .and(&self.scale)
             .for_each(|mut row, &scale| {
-                row[0] = 2.0 * INV_2_SQRT_PI;
-                row[1] = scale * scale * INV_2_SQRT_PI;
+                (row[0], row[1]) = normal_crps_metric(scale);
             });
         diag
     }
@@ -370,15 +426,13 @@ impl Scorable<CRPScore> for Normal {
 
     fn metric(&self) -> Array3<f64> {
         // CRPS metric for Normal — vectorized, avoids allocating self.var()
-        const INV_2_SQRT_PI: f64 = 0.28209479177387814; // 1/(2*sqrt(pi))
         let n_obs = self.loc.len();
         let mut fi = Array3::zeros((n_obs, 2, 2));
 
         Zip::from(fi.outer_iter_mut())
             .and(&self.scale)
             .for_each(|mut fi_i, &scale| {
-                fi_i[[0, 0]] = 2.0 * INV_2_SQRT_PI;
-                fi_i[[1, 1]] = scale * scale * INV_2_SQRT_PI;
+                (fi_i[[0, 0]], fi_i[[1, 1]]) = normal_crps_metric(scale);
             });
 
         fi
@@ -634,6 +688,10 @@ pub struct NormalFixedMean {
 }
 
 impl Distribution for NormalFixedMean {
+    fn scale_param_index() -> Option<usize> {
+        Some(0)
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         let log_scale = params.column(0).to_owned();
         let scale = crate::vmath::exp_array(&log_scale);
@@ -756,6 +814,12 @@ impl Scorable<LogScore> for NormalFixedMean {
         true
     }
 
+    fn d_score_and_diagonal_metric(&self, y: &Array1<f64>) -> (Array2<f64>, Array2<f64>) {
+        let g = Scorable::<LogScore>::d_score(self, y);
+        let m = g.mapv(guarded_log_sigma_metric);
+        (g, m)
+    }
+
     fn diagonal_metric(&self) -> Array2<f64> {
         let n_obs = self.loc.len();
         Array2::from_elem((n_obs, 1), 2.0)
@@ -807,13 +871,12 @@ impl Scorable<CRPScore> for NormalFixedMean {
     }
 
     fn diagonal_metric(&self) -> Array2<f64> {
-        const INV_2_SQRT_PI: f64 = 0.28209479177387814;
         let n_obs = self.loc.len();
         let mut diag = Array2::zeros((n_obs, 1));
         Zip::from(diag.column_mut(0))
             .and(&self.var)
             .for_each(|d, &var| {
-                *d = var * INV_2_SQRT_PI;
+                *d = normal_crps_metric(var.sqrt()).1;
             });
         diag
     }
@@ -860,14 +923,13 @@ impl Scorable<CRPScore> for NormalFixedMean {
 
     fn metric(&self) -> Array3<f64> {
         // var / (2*sqrt(pi)) for each observation
-        const INV_2_SQRT_PI: f64 = 0.28209479177387814;
         let n_obs = self.loc.len();
         let mut fi = Array3::zeros((n_obs, 1, 1));
 
         Zip::from(fi.outer_iter_mut())
             .and(&self.var)
             .for_each(|mut fi_i, &var| {
-                fi_i[[0, 0]] = var * INV_2_SQRT_PI;
+                fi_i[[0, 0]] = normal_crps_metric(var.sqrt()).1;
             });
 
         fi

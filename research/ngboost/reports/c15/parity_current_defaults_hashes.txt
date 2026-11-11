@@ -1,0 +1,26 @@
+normal log val             iters   56  hash 5b50295d3a8644b3  sum +4.570739983892615e1
+normal log valfrac         iters   39  hash 16506c5e1b01b21a  sum +5.514359074302395e1
+normal log noval           iters  150  hash 9f012ebd05a40a8d  sum -1.014403786518571e2
+normal crps                iters  150  hash 459ffb6adb03236f  sum -1.029004182337529e2
+normal crps val            iters   58  hash 961006ed01b8f5f2  sum -4.703174833437065e1
+normalfixedmean log        iters  100  hash e1cbbcca3e122c85  sum +7.598132462311962e1
+normalfixedvar log val     iters   29  hash 89ea22d23b852552  sum -1.904511920779887e1
+laplace log val            iters   56  hash cc0dac4d65ea3cff  sum -6.889927951479187e1
+laplace crps               iters  150  hash 5bc38c30dd7b4a10  sum -1.391474054082931e2
+studentt log val           iters   62  hash 62c97caaf51945e3  sum +1.444641842649085e2
+studentt crps              iters   60  hash 65b0951733c04be5  sum +1.308801529521209e6
+tfixeddf log val           iters   47  hash 5cdb8733812174c8  sum -8.795789937427944e1
+tfixeddf crps              iters  150  hash 0e4af93e70c8f8cc  sum -1.500410538062156e2
+cauchy log val             iters   52  hash 132356d108d4faf5  sum -1.431105068844941e2
+lognormal log val          iters   48  hash 40464d1dcff6a72d  sum -1.111364340023690e2
+lognormal crps             iters  150  hash 5a09ddffe5dbe593  sum -1.955422326864291e2
+halfnormal crps            iters  150  hash b0e3be4724947021  sum +2.576505725728465e2
+exponential crps           iters  150  hash 77108639f6e7af93  sum +2.281531552214879e2
+gamma log val              iters   73  hash e22ac1924ef2dbe2  sum +1.012391606968664e3
+gamma crps                 iters   60  hash 642840e6748be2d8  sum +7.358463470078586e2
+weibull log val            iters   48  hash 5bff37e9a3582580  sum +5.877117778053876e2
+weibull crps               iters   60  hash a27a85fd58d55d9f  sum +6.054288907849738e2
+poisson log val            iters   48  hash 2f28a13dde7fd79b  sum +1.625506322375699e2
+poisson crps               iters  150  hash eca8881dbf46e6cf  sum +1.614445971924998e2
+bernoulli log val          iters   28  hash b29c16a04b241e85  sum -9.108262658473318e1
+categorical3 log val       iters   40  hash 512245166c1d82ee  sum +1.469923086324829e1

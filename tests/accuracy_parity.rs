@@ -581,17 +581,17 @@ fn tikhonov_reg_rescues_diverging_weibull_crps() {
         ))
     };
 
-    // Unregularized: documents the divergence this guards against. Since the
-    // 2026-07-23 fit-loop gradient guard, the diverging fit fails LOUDLY
-    // with a divergence error instead of silently returning a NaN model. If
-    // this ever starts succeeding with a finite score, revisit the seed.
-    match crps_with_reg(0.0) {
-        Err(e) => assert!(e.contains("diverged"), "unexpected fit error: {e}"),
-        Ok(v) => assert!(
-            !v.is_finite(),
-            "seed 17 unexpectedly converged at reg=0 ({v}); pick a new diverging seed"
-        ),
-    }
+    // Unregularized: seed 17 used to diverge ("training diverged" error).
+    // The cause was the upstream CRPS "metric" E_Y[g gᵀ], whose units make
+    // the natural gradient scale like 1/λ; with the true CRPS metric
+    // 2∫∇F∇Fᵀ dt (research/ngboost Cycle 14) the same fit converges without
+    // regularization. `NGBOOST_CRPS_METRIC_LEGACY=1` still reproduces the
+    // divergence (checked when the metric was replaced).
+    let unregularized = crps_with_reg(0.0).expect("reg=0 must converge with the CRPS metric");
+    assert!(
+        unregularized.is_finite() && unregularized < 0.5,
+        "reg=0 CRPS={unregularized}"
+    );
 
     // Regularized: must converge to a healthy CRPS (healthy seeds sit ~0.35)
     let regularized = crps_with_reg(1e-6).expect("tikhonov_reg=1e-6 fit must succeed");

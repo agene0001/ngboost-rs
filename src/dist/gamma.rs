@@ -448,6 +448,16 @@ impl Scorable<CRPScore> for Gamma {
     }
 
     fn metric(&self) -> Array3<f64> {
+        if !crate::scores::crps_metric_legacy() {
+            return gamma_crps_metric(&self.shape, &self.rate);
+        }
+        self.legacy_crps_metric()
+    }
+}
+
+impl Gamma {
+    /// Pre-1.2 CRPS "metric" E_Y[g gᵀ] (wrong units; `crps_metric_legacy`).
+    fn legacy_crps_metric(&self) -> Array3<f64> {
         // Deterministic quadrature for E[g * gᵀ] over Y ~ Gamma(α, β).
         //
         // No inverse CDF (the previous PIT rule used statrs `inverse_cdf`
@@ -670,7 +680,9 @@ mod tests {
                 Array2::from_shape_vec((1, 2), vec![(shape as f64).ln(), (rate as f64).ln()])
                     .unwrap();
             let d = Gamma::from_params(&params);
-            let fi = Scorable::<CRPScore>::metric(&d);
+            // reference values of the pre-1.2 E_Y[g gᵀ] quadrature (kept as
+            // the legacy metric; the default is tested in tests/test_crps_audit.rs)
+            let fi = d.legacy_crps_metric();
             assert_relative_eq!(fi[[0, 0, 0]], m00, max_relative = 1e-3);
             assert_relative_eq!(fi[[0, 1, 1]], m11, max_relative = 1e-3);
             assert_relative_eq!(fi[[0, 0, 1]], m01, max_relative = 1e-3);
@@ -858,4 +870,49 @@ mod tests {
         // Beta(0.5, 0.5) = pi
         assert_relative_eq!(beta(0.5, 0.5), std::f64::consts::PI, epsilon = 1e-10);
     }
+}
+
+/// CRPS metric 2∫∇F∇Fᵀ dt of Gamma(α, β) in (ln α, ln β). With w = βt
+/// (dt = dw/β) it is K(α)/β: ∂F/∂ln β = w·g_α(w) (g_α the Gamma(α, 1)
+/// density), ∂F/∂ln α = α ∂P(α, w)/∂α (central difference). Midpoint rule
+/// in s = ln w (dw = w ds) over [max(−40, (ln 1e-13 + lnΓ(α+1))/α),
+/// ln(α + 14√α + 40)], 400 nodes; the w-weighting makes the deep left tail
+/// negligible for small α. research/ngboost Cycle 14.
+fn gamma_crps_metric(shape: &Array1<f64>, rate: &Array1<f64>) -> Array3<f64> {
+    use statrs::function::gamma::{gamma_lr, ln_gamma};
+    let n = shape.len();
+    let mut fi = Array3::zeros((n, 2, 2));
+    const N: usize = 400;
+    for i in 0..n {
+        let (a, b) = (shape[i], rate[i]);
+        if !(a > 0.0 && b > 0.0 && a.is_finite() && b.is_finite()) {
+            fi[[i, 0, 0]] = 1.0;
+            fi[[i, 1, 1]] = 1.0;
+            continue;
+        }
+        let lga = ln_gamma(a);
+        let s_lo = ((1e-13f64.ln() + ln_gamma(a + 1.0)) / a).max(-40.0);
+        let s_hi = (a + 14.0 * a.sqrt() + 40.0).ln();
+        let ds = (s_hi - s_lo) / N as f64;
+        let (ap, am) = (a * (1.0 + 1e-5), a * (1.0 - 1e-5));
+        let mut k = [[0.0f64; 2]; 2];
+        for j in 0..N {
+            let s = s_lo + (j as f64 + 0.5) * ds;
+            let w = s.exp();
+            let d_a = (gamma_lr(ap, w) - gamma_lr(am, w)) / 2e-5;
+            let d_b = (a * s - w - lga).exp();
+            let g = [d_a, d_b];
+            for p in 0..2 {
+                for q in 0..2 {
+                    k[p][q] += g[p] * g[q] * w * ds;
+                }
+            }
+        }
+        for p in 0..2 {
+            for q in 0..2 {
+                fi[[i, p, q]] = 2.0 * k[p][q] / b;
+            }
+        }
+    }
+    fi
 }

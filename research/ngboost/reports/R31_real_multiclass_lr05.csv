@@ -1,0 +1,98 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+support_dzclass,0,base,175,0.41,0.55037,0.65517,0.36814,NaN,0.7267,NaN,0.0336,NaN,0.0115,NaN
+support_dzclass,0,fwp0.5,182,0.34,0.50465,0.62948,0.35643,NaN,0.7492,NaN,0.0224,NaN,0.0087,NaN
+support_dzclass,0,fwp1,259,0.47,0.49814,0.63080,0.35486,NaN,0.7475,NaN,0.0108,NaN,0.0283,NaN
+support_dzclass,0,fwp1+icpt,301,0.56,0.47093,0.61382,0.34878,NaN,0.7470,NaN,0.0143,NaN,0.0124,NaN
+support_dzclass,1,base,117,0.34,0.56504,0.65797,0.36343,NaN,0.7459,NaN,0.0111,NaN,0.0284,NaN
+support_dzclass,1,fwp0.5,143,0.29,0.51206,0.62532,0.34928,NaN,0.7525,NaN,0.0127,NaN,0.0119,NaN
+support_dzclass,1,fwp1,125,0.25,0.52374,0.61793,0.34412,NaN,0.7580,NaN,0.0275,NaN,0.0101,NaN
+support_dzclass,1,fwp1+icpt,162,0.39,0.49774,0.61167,0.34151,NaN,0.7547,NaN,0.0244,NaN,0.0072,NaN
+support_dzclass,2,base,132,0.28,0.56221,0.63067,0.34781,NaN,0.7514,NaN,0.0074,NaN,0.0111,NaN
+support_dzclass,2,fwp0.5,193,0.38,0.49916,0.60362,0.33405,NaN,0.7673,NaN,0.0154,NaN,0.0059,NaN
+support_dzclass,2,fwp1,211,0.53,0.49366,0.59688,0.33393,NaN,0.7711,NaN,0.0325,NaN,0.0246,NaN
+support_dzclass,2,fwp1+icpt,287,0.56,0.46430,0.58861,0.32830,NaN,0.7722,NaN,0.0210,NaN,0.0084,NaN
+support_dzclass,3,base,82,0.21,0.57078,0.63380,0.35033,NaN,0.7536,NaN,0.0168,NaN,0.0238,NaN
+support_dzclass,3,fwp0.5,106,0.25,0.53249,0.61533,0.34279,NaN,0.7629,NaN,0.0166,NaN,0.0100,NaN
+support_dzclass,3,fwp1,206,0.37,0.50042,0.60056,0.33854,NaN,0.7645,NaN,0.0238,NaN,0.0127,NaN
+support_dzclass,3,fwp1+icpt,278,0.62,0.47478,0.59198,0.33320,NaN,0.7733,NaN,0.0315,NaN,0.0080,NaN
+support_dzclass,4,base,116,0.20,0.56606,0.65002,0.36776,NaN,0.7377,NaN,0.0252,NaN,0.0219,NaN
+support_dzclass,4,fwp0.5,128,0.26,0.53231,0.63318,0.35926,NaN,0.7475,NaN,0.0287,NaN,0.0078,NaN
+support_dzclass,4,fwp1,185,0.40,0.51890,0.63748,0.35708,NaN,0.7470,NaN,0.0206,NaN,0.0141,NaN
+support_dzclass,4,fwp1+icpt,162,0.36,0.51125,0.62546,0.35512,NaN,0.7475,NaN,0.0173,NaN,0.0046,NaN
+support_dzclass,5,base,134,0.21,0.55168,0.63015,0.34829,NaN,0.7519,NaN,0.0141,NaN,0.0194,NaN
+support_dzclass,5,fwp0.5,129,0.40,0.52672,0.61705,0.34252,NaN,0.7563,NaN,0.0221,NaN,0.0141,NaN
+support_dzclass,5,fwp1,137,0.27,0.52698,0.61607,0.34206,NaN,0.7591,NaN,0.0340,NaN,0.0179,NaN
+support_dzclass,5,fwp1+icpt,161,0.35,0.50992,0.60518,0.33724,NaN,0.7634,NaN,0.0274,NaN,0.0079,NaN
+support_dzclass,6,base,204,0.44,0.54964,0.64493,0.35420,NaN,0.7464,NaN,0.0218,NaN,0.0236,NaN
+support_dzclass,6,fwp0.5,293,0.49,0.48265,0.62529,0.34830,NaN,0.7492,NaN,0.0305,NaN,0.0114,NaN
+support_dzclass,6,fwp1,245,0.66,0.49751,0.62105,0.34943,NaN,0.7475,NaN,0.0112,NaN,0.0132,NaN
+support_dzclass,6,fwp1+icpt,394,0.80,0.46096,0.61122,0.34443,NaN,0.7530,NaN,0.0199,NaN,0.0098,NaN
+support_dzclass,7,base,84,0.16,0.57528,0.65895,0.36898,NaN,0.7360,NaN,0.0067,NaN,0.0255,NaN
+support_dzclass,7,fwp0.5,141,0.31,0.52252,0.63881,0.35859,NaN,0.7492,NaN,0.0195,NaN,0.0134,NaN
+support_dzclass,7,fwp1,264,0.63,0.49253,0.64307,0.35255,NaN,0.7547,NaN,0.0069,NaN,0.0170,NaN
+support_dzclass,7,fwp1+icpt,300,0.63,0.47577,0.62842,0.34835,NaN,0.7541,NaN,0.0153,NaN,0.0158,NaN
+support_dzclass,8,base,65,0.14,0.59274,0.65034,0.36270,NaN,0.7503,NaN,0.0287,NaN,0.0133,NaN
+support_dzclass,8,fwp0.5,121,0.24,0.52946,0.62927,0.35253,NaN,0.7530,NaN,0.0124,NaN,0.0106,NaN
+support_dzclass,8,fwp1,206,0.36,0.51164,0.63246,0.35103,NaN,0.7580,NaN,0.0245,NaN,0.0217,NaN
+support_dzclass,8,fwp1+icpt,297,0.61,0.47874,0.62145,0.34808,NaN,0.7602,NaN,0.0145,NaN,0.0112,NaN
+support_dzclass,9,base,106,0.18,0.56082,0.63832,0.36226,NaN,0.7442,NaN,0.0166,NaN,0.0256,NaN
+support_dzclass,9,fwp0.5,167,0.31,0.50454,0.62666,0.35598,NaN,0.7497,NaN,0.0206,NaN,0.0097,NaN
+support_dzclass,9,fwp1,202,0.44,0.49927,0.63537,0.35735,NaN,0.7453,NaN,0.0156,NaN,0.0142,NaN
+support_dzclass,9,fwp1+icpt,312,0.59,0.46510,0.63467,0.35747,NaN,0.7475,NaN,0.0206,NaN,0.0094,NaN
+flchain_cause,0,base,30,0.02,1.19657,1.28142,0.69836,NaN,0.4046,NaN,0.0103,NaN,0.0469,NaN
+flchain_cause,0,fwp0.5,31,0.03,1.19149,1.28449,0.69969,NaN,0.3931,NaN,0.0168,NaN,0.0442,NaN
+flchain_cause,0,fwp1,30,0.03,1.19260,1.28707,0.70084,NaN,0.3954,NaN,0.0099,NaN,0.0426,NaN
+flchain_cause,0,fwp1+icpt,26,0.04,1.20319,1.28935,0.70235,NaN,0.3839,NaN,0.0194,NaN,0.0468,NaN
+flchain_cause,1,base,17,0.02,1.21124,1.32897,0.72108,NaN,0.3747,NaN,0.0509,NaN,0.0334,NaN
+flchain_cause,1,fwp0.5,22,0.03,1.19333,1.32863,0.72277,NaN,0.3701,NaN,0.0402,NaN,0.0348,NaN
+flchain_cause,1,fwp1,19,0.02,1.20213,1.32722,0.72102,NaN,0.3609,NaN,0.0446,NaN,0.0369,NaN
+flchain_cause,1,fwp1+icpt,16,0.03,1.21140,1.32594,0.72055,NaN,0.3517,NaN,0.0353,NaN,0.0346,NaN
+flchain_cause,2,base,10,0.02,1.23437,1.32804,0.72026,NaN,0.3609,NaN,0.0050,NaN,0.0241,NaN
+flchain_cause,2,fwp0.5,10,0.02,1.22733,1.32791,0.71998,NaN,0.3609,NaN,0.0074,NaN,0.0231,NaN
+flchain_cause,2,fwp1,15,0.02,1.21485,1.32546,0.71892,NaN,0.3678,NaN,0.0156,NaN,0.0209,NaN
+flchain_cause,2,fwp1+icpt,10,0.02,1.23454,1.32466,0.71920,NaN,0.3517,NaN,0.0100,NaN,0.0231,NaN
+flchain_cause,3,base,76,0.04,1.14064,1.31124,0.70429,NaN,0.3816,NaN,0.0478,NaN,0.0440,NaN
+flchain_cause,3,fwp0.5,34,0.03,1.17378,1.29523,0.70508,NaN,0.3977,NaN,0.0319,NaN,0.0341,NaN
+flchain_cause,3,fwp1,33,0.03,1.17666,1.29330,0.70502,NaN,0.3908,NaN,0.0222,NaN,0.0286,NaN
+flchain_cause,3,fwp1+icpt,30,0.03,1.17765,1.29275,0.70472,NaN,0.3885,NaN,0.0333,NaN,0.0343,NaN
+flchain_cause,4,base,10,0.02,1.24016,1.30913,0.71365,NaN,0.3586,NaN,0.0146,NaN,0.0495,NaN
+flchain_cause,4,fwp0.5,10,0.02,1.24682,1.31120,0.71462,NaN,0.3448,NaN,0.0201,NaN,0.0481,NaN
+flchain_cause,4,fwp1,11,0.02,1.24490,1.31428,0.71574,NaN,0.3471,NaN,0.0219,NaN,0.0482,NaN
+flchain_cause,4,fwp1+icpt,21,0.03,1.19862,1.30749,0.71201,NaN,0.3586,NaN,0.0408,NaN,0.0492,NaN
+flchain_cause,5,base,30,0.03,1.21691,1.25089,0.68086,NaN,0.4276,NaN,0.0446,NaN,0.0580,NaN
+flchain_cause,5,fwp0.5,18,0.02,1.24042,1.25987,0.68575,NaN,0.4253,NaN,0.0616,NaN,0.0587,NaN
+flchain_cause,5,fwp1,19,0.02,1.24010,1.25878,0.68531,NaN,0.4069,NaN,0.0482,NaN,0.0602,NaN
+flchain_cause,5,fwp1+icpt,18,0.03,1.23952,1.25949,0.68578,NaN,0.4161,NaN,0.0520,NaN,0.0574,NaN
+flchain_cause,6,base,19,0.02,1.22865,1.27292,0.69231,NaN,0.4253,NaN,0.0608,NaN,0.0303,NaN
+flchain_cause,6,fwp0.5,27,0.03,1.19042,1.26594,0.69035,NaN,0.4345,NaN,0.0532,NaN,0.0309,NaN
+flchain_cause,6,fwp1,40,0.03,1.17035,1.26204,0.68789,NaN,0.4368,NaN,0.0586,NaN,0.0364,NaN
+flchain_cause,6,fwp1+icpt,35,0.03,1.17880,1.25891,0.68684,NaN,0.4437,NaN,0.0700,NaN,0.0298,NaN
+flchain_cause,7,base,12,0.02,1.24518,1.29333,0.70504,NaN,0.3839,NaN,0.0411,NaN,0.0369,NaN
+flchain_cause,7,fwp0.5,10,0.02,1.24753,1.29326,0.70488,NaN,0.3908,NaN,0.0436,NaN,0.0366,NaN
+flchain_cause,7,fwp1,9,0.02,1.25151,1.29476,0.70579,NaN,0.3931,NaN,0.0419,NaN,0.0362,NaN
+flchain_cause,7,fwp1+icpt,9,0.02,1.25150,1.29485,0.70583,NaN,0.3931,NaN,0.0407,NaN,0.0361,NaN
+flchain_cause,8,base,7,0.02,1.26511,1.30239,0.71100,NaN,0.3517,NaN,0.0049,NaN,0.0295,NaN
+flchain_cause,8,fwp0.5,11,0.02,1.24910,1.29808,0.70857,NaN,0.3609,NaN,0.0155,NaN,0.0282,NaN
+flchain_cause,8,fwp1,11,0.02,1.25605,1.29778,0.70869,NaN,0.3494,NaN,0.0092,NaN,0.0283,NaN
+flchain_cause,8,fwp1+icpt,11,0.02,1.25605,1.29791,0.70878,NaN,0.3448,NaN,0.0144,NaN,0.0293,NaN
+flchain_cause,9,base,11,0.01,1.23100,1.29906,0.70864,NaN,0.3540,NaN,0.0329,NaN,0.0090,NaN
+flchain_cause,9,fwp0.5,10,0.05,1.25164,1.30291,0.71075,NaN,0.3540,NaN,0.0113,NaN,0.0083,NaN
+flchain_cause,9,fwp1,11,0.04,1.23857,1.29897,0.70841,NaN,0.3586,NaN,0.0098,NaN,0.0073,NaN
+flchain_cause,9,fwp1+icpt,12,0.04,1.23024,1.29617,0.70749,NaN,0.3609,NaN,0.0217,NaN,0.0084,NaN
+
+# SUMMARY (mean ± sd over 10 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# support_dzclass base           122   0.6450±0.0111    0.3594±0.0084       NaN±NaN       0.744     NaN   0.018   0.020     NaN
+# support_dzclass fwp0.5         160   0.6244±0.0101    0.3500±0.0082       NaN±NaN       0.754     NaN   0.020   0.010     NaN
+# support_dzclass fwp1           204   0.6232±0.0156    0.3481±0.0081       NaN±NaN       0.755     NaN   0.021   0.017     NaN
+# support_dzclass fwp1+icpt      265   0.6132±0.0150    0.3443±0.0093       NaN±NaN       0.757     NaN   0.021   0.009     NaN
+#   Δ(fwp0.5 − base): NLL -0.0206 (se 0.0020, wins 10/10) | CRPS -0.0094 (se 0.0010) | RMSE NaN (se NaN)
+#   Δ(fwp1 − base): NLL -0.0219 (se 0.0036, wins 10/10) | CRPS -0.0113 (se 0.0015) | RMSE NaN (se NaN)
+#   Δ(fwp1+icpt − base): NLL -0.0318 (se 0.0040, wins 10/10) | CRPS -0.0151 (se 0.0018) | RMSE NaN (se NaN)
+# flchain_cause base            22   1.2977±0.0243    0.7055±0.0125       NaN±NaN       0.382     NaN   0.031   0.036     NaN
+# flchain_cause fwp0.5          18   1.2968±0.0229    0.7062±0.0119       NaN±NaN       0.383     NaN   0.030   0.035     NaN
+# flchain_cause fwp1            20   1.2960±0.0231    0.7058±0.0119       NaN±NaN       0.381     NaN   0.028   0.035     NaN
+# flchain_cause fwp1+icpt       19   1.2948±0.0226    0.7054±0.0116       NaN±NaN       0.379     NaN   0.034   0.035     NaN
+#   Δ(fwp0.5 − base): NLL -0.0010 (se 0.0022, wins 6/10) | CRPS +0.0007 (se 0.0007) | RMSE NaN (se NaN)
+#   Δ(fwp1 − base): NLL -0.0018 (se 0.0025, wins 6/10) | CRPS +0.0002 (se 0.0008) | RMSE NaN (se NaN)
+#   Δ(fwp1+icpt − base): NLL -0.0030 (se 0.0027, wins 7/10) | CRPS -0.0002 (se 0.0009) | RMSE NaN (se NaN)

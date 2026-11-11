@@ -1,0 +1,3 @@
+guard=true seed 0: 1129 rounds | test NLL 2.1671 | rows with a component σ > 100: train 0 / 32010, test 0 / 9146 | test σ max 6.928e0
+guard=true seed 1: 774 rounds | test NLL 2.1861 | rows with a component σ > 100: train 0 / 32010, test 0 / 9146 | test σ max 8.763e0
+guard=true seed 2: 761 rounds | test NLL 2.2120 | rows with a component σ > 100: train 0 / 32010, test 0 / 9146 | test σ max 8.602e0

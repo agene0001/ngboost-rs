@@ -1,0 +1,46 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,0,auto,70,82.17,-0.01322,0.01421,0.13869,0.24480,0.4991,0.9225,0.8993,0.2700,0.0059,NaN
+kin8nm,1,auto,351,271.98,0.04000,0.07412,0.14848,0.25982,0.4674,0.9268,0.9286,0.2791,0.0460,NaN
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,2,auto,1520,1243.64,-0.06491,-0.02247,0.13437,0.23640,0.4759,0.9128,0.9343,0.2510,-0.0434,NaN
+kin8nm,3,auto,140,118.65,-0.01194,-0.02047,0.13369,0.23516,0.5101,0.9445,0.8734,0.2679,-0.0038,NaN
+
+# SUMMARY (mean ± sd over 2 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto           830  -0.0215±0.0014    0.1340±0.0005    0.2358±0.0009    0.493   0.929   0.904  -0.024     NaN
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,4,auto,172,180.18,0.00840,0.02807,0.14037,0.24744,0.4905,0.9311,0.9083,0.2714,0.0279,NaN
+
+# SUMMARY (mean ± sd over 1 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto           172   0.0281±0.0000    0.1404±0.0000    0.2474±0.0000    0.491   0.931   0.908   0.028     NaN
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,5,auto,25,66.92,-0.00223,-0.00566,0.13623,0.23924,0.4979,0.9378,0.8741,0.2723,0.0094,NaN
+
+# SUMMARY (mean ± sd over 1 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto            25  -0.0057±0.0000    0.1362±0.0000    0.2392±0.0000    0.498   0.938   0.874   0.009     NaN
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,6,auto,28,69.56,0.00412,0.01875,0.13987,0.24695,0.4905,0.9268,0.8961,0.2739,0.0255,NaN
+
+# SUMMARY (mean ± sd over 1 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto            28   0.0187±0.0000    0.1399±0.0000    0.2470±0.0000    0.491   0.927   0.896   0.025     NaN
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,7,auto,32,73.01,0.01358,0.04952,0.14364,0.25288,0.4704,0.9152,0.9266,0.2720,-0.0098,NaN
+
+# SUMMARY (mean ± sd over 1 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto            32   0.0495±0.0000    0.1436±0.0000    0.2529±0.0000    0.470   0.915   0.927  -0.010     NaN
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,8,auto,86,117.97,-0.06135,-0.01545,0.13480,0.23706,0.4692,0.9237,0.9270,0.2537,-0.0489,NaN
+
+# SUMMARY (mean ± sd over 1 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto            86  -0.0154±0.0000    0.1348±0.0000    0.2371±0.0000    0.469   0.924   0.927  -0.049     NaN
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+kin8nm,9,auto,13,50.78,0.09538,0.07848,0.14770,0.25809,0.4869,0.9213,0.9027,0.2858,0.1199,NaN
+
+# SUMMARY (mean ± sd over 1 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# kin8nm   auto            13   0.0785±0.0000    0.1477±0.0000    0.2581±0.0000    0.487   0.921   0.903   0.120     NaN

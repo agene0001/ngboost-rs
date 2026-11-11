@@ -3,10 +3,13 @@ pub mod cauchy;
 pub mod exponential;
 pub mod gamma;
 pub mod halfnormal;
+pub mod hurdle;
 pub mod laplace;
 pub mod lognormal;
 pub mod multivariate_normal;
+pub mod negative_binomial;
 pub mod normal;
+pub mod normal_mixture;
 pub mod poisson;
 pub mod studentt;
 pub mod weibull;
@@ -19,12 +22,15 @@ pub use cauchy::{Cauchy, CauchyFixedVar};
 pub use exponential::Exponential;
 pub use gamma::Gamma;
 pub use halfnormal::HalfNormal;
+pub use hurdle::{Hurdle, HurdleCrpsPart, HurdleLogNormal, HurdleNormal};
 pub use laplace::Laplace;
 pub use lognormal::LogNormal;
 pub use multivariate_normal::{
     MultivariateNormal, MultivariateNormal2, MultivariateNormal3, MultivariateNormal4,
 };
+pub use negative_binomial::NegativeBinomial;
 pub use normal::{Normal, NormalFixedMean, NormalFixedVar};
+pub use normal_mixture::{NormalMixture, NormalMixture2, NormalMixture3};
 pub use poisson::Poisson;
 pub use studentt::{StudentT, TFixedDf, TFixedDfFixedVar};
 pub use weibull::Weibull;
@@ -54,6 +60,69 @@ pub trait Distribution: Sized + Clone + Debug {
 
     /// Returns the number of parameters for this distribution.
     fn n_params(&self) -> usize;
+
+    /// Index of the internal parameter column that is a **log-scale** — an
+    /// affine map on it rescales the predictive spread without moving the
+    /// location — or `None`. Drives the default post-hoc scale recalibration
+    /// at the end of `NGBoost::fit` (`NGBoost::auto_calibrate_scale`). Only
+    /// loc/scale families return `Some`: Normal, Laplace, LogNormal, Cauchy,
+    /// StudentT, TFixedDf (column 1) and NormalFixedMean (column 0).
+    fn scale_param_index() -> Option<usize> {
+        None
+    }
+
+    /// All log-scale columns, recalibrated jointly with one shared (a, b) by
+    /// the default end-of-fit recalibration. Defaults to
+    /// [`Self::scale_param_index`]; `NormalMixture2` returns both component
+    /// scales.
+    fn scale_param_columns() -> Vec<usize> {
+        Self::scale_param_index().into_iter().collect()
+    }
+
+    /// Fewest validation rows for the default end-of-fit recalibration to
+    /// run at all (from this many it fits the shift; from 300 also the
+    /// slope). 40 for the loc/scale heads (R9 sweep); NegativeBinomial
+    /// returns 300 because a shared dispersion shift fitted on 100 rows was
+    /// a coin flip where r is weakly identified (research Cycle 16, R63).
+    fn auto_calibration_min_rows() -> usize {
+        40
+    }
+
+    /// Default exponent β for Fisher-weighted base-learner fits when the model
+    /// does not set `fisher_weight_power` / `fisher_weighted_learner`
+    /// (`None` = upstream unweighted fit). Poisson, NegativeBinomial and
+    /// Categorical (incl. Bernoulli) return `Some(1.0)` (since 1.2.0): its unweighted natural-gradient leaf, mean(1 − y/λ), is
+    /// a mean of ratios that under-predicts totals when rates are
+    /// heterogeneous, while the weight-λ leaf Σ(λ−y)/Σλ is the Newton step
+    /// (identical to XGBoost's `count:poisson` second-order trees); measured
+    /// never worse and up to −0.10 NLL / −7.5 % RMSE (`docs/fisher_weight_power.md`).
+    /// Override per model with `fisher_weight_power = Some(0.0)`.
+    fn default_fisher_weight_power() -> Option<f64> {
+        None
+    }
+
+    /// Index of the **location** column for the staged fit
+    /// (`NGBoost::fit_staged`): location first, then the remaining columns,
+    /// then the location again weighted by its Fisher entry (feasible GLS),
+    /// then the rest. `None` = no staged fit. Normal, Laplace, LogNormal,
+    /// StudentT, TFixedDf and Cauchy return `Some(0)`.
+    fn location_column() -> Option<usize> {
+        None
+    }
+
+    /// Whether `fit_with_validation` uses the staged fit by default (LogScore,
+    /// early stopping and validation data present). True for Normal,
+    /// LogNormal and StudentT (since 1.2.0; research/ngboost Cycles 13–14;
+    /// Laplace was mixed and stays joint).
+    fn default_staged_fit() -> bool {
+        false
+    }
+
+    /// Default for `NGBoost::refit_intercept` (per-round unshrunk intercept
+    /// step) when the model leaves it `None`. True only for Categorical K > 2.
+    fn default_refit_intercept() -> bool {
+        false
+    }
 
     /// Returns a point prediction.
     fn predict(&self) -> Array1<f64>;

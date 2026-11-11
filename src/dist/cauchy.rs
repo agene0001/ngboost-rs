@@ -25,6 +25,14 @@ pub struct Cauchy {
 const CAUCHY_DF: f64 = 1.0;
 
 impl Distribution for Cauchy {
+    fn location_column() -> Option<usize> {
+        Some(0)
+    }
+
+    fn scale_param_index() -> Option<usize> {
+        Some(1)
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
         let scale = crate::vmath::exp_column(&params.column(1));
