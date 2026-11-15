@@ -1,0 +1,26 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+cat3_nl,0,base,154,0.18,0.78788,0.87799,0.52174,NaN,0.5883,NaN,0.0177,NaN,0.0252,NaN
+cat3_nl,1,base,161,0.15,0.80507,0.91521,0.54813,NaN,0.5700,NaN,0.0224,NaN,0.0095,NaN
+cat3_nl,2,base,174,0.16,0.82039,0.90717,0.54079,NaN,0.5633,NaN,0.0295,NaN,0.0049,NaN
+cat3_nl,3,base,71,0.09,0.84450,0.91085,0.54145,NaN,0.5875,NaN,0.0404,NaN,0.0084,NaN
+cat3_nl,4,base,167,0.15,0.77238,0.88117,0.52511,NaN,0.5875,NaN,0.0278,NaN,0.0236,NaN
+cat3_nl,5,base,116,0.12,0.82502,0.95238,0.56861,NaN,0.5383,NaN,0.0401,NaN,0.0273,NaN
+cat3_nl,6,base,232,0.21,0.74825,0.89305,0.52830,NaN,0.5842,NaN,0.0315,NaN,0.0176,NaN
+cat3_nl,7,base,157,0.15,0.81213,0.92615,0.55533,NaN,0.5542,NaN,0.0180,NaN,0.0155,NaN
+cat3_nl,8,base,81,0.10,0.82559,0.92729,0.55719,NaN,0.5442,NaN,0.0445,NaN,0.0277,NaN
+cat3_nl,9,base,221,0.19,0.76588,0.89917,0.53341,NaN,0.5892,NaN,0.0247,NaN,0.0288,NaN
+cat3_imb,0,base,30,0.05,0.60265,0.64868,0.34966,NaN,0.7892,NaN,0.0134,NaN,0.0091,NaN
+cat3_imb,1,base,23,0.05,0.62323,0.63867,0.34027,NaN,0.7983,NaN,0.0121,NaN,0.0155,NaN
+cat3_imb,2,base,3,0.04,0.62979,0.63289,0.33771,NaN,0.7992,NaN,0.0306,NaN,0.0086,NaN
+cat3_imb,3,base,16,0.05,0.60739,0.62611,0.33471,NaN,0.8000,NaN,0.0193,NaN,0.0041,NaN
+cat3_imb,4,base,61,0.07,0.58789,0.63299,0.33780,NaN,0.8008,NaN,0.0211,NaN,0.0081,NaN
+cat3_imb,5,base,27,0.05,0.58812,0.60167,0.31717,NaN,0.8133,NaN,0.0081,NaN,0.0054,NaN
+cat3_imb,6,base,12,0.04,0.61995,0.65752,0.35495,NaN,0.7842,NaN,0.0369,NaN,0.0133,NaN
+cat3_imb,7,base,35,0.11,0.59681,0.64381,0.34515,NaN,0.7933,NaN,0.0158,NaN,0.0059,NaN
+cat3_imb,8,base,20,0.07,0.59759,0.63867,0.34084,NaN,0.7975,NaN,0.0097,NaN,0.0103,NaN
+cat3_imb,9,base,31,0.05,0.56046,0.63757,0.34333,NaN,0.7942,NaN,0.0227,NaN,0.0216,NaN
+
+# SUMMARY (mean ± sd over 10 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# cat3_nl  base           153   0.9090±0.0227    0.5420±0.0153       NaN±NaN       0.571     NaN   0.030   0.019     NaN
+# cat3_imb base            26   0.6359±0.0149    0.3402±0.0101       NaN±NaN       0.797     NaN   0.019   0.010     NaN

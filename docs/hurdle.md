@@ -42,6 +42,12 @@ let d = m.pred_dist(&x_test);
   - cdf = (1 − π)F_D(y) + π·1{y ≥ 0};
   - ppf is the generalised inverse (quantiles inside the atom's band are 0);
   - mean = (1 − π)E_D[Y].
+  - `model.predict(x)` is that mean for `HurdleNormal`. For
+    `HurdleLogNormal` (since 1.3.0) it is (1 − π)·E_D[min(Y, c)] with c the
+    largest target seen in training (`model.target_max`): the log-normal
+    mean is exponential in σ², and a few rows fitted with a large σ gave
+    means twenty times the largest target. `pred_dist(x).mean()` is still
+    the plain mean.
 - **Recalibration:** the default scale recalibration acts on D's scale
   columns.
 

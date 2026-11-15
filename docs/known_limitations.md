@@ -241,7 +241,8 @@ evidence. Numbers are held-out test values; runs are in
     astronomically large (> 10³), while NLL stays finite. This happened in
     15 of 80 joint fits and 1 of 80 staged fits (R54c+e). There is no ν
     floor. A floor at ν > 1 (or > 2 for a finite variance) would be cheap;
-    it was not measured.
+    it was not measured. *(Cycle 18: measured; `StudentTFiniteVar` (ν > 2.1)
+    is the bounded head, see 59. `StudentT` itself is unchanged.)*
 48. **CRPS-trained heads are overconfident relative to LogScore** where
     the shape is misspecified: with the fixed metric a CRPS Weibull wins
     CRPS on every seed (30/30) but loses NLL (median +0.07…+0.10, 5/30
@@ -304,13 +305,277 @@ evidence. Numbers are held-out test values; runs are in
     3/5 (R65–R66). The default (`staged_fit = None`) therefore stages only
     when the recalibration runs (`auto_calibrate_scale`, ≥ 40 validation
     rows). `staged_fit = Some(true)` with the calibration off reproduces the
-    hazard.
+    hazard. *(Cycle 18: the cause is the in-sample location residuals;
+    `staged_crossfit_folds` removes it, opt-in, see 58.)*
 56. **`CountModel::fit_auto` tests predictive, not structural,
     over-dispersion.** λ̂ is out of sample, so estimation error alone can
     push z over 1.645 on true-Poisson data with hard-to-estimate rates
     (switched on 6–9/10 seeds there). NB won on those, by −0.006 and
     −0.014. It needs explicit validation rows; it costs a second fit only
     when it switches.
+
+## Cycle 18 (1.3.0: leaf size, cross-fitting, new heads, search space)
+
+57. **The `min_samples_leaf = 20` default of `HistogramLearner` is a
+    large-leaf prior that small data cannot afford.** At 210 training rows
+    it still won on all six datasets (−0.012…−0.12 NLL). At about 100
+    training rows it was a wash on NLL (mean −0.015; +0.05…+0.07 on two
+    datasets, n.s.) and lost RMSE on one (het_b +0.29, 3.9 se), where leaf
+    5–10 was better — hence the adaptive rule of item 62. It was measured
+    on unweighted fits at depth 3 only: not with sample weights and not on
+    the survival wrappers, which inherit it through
+    `default_base_learner()`. On the
+    multiclass, hurdle and mixture heads the effect is small (−0.011…+0.001
+    NLL in 12 cases, none significantly worse). The gain comes from the
+    location trees; a separate leaf size per parameter is not exposed.
+58. **Cross-fitted staged residuals (`staged_crossfit_folds`) lose on a
+    heavy-tailed target on small data.** Protein, Normal head: +0.07 NLL
+    (4/10 seeds) at 490 training rows, +0.09 with 30 validation rows,
+    against wins on the other five datasets in both settings. With leaf 1
+    the 490-row loss was +0.23, so part of it was small scale leaves; the
+    rest sits in four seeds whose validation NLL improved while test NLL
+    worsened — a sharper σ selected on 70 validation rows and punished by
+    tail rows. Checked row by row (Cycle 20): 5 of 1410 test rows carry the
+    whole +0.069 — targets in the far mode of protein's two-humped
+    distribution (14–21 where the fit predicts 2–6), which the sharper
+    cross-fitted σ puts at |z| 5–10 under a Gaussian tail. The median row
+    is 0.010 *better*. With `StudentTFiniteVar` the loss is gone (+0.004,
+    se 0.019) and the default fit is 0.04 better than Normal's: on a
+    small sample with a second mode or heavy tails, change the head
+    before turning on cross-fitting. Opt-in for that reason.
+    **LogNormal means exploded under cross-fitting until the scale
+    ceiling of item 63.** On kin8nm (a bounded target; its logarithm has a
+    heavy lower tail) NLL improved by 0.12 on 10/10 seeds while the
+    predictive mean exp(μ + σ²/2) blew up (RMSE above 0.2 on 9 of 10
+    seeds, up to 10²⁵; CRPS likewise on some): the honest log-scale
+    residuals contain a few very large values, the additive scale trees
+    isolate those rows and fit σ ≈ |r|, and the mean is exponential in σ².
+    The default staged LogNormal fit showed the same effect mildly (RMSE
+    0.30–0.57 against 0.15 on 4 of 10 seeds). With the ceiling: −0.124 NLL
+    and RMSE 0.142 on kin8nm; true log-normal data, a gamma target and a
+    real cost target −0.018, −0.005 and −0.007, means unaffected.
+    GammaMean: −0.005…−0.084 NLL on three datasets, means unaffected.
+    StudentTFiniteVar: −0.048, −0.037, −0.040 NLL on het_a, tnoise, kin8nm
+    (9–10 of 10 seeds), −0.008 (se 0.012) on protein; RMSE unchanged or
+    better (protein −0.05), 90 % coverage 0.93 → 0.90 on the two synthetic
+    sets where the default was too wide.
+    Folds are random or, with `ValidationSplit::Chronological`, contiguous
+    blocks; on autocorrelated series neither is leak-free for the location,
+    though only the residuals fed to the scale stage are affected.
+59. **`StudentTFiniteVar` bounds ν below, not the tails above.** ν > 2.1
+    keeps the variance finite (≤ 21 σ²) and removed every undefined-mean /
+    infinite-variance row in 80 staged fits at no NLL cost on average
+    (−0.001; worst dataset, protein, +0.019). That average is not sharper
+    than ±0.01: an arithmetically equivalent implementation (the chain
+    factor computed as e/(2.1 + e) instead of (ν − 2.1)/ν) changed
+    individual fits by up to 0.17 NLL and gave +0.010 on average, +0.065
+    on protein (`reports/O3_fvulp_*.csv`). The shipped code is the variant
+    that was measured first and reproduces those 80 fits digit for digit.
+    Data whose best t fit really has ν < 2.1 is fitted slightly worse than
+    by `StudentT`. A bound of exactly
+    1 or 2 does not work: it is attained in floating point. The bound is a
+    constant of the type, not a model option.
+60. **`GammaMean` was compared with `Gamma`, not with LogNormal or a
+    tuned alternative,** on six datasets (three true-Gamma synthetic). Its
+    staged default needs ≥ 300 validation rows (the shape recalibration);
+    below that it is a joint fit, which beat `Gamma` on five of six
+    datasets (+0.014 on the sixth). The existing `Gamma` head showed
+    single-seed mean blow-ups (RMSE 114 against a median 2.9); that defect
+    is still there and has no regression test. CRPS training of `GammaMean`
+    reuses `Gamma`'s finite-difference CRPS gradient and is tested for
+    correctness only, not benchmarked.
+61. **The `hyper_opt` default search space was derived on one head**
+    (and checked end to end on three more, item 65).
+    Normal, LogScore, six datasets of at most 12 000 rows, trials scored on
+    a single 10 % holdout rather than the 5-fold default. The
+    learning-rate-scaled fold patience makes searches at learning rates
+    below 0.05 slower (up to 4× the patience window per fold). TPE itself
+    is unchanged: it beat random search by 0.02–0.05 NLL at 40 trials, a
+    random startup phase made no reliable difference, and scoring trials on
+    the early-stopping fold selected as well as an untouched fold.
+
+## Cycle 19 (1.3.0: adaptive leaf, exact learners, LogNormal ceiling, tuner end to end)
+
+62. **The adaptive leaf rule helps one kind of small dataset.** A tree
+    fitted on n < 200 rows uses a leaf of n/10 instead of 20. Against a
+    fixed 20 (Normal head, six datasets × 20 seeds): pooled RMSE −5.0 %
+    at 70 training rows, −1.7 % at 105, −1.2 % at 140, NLL lower on 207 of
+    360 fits. Most of it is one dataset whose mean depends strongly on one
+    feature (−4…−25 % RMSE); the other five are within noise both ways
+    (largest adverse: +2.3 % RMSE, 1.4 se). On the ten seeds that had not
+    been used to propose the rule, the NLL gain at 105 rows was not
+    reproduced (+0.005). Mean NLL at these sizes is dominated by a few
+    diverging fits (protein, se 0.3) and was not used as evidence. "Rows"
+    means what the learner is handed: after the validation split, a
+    minibatch, and four fifths of the data inside `hyper_opt` or cross-fit
+    folds — so fold fits on fewer than 250 rows use a smaller leaf than
+    the final fit. Divisor and cap were stated in advance, not searched.
+    Only the histogram learner was measured below 200 rows.
+    On count and classification heads (Cycle 20; Poisson,
+    NegativeBinomial, Bernoulli, Categorical K = 3; nine datasets × 20
+    seeds) the rule is a trade, not a general gain: NLL lower on 280 of
+    540 fits. A strong nonlinear rate gains a lot (pois_nl −0.60 and
+    −0.25 NLL at 70 and 105 rows); a weak or linear signal loses a little
+    (pois_low +0.048 and +0.044, about 3 se; bern_lin +0.026 at 105
+    rows); the rest is noise, and everything vanishes by 140 rows. With
+    sample weights the Normal result repeats (pooled RMSE −5.0 % at 70
+    rows, nothing at 105–140), and the leaf-20 default itself holds
+    (lower NLL than leaf 1 on 45 of 60 weighted fits at 2100 rows). For
+    small, weak-signal count data use
+    `HistogramLearner::with_params(depth, 255, 20, 2)`.
+63. **The LogNormal scale ceiling is relative to a constant that the
+    recalibration moves.** σ(x) ≤ 4 × exp(`init_params[scale]`): after a
+    staged fit that constant is the rms residual log-scale, and at most
+    1/16 of the rows can truly exceed four times it. The end-of-fit
+    recalibration (log σ ← a + b·log σ) maps the constant with everything
+    else, so with slope b > 1 the ceiling is tighter than that by
+    (b − 1)·ln 4 and with b < 1 looser. On the four benchmark datasets it
+    either repairs the mean (kin8nm) or never binds. In a constructed
+    extreme (6 % of rows with 60 times the noise of the rest, a short
+    fit whose recalibration stretches the scale) it binds on 6 % of the
+    rows and scores 0.09–0.21 NLL better than the unclamped
+    sum. A small region whose true σ is above the ceiling would be
+    under-dispersed: use `pred_param_unbounded`, or `Normal` on ln y. The
+    ceiling bounds σ, not the mean — with a baseline log-scale near 1 it
+    still allows mean/median ratios in the hundreds. Not applied to the
+    survival wrapper or to the hurdle heads. The exact leaf step for the
+    log-scale, tried as an alternative, did not stop the blow-up and was
+    not adopted (`proposals/O8_exact_scale_step.md`).
+64. **`DecisionTreeLearner::new` and `default_tree_learner()` now differ.**
+    `new(depth)` follows the library's leaf default (20, adaptive);
+    `default_sklearn()`, `default_tree_learner()` and
+    `arena_tree_learner()` keep scikit-learn's leaf 1, because matching
+    Python NGBoost is their contract. The exact learner was measured on
+    the Normal head at 210, 490 and 2100 training rows, the arena learner
+    at 2100 only (protein unchanged there).
+65. **The end-to-end tuner comparison is four heads and one size.**
+    Normal (five datasets) and, in Cycle 20, LogNormal, Poisson and
+    NegativeBinomial (five datasets): there the default search beat the
+    1.2.0 example by 0.045 NLL (31 of 40) and no tuning by 0.037 (34 of
+    40), was never worse than not tuning, and gained nothing on a weakly
+    varying Poisson rate or beyond noise on the NegativeBinomial dataset.
+    Classification heads are unmeasured. For Normal: LogScore, 2400
+    training rows, 30 trials, 5 folds, five datasets × 8 seeds. The default search beat the 1.2.0 example by 0.093 NLL (37 of
+    40) and no tuning by 0.077 (36 of 40), but only by 0.011–0.015 on two
+    of the five datasets. Its searches took 0.7–1.8× the old ones' time on
+    a loaded machine (deeper trees and more rounds on kin8nm); no clean
+    timing was taken. The 1.2.0 arm is a reconstruction: that release's
+    space, leaf 1 and a fold patience of 50, refitted with early stopping
+    like the other arms.
+
+## Cycle 20 (1.3.0: other heads' means, protein rows, last-bit noise, tuner on more heads)
+
+66. **`HurdleLogNormal` bounds its point prediction, not its
+    distribution.** On the dataset that broke `LogNormal` (kin8nm with a
+    fifth of the targets set to zero) it was sane in 10 of 10 fits, and so
+    was the survival wrapper's `LogNormal` (20 fits; largest mean/median
+    ratio 2.5): both are joint fits. But on a constructed bounded target
+    with a point mass at its floor — marginal log-scale near 0.9 — one
+    hurdle fit in four stopped early with σ ≈ 3.4 on a few rows and a mean
+    of 31 against a largest target of 1.45, and the scale ceiling of item
+    63 would not have caught it. Since Cycle 21 `predict` returns
+    (1 − π)·E[min(Y, c)], c the largest training target
+    (`NGBoost::target_max`, stored with the model). That is a bound, not a
+    repair: the fitted σ on those rows is still 3.4, intervals and
+    `pred_dist(x).mean()` still reflect it, and a prediction near c on such
+    a row is still poor. A genuine future target above every training
+    target is under-predicted by construction (the winsorised mean is
+    below the mean by E[(Y − c)⁺], small unless c sits inside the bulk).
+    Models saved before 1.3.0 have no stored maximum and keep the plain
+    mean. Plain `LogNormal`, the survival wrapper and `Gamma` do not use
+    the bound. `Gamma`'s recorded blow-ups (RMSE 114 against a median 2.9)
+    were single-row leaves driving the rate to zero and do not occur with
+    the 1.3.0 leaf default (60 fits); they can with a leaf-1 learner.
+    `GammaMean` never showed them.
+67. **Single fits are chaotic in the last bit.** Multiplying the training
+    targets by 1 ± 10⁻¹² changed the early-stopping round of 359 of 360
+    Normal fits and a single fit's held-out NLL by 0.018 on average (up
+    to 0.10). A 10-seed paired difference on one dataset moves by about
+    0.007 (up to 0.015) under such a change; the average over six
+    datasets by 0.0015. Single-dataset differences below about 0.02 in
+    these documents are therefore not findings, however small their
+    seed-to-seed standard error; pooled ones are. The same holds for
+    comparing two releases of this crate on one dataset.
+## Cycle 23 (1.3.0: `max_bins` in the default search space)
+
+68. **`max_bins` earns its place in the search on one kind of target.**
+    Searching it (8–255, log) at the same 30 trials was 0.009 NLL better
+    pooled over eight dataset-head pairs (41 of 64 searches). All of that
+    is kin8nm — Normal −0.026 (7 of 8), LogNormal −0.051 (8 of 8), with
+    winning models at 18–19 bins — a smooth target where coarse bins act
+    as a regulariser. Six pairs are inside the noise (−0.010…+0.006), and
+    het_b was +0.024 (1.5 se, 3 of 8): a fifth dimension dilutes a
+    30-trial search a little where it has nothing to find. The untuned
+    default stays at 255 bins; no rule for choosing the bin count without
+    a search was looked for. k-means bin edges were tried instead of
+    quantile edges and rejected (no gain at 255 bins, and not invariant
+    to rescaling a feature).
+
+## Cycle 24 (1.3.0: cross-fitting and the head as search choices)
+
+69. **Searching cross-fitting improves the log score, not the point
+    prediction, and is expensive.** `default_search_space_with_crossfit`
+    was 0.043 NLL better than the default space at 30 trials (Normal and
+    LogNormal, seven dataset-head pairs, 42 of 56 searches), but RMSE did
+    not move (two datasets about 1 % worse, 1.6 se) and the search took
+    several times longer. Measured at 2400 training rows only: on a few
+    hundred rows with a heavy-tailed target, cross-fitting with the
+    Normal head loses (item 58), and whether a search catches that was
+    not tested. The key does nothing on heads without a staged fit.
+70. **The tuner's CV score is not a safe way to choose a head.** Picking
+    between Normal and StudentTFiniteVar, or LogNormal and GammaMean, by
+    the better search score was 0.007 worse than one head at the same
+    total budget and 0.004 better at twice the budget (neither
+    significant). It was right where the gap was large (t-distributed
+    noise, −0.075) and wrong on kin8nm, where it chose GammaMean over
+    LogNormal in 8 of 8 searches and lost 0.037 on test. The fold score
+    ranks configurations of one head well; across heads it also reflects
+    how each head's early stopping and recalibration use the scoring
+    fold. No head-selection helper is provided.
+
+71. **Cross-fitting is not the default, by cost and by small data.**
+    Tested as the default of the staged fit (Cycle 25; the shipped
+    default model, five heads, 19 head × dataset pairs, seeds chosen
+    fresh, a second set to confirm). Always on fails: below 40 validation
+    rows the default is a joint fit, the option replaces it by four
+    stages stopped on 10–30 rows, and although the average improves,
+    single datasets lose 0.1–0.3 NLL (Normal on kin8nm at 200 rows
+    +0.116, 2.4 se; Normal on protein at 200–300 rows +0.18 … +0.26). From
+    40 validation rows up it is better on 18 of 19 pairs: −0.045 NLL
+    (se 0.007), 1543 of 1900 fits, RMSE −1.1 %, coverage unchanged; with
+    3 folds −0.043. The exception is the Normal head on protein (+0.005,
+    RMSE +0.5 % at 4.9 se). The gain decays with size (−0.03 at 6000
+    rows, −0.02 at 20 000). One fit at a time it costs 2.4–6.6× the
+    default with 5 folds (median 5.6×) and 0.9–5.0× with 3 (median 3.2×),
+    and a tuner search pays that on every fold. One cross-fitted
+    LogNormal fit in 560 predicted a mean of 901 for a target of 46 on a
+    row whose σ sat just under the ceiling of item 63. Not tested:
+    explicit validation sets, more than 20 000 rows, the survival
+    wrapper.
+
+72. **On a weak-signal count target the fit options are worth almost
+    nothing — measured on football goals with basic features only.** The
+    features were market odds, recent form and Elo, with no feature
+    engineering, so this is evidence about a low-signal target, not about
+    sports data with strong features: where the rate varies strongly
+    (two synthetic sets) the same options are worth 0.03–0.07, and no
+    default was chosen from these data. Cycle 26, 14 019
+    football matches (home and away goals, means 1.5 and 1.2, variance /
+    mean 1.07–1.10), random splits and a rolling origin by season:
+    NegativeBinomial is 0.001–0.007 NLL *worse* than Poisson in all eight
+    comparisons (item 4's slow dispersion on nearly-Poisson data);
+    `CountModel::fit_auto` stays on Poisson in 219 of 232 fits. The leaf
+    default against leaf 1 is −0.000 … −0.006; a 30-trial tuner search on
+    the Poisson head −0.0001 (se 0.0005). The staged NegativeBinomial fit
+    with cross-fitted residuals was tested as that head's default and
+    failed its rule: −0.0021 on eleven real dataset rows (1.7 se, 60 % of
+    fits), a gain only with strong over-dispersion or a strongly varying
+    rate (−0.036, −0.027 on two synthetic sets), at 4–36× the fit time; it
+    stays opt-in (item 51). For scale, the features are worth 0.05–0.07
+    over a constant rate there. On over-dispersed real counts (variance /
+    mean 2.1–7.9) NegativeBinomial wins by 0.02–1.5 and the leaf default
+    by 0.004–0.010 (Poisson). Not tested: larger count scales, the Normal
+    head on totals or margins.
 
 ## Not pursued (reasoned, not measured)
 

@@ -1,0 +1,18 @@
+
+== het_a [real objective]: best validation score after t trials (mean ± se over sampler seeds) | test NLL of incumbent
+sampler    seeds              t=5             t=10             t=20             t=30             t=40             t=60             t=80          test@end  dup%
+random         8   1.2840 ±0.0176   1.2453 ±0.0109   1.2231 ±0.0078   1.2002 ±0.0066   1.1972 ±0.0071                                      1.2630 ±0.0145   0.0
+tpe            8   1.2524 ±0.0158   1.2170 ±0.0135   1.1838 ±0.0142   1.1676 ±0.0119   1.1519 ±0.0083                                      1.2142 ±0.0123   0.0
+tpe10          8   1.2840 ±0.0176   1.2453 ±0.0109   1.1827 ±0.0073   1.1660 ±0.0078   1.1612 ±0.0067                                      1.2265 ±0.0161   0.3
+
+== kin8nm [real objective]: best validation score after t trials (mean ± se over sampler seeds) | test NLL of incumbent
+sampler    seeds              t=5             t=10             t=20             t=30             t=40             t=60             t=80          test@end  dup%
+random         8  -0.7068 ±0.0240  -0.7430 ±0.0154  -0.7618 ±0.0129  -0.7886 ±0.0114  -0.8042 ±0.0114                                     -0.7638 ±0.0113   0.0
+tpe            8  -0.6961 ±0.0226  -0.7300 ±0.0133  -0.8000 ±0.0051  -0.8158 ±0.0072  -0.8211 ±0.0063                                     -0.7766 ±0.0075   0.0
+tpe10          8  -0.7068 ±0.0240  -0.7430 ±0.0154  -0.8173 ±0.0086  -0.8272 ±0.0060  -0.8349 ±0.0056                                     -0.7915 ±0.0064   0.0
+
+== tnoise [real objective]: best validation score after t trials (mean ± se over sampler seeds) | test NLL of incumbent
+sampler    seeds              t=5             t=10             t=20             t=30             t=40             t=60             t=80          test@end  dup%
+random         8   1.4027 ±0.0293   1.3746 ±0.0207   1.3444 ±0.0178   1.3266 ±0.0096   1.3252 ±0.0098                                      1.3098 ±0.0147   0.0
+tpe            8   1.4252 ±0.0178   1.3345 ±0.0177   1.3074 ±0.0132   1.2835 ±0.0091   1.2813 ±0.0088                                      1.2652 ±0.0080   0.0
+tpe10          8   1.4027 ±0.0293   1.3746 ±0.0207   1.3070 ±0.0078   1.2870 ±0.0067   1.2815 ±0.0076                                      1.2824 ±0.0139   0.3

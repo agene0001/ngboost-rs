@@ -1,0 +1,61 @@
+Δ = arm − old on the test block (negative = better); n = seeds present in both
+
+test_nll
+  kin8nm   | untuned -0.0099 (0.0123) 4/8 | old -0.2940 (n=8) | oldspace -0.0480 (0.0097) 8/8 | new -0.0817 (0.0203) 7/8
+  lognorm_het | untuned -0.0282 (0.0130) 6/8 | old 2.0191 (n=8) | oldspace -0.0153 (0.0086) 7/8 | new -0.0753 (0.0125) 8/8
+  nb_over  | untuned +0.0148 (0.0034) 0/8 | old 2.9775 (n=8) | oldspace +0.0003 (0.0044) 6/8 | new -0.0149 (0.0066) 6/8
+  pois_low | untuned +0.0036 (0.0014) 2/8 | old 2.2864 (n=8) | oldspace -0.0021 (0.0021) 5/8 | new +0.0011 (0.0020) 3/8
+  pois_nl  | untuned -0.0219 (0.0120) 6/8 | old 2.5759 (n=8) | oldspace +0.0096 (0.0366) 6/8 | new -0.0559 (0.0160) 7/8
+  pooled   | untuned -0.0083 (0.0049) 18/40 | oldspace -0.0111 (0.0081) 32/40 | new -0.0453 (0.0077) 31/40
+
+test_rmse
+  kin8nm   | untuned +0.0063 (0.0016) 1/8 | old 0.1526 (n=8) | oldspace -0.0075 (0.0018) 8/8 | new -0.0097 (0.0019) 8/8
+  lognorm_het | untuned -0.0700 (0.0336) 6/8 | old 4.8050 (n=8) | oldspace -0.0689 (0.0409) 7/8 | new -0.1963 (0.0465) 8/8
+  nb_over  | untuned +0.0205 (0.0373) 2/8 | old 7.4910 (n=8) | oldspace -0.0179 (0.0375) 6/8 | new -0.2551 (0.0495) 8/8
+  pois_low | untuned +0.0096 (0.0040) 2/8 | old 2.4902 (n=8) | oldspace -0.0050 (0.0053) 5/8 | new +0.0025 (0.0049) 2/8
+  pois_nl  | untuned -0.1186 (0.0539) 7/8 | old 3.8106 (n=8) | oldspace +0.0165 (0.1272) 5/8 | new -0.2250 (0.0744) 7/8
+  pooled   | untuned -0.0305 (0.0165) 18/40 | oldspace -0.0166 (0.0267) 31/40 | new -0.1367 (0.0260) 33/40
+
+search seconds (mean), refit rounds (mean), winning parameters (median)
+  kin8nm   untuned   secs     0.0  rounds     508  cap   2000  lr nan depth nan leaf nan col nan
+  kin8nm   old       secs    74.5  rounds     589  cap   1131  lr 0.015 depth 6 leaf nan col nan
+  kin8nm   oldspace  secs    72.5  rounds    1025  cap   1109  lr 0.018 depth 6 leaf nan col nan
+  kin8nm   new       secs    73.6  rounds     819  cap   3051  lr 0.033 depth 7 leaf 83 col 0.85
+  lognorm_het untuned   secs     0.0  rounds     409  cap   2000  lr nan depth nan leaf nan col nan
+  lognorm_het old       secs    57.8  rounds     386  cap   1225  lr 0.073 depth 2 leaf nan col nan
+  lognorm_het oldspace  secs    58.2  rounds     415  cap   1356  lr 0.066 depth 3 leaf nan col nan
+  lognorm_het new       secs    46.6  rounds     379  cap   1849  lr 0.060 depth 3 leaf 120 col 0.86
+  nb_over  untuned   secs     0.0  rounds      83  cap   2000  lr nan depth nan leaf nan col nan
+  nb_over  old       secs   111.8  rounds     225  cap   1307  lr 0.072 depth 2 leaf nan col nan
+  nb_over  oldspace  secs   106.2  rounds     245  cap   1207  lr 0.089 depth 2 leaf nan col nan
+  nb_over  new       secs    42.2  rounds     107  cap   1305  lr 0.082 depth 4 leaf 195 col 0.85
+  pois_low untuned   secs     0.0  rounds      51  cap   2000  lr nan depth nan leaf nan col nan
+  pois_low old       secs    17.0  rounds     139  cap   1295  lr 0.059 depth 2 leaf nan col nan
+  pois_low oldspace  secs    17.9  rounds      83  cap    963  lr 0.072 depth 2 leaf nan col nan
+  pois_low new       secs    10.9  rounds      55  cap   1083  lr 0.094 depth 2 leaf 103 col 0.78
+  pois_nl  untuned   secs     0.0  rounds     508  cap   2000  lr nan depth nan leaf nan col nan
+  pois_nl  old       secs    34.1  rounds     503  cap   1376  lr 0.077 depth 2 leaf nan col nan
+  pois_nl  oldspace  secs    35.4  rounds     500  cap   1198  lr 0.083 depth 2 leaf nan col nan
+  pois_nl  new       secs    32.9  rounds     637  cap   1650  lr 0.069 depth 3 leaf 95 col 0.85
+
+=================== against the untuned default
+Δ = arm − untuned on the test block (negative = better); n = seeds present in both
+
+test_nll
+  kin8nm   | untuned -0.3039 (n=8) | old +0.0099 (0.0123) 4/8 | oldspace -0.0381 (0.0149) 6/8 | new -0.0718 (0.0178) 7/8
+  lognorm_het | untuned 1.9909 (n=8) | old +0.0282 (0.0130) 2/8 | oldspace +0.0129 (0.0077) 2/8 | new -0.0471 (0.0135) 8/8
+  nb_over  | untuned 2.9923 (n=8) | old -0.0148 (0.0034) 8/8 | oldspace -0.0145 (0.0048) 7/8 | new -0.0298 (0.0070) 8/8
+  pois_low | untuned 2.2900 (n=8) | old -0.0036 (0.0014) 6/8 | oldspace -0.0057 (0.0022) 8/8 | new -0.0024 (0.0023) 4/8
+  pois_nl  | untuned 2.5541 (n=8) | old +0.0219 (0.0120) 2/8 | oldspace +0.0315 (0.0273) 6/8 | new -0.0340 (0.0088) 7/8
+  pooled   | old +0.0083 (0.0049) 22/40 | oldspace -0.0028 (0.0072) 29/40 | new -0.0370 (0.0060) 34/40
+
+test_rmse
+  kin8nm   | untuned 0.1589 (n=8) | old -0.0063 (0.0016) 7/8 | oldspace -0.0138 (0.0013) 8/8 | new -0.0160 (0.0015) 8/8
+  lognorm_het | untuned 4.7350 (n=8) | old +0.0700 (0.0336) 2/8 | oldspace +0.0010 (0.0167) 3/8 | new -0.1264 (0.0498) 7/8
+  nb_over  | untuned 7.5114 (n=8) | old -0.0205 (0.0373) 6/8 | oldspace -0.0383 (0.0618) 6/8 | new -0.2755 (0.0456) 8/8
+  pois_low | untuned 2.4998 (n=8) | old -0.0096 (0.0040) 6/8 | oldspace -0.0145 (0.0056) 7/8 | new -0.0071 (0.0058) 4/8
+  pois_nl  | untuned 3.6920 (n=8) | old +0.1186 (0.0539) 1/8 | oldspace +0.1352 (0.0909) 3/8 | new -0.1064 (0.0536) 6/8
+  pooled   | old +0.0305 (0.0165) 22/40 | oldspace +0.0139 (0.0233) 27/40 | new -0.1063 (0.0226) 33/40
+
+search seconds (mean), refit rounds (mean), winning parameters (median)
+  kin8nm   untuned   secs     0.0  rounds     508  cap   2000  lr nan depth nan leaf nan col nan

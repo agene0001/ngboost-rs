@@ -53,3 +53,17 @@ helps CRPS and RMSE only on strongly over-dispersed data (nb_over: CRPS
 −0.056, RMSE −0.24) and costs NLL everywhere (+0.002…+0.029; pois_low 0/10).
 Use LogScore unless your evaluation metric is CRPS on heavily dispersed
 counts.
+
+**Real data (Cycle 26, `research/optimization-algorithm/proposals/
+O17_count_heads_real_data.md`).** Held-out NLL against the Poisson head,
+default settings of both: doctor visits (variance / mean 2.1) −0.024
+(30/30), articles per biochemist (2.2) −0.076 (9/10), physician visits
+(7.9) −1.50 (30/30) — and football goals (1.07–1.10) **+0.001 … +0.007**,
+Poisson better in all eight comparisons. `CountModel::fit_auto` made the
+right choice on each. The staged fit (`staged_fit = Some(true)`) with
+cross-fitted residuals (`staged_crossfit_folds = 5`) was tested as this
+head's default and is not one: −0.0021 on the real data (1.7 standard
+errors), −0.036 and −0.027 on the two strongly dispersed or strongly
+nonlinear synthetic sets, at 4–36× the fit time. Without cross-fitting
+the staged fit is still overconfident on over-dispersed data (+0.113 on
+nb_over, +0.013 on physician visits).

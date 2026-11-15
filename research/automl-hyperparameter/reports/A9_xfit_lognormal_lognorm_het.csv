@@ -1,0 +1,9 @@
+dataset,seed,arm,trials,cv_score,opt_rounds,lr,depth,msl,cs,n_est,search_secs,n_iter,test_nll,test_crps,test_rmse,cov90,calib,max_bins,xfit
+lognorm_het,0,xfit,30,1.93809,652,0.03115,3,128,0.929,3210,184.7,794,1.95504,NaN,5.41295,NaN,NaN,51,5
+lognorm_het,1,xfit,30,1.92525,784,0.03237,3,69,0.895,3090,146.8,453,1.91283,NaN,4.35056,NaN,NaN,37,5
+lognorm_het,2,xfit,30,1.97237,401,0.05741,3,49,0.996,1742,274.3,521,1.94540,NaN,4.51650,NaN,NaN,44,5
+lognorm_het,3,xfit,30,1.92725,216,0.08394,3,126,0.972,1192,58.7,320,2.00446,NaN,4.75642,NaN,NaN,44,0
+lognorm_het,4,xfit,30,1.93237,477,0.06157,3,131,0.675,1625,237.9,414,2.07093,NaN,6.04006,NaN,NaN,111,5
+lognorm_het,5,xfit,30,1.96534,289,0.07921,3,48,0.819,1263,104.1,251,1.90445,NaN,3.99782,NaN,NaN,18,5
+lognorm_het,6,xfit,30,1.97180,598,0.02645,5,111,0.756,3781,180.9,773,1.86060,NaN,4.32866,NaN,NaN,64,5
+lognorm_het,7,xfit,30,1.94348,423,0.06929,3,99,0.692,1444,165.9,356,1.84807,NaN,3.63866,NaN,NaN,174,5

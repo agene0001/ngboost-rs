@@ -220,3 +220,40 @@ will run: `auto_calibrate_scale` on and ≥ 40 validation rows.
 `NGBoost::uses_staged_fit(n_rows, n_val)` reports the decision. On small,
 shock-prone series (elnino) the calibrated staged fit can still lose: no
 mean gain, sharper σ (known_limitations 52).
+
+## Leaf size and cross-fitted residuals (Cycle 18, 1.3.0)
+
+Two further results for the staged Normal fit, both from
+`research/optimization-algorithm/` (six datasets × 10 seeds).
+
+**Leaf size.** The location trees over-fit with single-row leaves.
+`min_samples_leaf = 20` — the `HistogramLearner` default since 1.3.0 —
+against 1, depth 3: −0.061 het_a, −0.014 het_b, −0.048 homo, −0.062
+tnoise, −0.025 kin8nm, −0.016 protein held-out NLL at 2100 training rows.
+Leaf 50 on the location trees alone gave −0.057 on average, on the scale
+trees alone −0.003. Below 200 fitted rows the default leaf shrinks to a
+tenth of the rows (−1.2…−5.0 % RMSE against a fixed 20 at 70–140 rows,
+six datasets × 20 seeds).
+
+**Cross-fitted residuals** (`staged_crossfit_folds = 5`, opt-in). The
+uncalibrated staged fit is too narrow (previous section) because its scale
+stages are trained on in-sample location residuals, whose variance is only
+41–76 % of the out-of-fold variance at 2100 training rows (12–57 % at
+490). With out-of-fold location predictions for
+the training rows the scale stage is honest before any recalibration:
+
+| | default staged | cross-fit | cross-fit, recalibration off |
+|---|---|---|---|
+| mean Δ NLL, 2100 training rows | 0 | −0.038 | −0.029 |
+| 90 % coverage, range over datasets | 0.855–0.905 | 0.894–0.915 | 0.875–0.904 |
+| mean Δ NLL, 490 training rows | 0 | −0.036 | — |
+| mean Δ NLL, 30 validation rows (default: joint) | 0 | −0.149 | — |
+
+Per dataset it wins on four of six at 2100 rows and five of six in the
+two small-data settings; the loser on small data is protein (+0.07,
++0.09), a heavy-tailed target. Fit time is 2.4–6.6× the default staged
+fit with 5 folds (median 5.6×) and 0.9–5.0× with 3 (median 3.2×). Not a
+default: see `docs/known_limitations.md` 71 for the test of it as one, 58
+for the small-data loss and 63 for the LogNormal scale ceiling that goes
+with it.
+

@@ -1,0 +1,6 @@
+dataset    untuned NLL  shipped-untuned      se  lower  dRMSE% search s  winner medians lr/depth/leaf/bins
+fbf_away        1.4037          -0.0016  0.0005   7/8   -0.16       33  0.050/2/95/68
+fbf_home        1.5048          +0.0005  0.0013   5/8   +0.05       33  0.062/2/111/85
+fbo_away        1.3861          +0.0006  0.0005   4/8   +0.06       27  0.080/3/31/19
+fbo_home        1.4881          -0.0000  0.0005   4/8   -0.01       29  0.047/2/37/131
+pooled over 4 datasets: -0.0001 (se 0.0005)

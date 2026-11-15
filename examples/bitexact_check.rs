@@ -3,7 +3,7 @@
 //! working tree) and diff the output — any semantic training change shows up
 //! as a hash mismatch.
 use ndarray::{Array1, Array2};
-use ngboost_rs::learners::{HistogramLearner, default_base_learner, default_tree_learner};
+use ngboost_rs::learners::{default_base_learner, default_tree_learner};
 use ngboost_rs::survival::NGBSurvivalLogNormal;
 use ngboost_rs::{Distribution, NGBExactRegressor, NGBHistRegressor};
 

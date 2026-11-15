@@ -1,0 +1,45 @@
+arm k5 - off, rule G (size >= 400)
+paired fits: 1900; non-finite or failed: off 0, k5 0
+
+By pool size (mean over head x dataset pairs; se over pair means)
+  size pairs     dNLL     se     lower  dRMSE%    se cov off  cov on time x staged off
+   400    19  -0.0354 0.0092  281/380    -1.03  0.40   0.886   0.880   3.79   320/380 
+   800    19  -0.0596 0.0095  326/380    -2.04  0.57   0.900   0.898   5.55   320/380 
+  1600    19  -0.0626 0.0119  327/380    -1.66  0.59   0.895   0.894   4.32   320/380 
+  3200    19  -0.0389 0.0082  307/380    -0.60  0.26   0.906   0.902   4.50   380/380 
+  6000    19  -0.0302 0.0078  302/380    -0.32  0.26   0.907   0.904   3.80   380/380 
+
+By head x dataset (per-seed mean over sizes; se over seeds)
+head        dataset          dNLL     se     t     lower  dRMSE%    se     t
+gammamean   gamma_het     -0.0332 0.0028 -11.8   81/100    -2.10  0.26  -8.1
+gammamean   kin8nm        -0.0942 0.0039 -23.9   98/100    -5.41  0.36 -14.9
+gammamean   lognorm_het   -0.0873 0.0051 -17.1   80/100    -2.96  0.32  -9.2
+lognormal   kin8nm        -0.0896 0.0042 -21.3   94/100    -2.33  0.39  -6.0
+lognormal   lognorm_het   -0.0410 0.0044  -9.3   75/100    -0.11  0.28  -0.4
+normal      het_a         -0.0750 0.0056 -13.3   93/100    -1.39  0.50  -2.8
+normal      het_b         -0.0234 0.0052  -4.5   72/100    -0.08  0.11  -0.7
+normal      homo          -0.0078 0.0029  -2.7   63/100    -0.16  0.40  -0.4
+normal      kin8nm        -0.0423 0.0042 -10.2   93/100    +0.54  0.26  +2.1
+normal      protein       +0.0050 0.0075  +0.7   62/100    +0.50  0.10  +4.9
+normal      tnoise        -0.0925 0.0053 -17.3   94/100    -2.27  0.29  -7.9
+studentt    het_a         -0.0555 0.0044 -12.7   85/100    -1.32  0.34  -3.9
+studentt    kin8nm        -0.0235 0.0036  -6.5   84/100    -0.15  0.20  -0.7
+studentt    protein       -0.0039 0.0026  -1.5   65/100    -0.14  0.12  -1.2
+studentt    tnoise        -0.0423 0.0047  -9.0   86/100    -1.54  0.34  -4.6
+studenttfv  het_a         -0.0652 0.0066  -9.9   93/100    -1.13  0.48  -2.3
+studenttfv  kin8nm        -0.0328 0.0037  -8.8   82/100    +0.03  0.24  +0.1
+studenttfv  protein       -0.0149 0.0042  -3.6   60/100    -0.10  0.17  -0.6
+studenttfv  tnoise        -0.0421 0.0073  -5.8   83/100    -1.35  0.40  -3.3
+
+Pooled
+  dNLL over fits -0.0453; over pair means -0.0453 (se 0.0072, t -6.3, 19 pairs)
+  lower on 1543/1900 fits (81 %)
+  dRMSE over pair means -1.13 % (se 0.34)
+  coverage off 0.899, on 0.896
+  wall time, sum on / sum off: 4.08
+
+Decision rule
+  R1 benefit           pass
+  R2 no harm           pass  pairs [] cells []
+  R3 point predictions pass  pairs []
+  R4 robustness        pass

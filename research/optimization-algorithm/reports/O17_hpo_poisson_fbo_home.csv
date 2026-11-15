@@ -1,0 +1,17 @@
+dataset,seed,arm,trials,cv_score,opt_rounds,lr,depth,msl,cs,n_est,search_secs,n_iter,test_nll,test_crps,test_rmse,cov90,calib,max_bins,xfit
+fbo_home,300,untuned,0,NaN,0,NaN,NaN,NaN,NaN,2000,0.0,47,1.48576,NaN,1.17202,NaN,NaN,NaN,NaN
+fbo_home,300,shipped,30,1.49433,60,0.05171,3,78,0.931,1934,23.4,77,1.48819,NaN,1.17445,NaN,NaN,25,NaN
+fbo_home,301,untuned,0,NaN,0,NaN,NaN,NaN,NaN,2000,0.0,60,1.48743,NaN,1.18006,NaN,NaN,NaN,NaN
+fbo_home,301,shipped,30,1.48986,57,0.08558,2,83,0.710,1169,21.4,84,1.48686,NaN,1.17931,NaN,NaN,28,NaN
+fbo_home,302,untuned,0,NaN,0,NaN,NaN,NaN,NaN,2000,0.0,41,1.47701,NaN,1.18204,NaN,NaN,NaN,NaN
+fbo_home,302,shipped,30,1.49210,171,0.02250,2,17,0.770,4444,34.1,135,1.47752,NaN,1.18283,NaN,NaN,214,NaN
+fbo_home,303,untuned,0,NaN,0,NaN,NaN,NaN,NaN,2000,0.0,129,1.47615,NaN,1.16402,NaN,NaN,NaN,NaN
+fbo_home,303,shipped,30,1.49781,204,0.02197,2,186,0.667,4553,31.9,205,1.47495,NaN,1.16201,NaN,NaN,162,NaN
+fbo_home,304,untuned,0,NaN,0,NaN,NaN,NaN,NaN,2000,0.0,56,1.50863,NaN,1.19542,NaN,NaN,NaN,NaN
+fbo_home,304,shipped,30,1.48860,30,0.13950,3,10,0.698,717,19.1,18,1.50895,NaN,1.19590,NaN,NaN,14,NaN
+fbo_home,305,untuned,0,NaN,0,NaN,NaN,NaN,NaN,2000,0.0,43,1.49160,NaN,1.20153,NaN,NaN,NaN,NaN
+fbo_home,305,shipped,30,1.48556,160,0.03455,2,21,0.955,2895,30.1,87,1.48972,NaN,1.19982,NaN,NaN,49,NaN
+fbo_home,306,untuned,0,NaN,0,NaN,NaN,NaN,NaN,2000,0.0,83,1.48587,NaN,1.19581,NaN,NaN,NaN,NaN
+fbo_home,306,shipped,30,1.49015,171,0.02600,2,37,0.648,3847,37.4,344,1.48650,NaN,1.19708,NaN,NaN,131,NaN
+fbo_home,307,untuned,0,NaN,0,NaN,NaN,NaN,NaN,2000,0.0,54,1.49238,NaN,1.19263,NaN,NaN,NaN,NaN
+fbo_home,307,shipped,30,1.48929,87,0.04710,2,14,0.607,2124,32.6,181,1.49206,NaN,1.19120,NaN,NaN,233,NaN

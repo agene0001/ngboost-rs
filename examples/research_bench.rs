@@ -16,8 +16,9 @@ use ngboost_rs::dist::NormalMixture;
 use ngboost_rs::dist::{
     Bernoulli, Categorical, ClassificationDistn, Distribution, DistributionMethods, Laplace,
     LogNormal, NegativeBinomial, Normal, NormalMixture2, NormalMixture3, Poisson, StudentT,
+    StudentTFiniteVar,
 };
-use ngboost_rs::dist::{Gamma, HalfNormal, Weibull};
+use ngboost_rs::dist::{Gamma, GammaMean, HalfNormal, Weibull};
 use ngboost_rs::learners::HistogramLearner;
 use ngboost_rs::learners::{HistTreeNode, SerializableTrainedLearner};
 use ngboost_rs::ngboost::NGBoost;
@@ -48,6 +49,8 @@ struct Args {
     val_rows: usize,
     dist: String,
     y_shift: f64,
+    /// `min_samples_leaf` of every tree (Cycle 18; default 1 = historical)
+    min_leaf: usize,
 }
 
 fn parse_args() -> Args {
@@ -65,6 +68,7 @@ fn parse_args() -> Args {
         val_rows: usize::MAX,
         dist: "normal".into(),
         y_shift: 0.0,
+        min_leaf: 1,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -84,6 +88,7 @@ fn parse_args() -> Args {
             "--val-rows" => a.val_rows = v.parse().unwrap(),
             "--dist" => a.dist = v.clone(),
             "--y-shift" => a.y_shift = v.parse().unwrap(),
+            "--min-leaf" => a.min_leaf = v.parse().unwrap(),
             other => panic!("unknown arg {other}"),
         }
         i += 2;
@@ -240,6 +245,21 @@ fn synth(name: &str, n: usize, seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f
                 let z = g.z();
                 y[i] = if u < pz { 0.0 } else { 1.0 + mu_a + s * z };
                 sig[i] = f64::NAN;
+                continue;
+            }
+            // Cycle 18: truly Gamma targets with a log-linear mean.
+            // gamma_homo: constant shape 4; gamma_het: shape 1.4–7.7 driven
+            // by a feature the mean ignores; gamma_shared: shape driven by
+            // the mean's dominant feature
+            "gamma_homo" | "gamma_het" | "gamma_shared" => {
+                let m = (0.5 + 0.3 * mu_a).exp();
+                let al = match name {
+                    "gamma_homo" => 4.0,
+                    "gamma_het" => 1.0 + (0.5 + 0.7 * r[4]).exp(),
+                    _ => 1.0 + (0.5 + 0.7 * r[0]).exp(),
+                };
+                y[i] = m * g.gamma(al) / al;
+                sig[i] = m / al.sqrt();
                 continue;
             }
             // misspecified heavy tails: t(4) noise scaled like het_a
@@ -713,6 +733,19 @@ fn load_dataset(name: &str, seed: u64, a: &Args) -> (Array2<f64>, Array1<f64>) {
     }
     match name {
         "kin8nm" => load_csv(&format!("{DATA_DIR}/kin8nm.csv"), "y"),
+        // kin8nm with a random fifth of the targets set to exactly 0: a
+        // hurdle target whose positive part is bounded and not log-normal in
+        // its tails (the LogNormal mean blow-up case, Cycle 19 O5)
+        "zi_kin8nm" => {
+            let (x, mut y) = load_csv(&format!("{DATA_DIR}/kin8nm.csv"), "y");
+            let mut rng = StdRng::seed_from_u64(seed ^ 0x21_0000_5eed);
+            for v in y.iter_mut() {
+                if rng.random_range(0.0..1.0) < 0.2 {
+                    *v = 0.0;
+                }
+            }
+            (x, y)
+        }
         "protein" => load_csv(&format!("{DATA_DIR}/protein.csv"), "RMSD"),
         _ => {
             let (x, y, _) = synth(name, a.n_synth, seed);
@@ -890,7 +923,7 @@ fn build_model(variant: &str, a: &Args, seed: u64) -> (Model, LibCalib, PostHoc)
     let mut m = Model::with_full_options(
         a.n_est,
         a.lr,
-        HistogramLearner::new(a.depth),
+        HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2),
         true,
         1.0,
         1.0,
@@ -919,6 +952,9 @@ fn build_model(variant: &str, a: &Args, seed: u64) -> (Model, LibCalib, PostHoc)
             "calib" => calibrate = LibCalib::Moment,
             "libaffine" => calibrate = LibCalib::Affine,
             "auto" => m.auto_calibrate_scale = true,
+            "joint" => m.staged_fit = Some(false),
+            "staged" => m.staged_fit = Some(true),
+            "xfit" => m.staged_crossfit_folds = 5,
             // select β ∈ {0, 0.5, 1} by validation score (realistic user procedure)
             "fwsel" => m.fisher_weight_power = Some(f64::NAN),
             t if t.starts_with("fwp") => {
@@ -1090,7 +1126,7 @@ where
     let mut m = NGBoost::<D, S, HistogramLearner>::with_full_options(
         a.n_est,
         a.lr,
-        HistogramLearner::new(a.depth),
+        HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2),
         true,
         1.0,
         1.0,
@@ -1115,6 +1151,7 @@ where
             "libaffine" => libaffine = true,
             "joint" => m.staged_fit = Some(false),
             "staged" => m.staged_fit = Some(true),
+            "xfit" => m.staged_crossfit_folds = 5,
             "fw" => m.fisher_weighted_learner = true,
             t if t.starts_with("fwp") => {
                 m.fisher_weight_power = Some(t[3..].parse().expect("fwp<beta>"));
@@ -1175,6 +1212,84 @@ where
         )
         .unwrap();
     }
+    if std::env::var("NGB_PARAM_DIAG").is_ok() {
+        // per-column range of the model's own (unclamped) parameters on
+        // train / val / test
+        // (Cycle 19: where does an exploding LogNormal mean come from?)
+        let q = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[((v.len() - 1) as f64 * p).round() as usize]
+        };
+        for (name, xs) in [("train", xtr), ("val", xva), ("test", xte)] {
+            let p = m.pred_param_unbounded(xs);
+            for c in 0..p.ncols() {
+                let mut col: Vec<f64> = p.column(c).to_vec();
+                eprintln!(
+                    "PARAMDIAG {},{seed},{variant},{name},col{c},n={},min={:.4},q01={:.4},q50={:.4},q99={:.4},q999={:.4},max={:.4}",
+                    CURRENT_DS.lock().unwrap(),
+                    col.len(),
+                    q(&mut col, 0.0),
+                    q(&mut col, 0.01),
+                    q(&mut col, 0.5),
+                    q(&mut col, 0.99),
+                    q(&mut col, 0.999),
+                    q(&mut col, 1.0)
+                );
+            }
+        }
+        // what a ceiling on the scale column, k × the marginal scale, would
+        // do to the test scores (k = inf is the model as fitted)
+        if let Some(sc) = D::scale_param_index() {
+            // reference: the marginal scale (default) or, with
+            // NGB_CAP_REF=init, the model's stored scale intercept (after a
+            // staged fit: the rms residual scale given the location)
+            let by_init = std::env::var("NGB_CAP_REF").is_ok_and(|v| v == "init");
+            let s0 = if by_init {
+                m.init_params.as_ref().unwrap()[sc]
+            } else {
+                D::fit(ytr)[sc]
+            };
+            let ptr = m.pred_param_unbounded(xtr);
+            let pte = m.pred_param_unbounded(xte);
+            for k in [1.5_f64, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, f64::INFINITY] {
+                let ceil = s0 + k.ln();
+                let mut pc = pte.clone();
+                let mut hit = 0usize;
+                for v in pc.column_mut(sc).iter_mut() {
+                    if *v > ceil {
+                        *v = ceil;
+                        hit += 1;
+                    }
+                }
+                let hit_tr = ptr.column(sc).iter().filter(|&&v| v > ceil).count();
+                let d = D::from_params(&pc);
+                let nll_k = Scorable::<LogScore>::score(&d, yte).mean().unwrap();
+                let rmse_k = (&d.mean() - yte).mapv(|e| e * e).mean().unwrap().sqrt();
+                eprintln!(
+                    "CAPDIAG {},{seed},{variant},{k},{:.5},{:.5},{hit},{hit_tr},{:.4}",
+                    CURRENT_DS.lock().unwrap(),
+                    nll_k,
+                    rmse_k,
+                    s0
+                );
+            }
+        }
+        // the rows that dominate the squared error of the mean
+        let mut worst: Vec<(f64, usize)> = (0..yte.len())
+            .map(|i| ((mean[i] - yte[i]).powi(2), i))
+            .collect();
+        worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let p = m.pred_param_unbounded(xte);
+        for &(e, i) in worst.iter().take(3) {
+            eprintln!(
+                "PARAMDIAG {},{seed},{variant},worst,row{i},sqerr={e:.4e},y={:.4},mean={:.4e},params={:?}",
+                CURRENT_DS.lock().unwrap(),
+                yte[i],
+                mean[i],
+                p.row(i).to_vec()
+            );
+        }
+    }
     let mse = (&mean - yte).mapv(|e| e * e).mean().unwrap();
     let var = dist.variance().mean().unwrap();
     let cov = |alpha: f64| {
@@ -1227,7 +1342,7 @@ fn run_one_poisson(
     let mut m = NGBoost::<Poisson, LogScore, HistogramLearner>::with_full_options(
         a.n_est,
         a.lr,
-        HistogramLearner::new(a.depth),
+        HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2),
         true,
         1.0,
         1.0,
@@ -1340,7 +1455,7 @@ where
     let mut m = NGBoost::<NegativeBinomial, S, HistogramLearner>::with_full_options(
         a.n_est,
         a.lr,
-        HistogramLearner::new(a.depth),
+        HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2),
         true,
         1.0,
         1.0,
@@ -1455,7 +1570,7 @@ fn run_one_bernoulli(
     let mut m = NGBoost::<Bernoulli, LogScore, HistogramLearner>::with_full_options(
         a.n_est,
         a.lr,
-        HistogramLearner::new(a.depth),
+        HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2),
         true,
         1.0,
         1.0,
@@ -1547,7 +1662,7 @@ fn run_one_categorical<const K: usize>(
     let mut m = NGBoost::<Categorical<K>, LogScore, HistogramLearner>::with_full_options(
         a.n_est,
         a.lr,
-        HistogramLearner::new(a.depth),
+        HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2),
         true,
         1.0,
         1.0,
@@ -1652,7 +1767,7 @@ fn run_one_automix(
     macro_rules! run {
         ($m:expr) => {{
             let mut m = $m;
-            m.base_learner = HistogramLearner::new(a.depth);
+            m.base_learner = HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2);
             m.early_stopping_rounds = Some(a.patience);
             m.random_state = Some(seed);
             for tok in variant.split('+') {
@@ -1748,7 +1863,7 @@ fn run_one_normprobe(
         let mut m = NGBoost::with_full_options(
             a.n_est,
             a.lr,
-            HistogramLearner::new(a.depth),
+            HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2),
             true,
             1.0,
             1.0,
@@ -2117,7 +2232,7 @@ fn run_one_normprobe(
         .expect("fit failed");
     let r0 = base.base_models.len();
     let mut auto = NGBAutoMixtureRegressor::new(a.n_est, a.lr);
-    auto.base_learner = HistogramLearner::new(a.depth);
+    auto.base_learner = HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2);
     auto.early_stopping_rounds = Some(a.patience);
     auto.random_state = Some(seed);
     let normal_out = |m: &NGBoost<Normal, LogScore, HistogramLearner>, secs: f64| {
@@ -2335,7 +2450,7 @@ fn run_one_zero(
         let mut m = NGBoost::<D, S, HistogramLearner>::with_full_options(
             a.n_est,
             a.lr,
-            HistogramLearner::new(a.depth),
+            HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2),
             true,
             1.0,
             1.0,
@@ -2364,7 +2479,9 @@ fn run_one_zero(
             &cdf,
             &ppf,
             &d.logpdf(yte),
-            &d.mean(),
+            // the model's point prediction: the mean, except where the
+            // head bounds it by the largest training target (HurdleLogNormal)
+            &m.predict(xte),
             yte,
             m.base_models.len(),
             secs,
@@ -2419,7 +2536,7 @@ fn run_one_zero(
             use ngboost_rs::NGBAutoMixtureRegressor;
             let t = Instant::now();
             let mut m = NGBAutoMixtureRegressor::new(a.n_est, a.lr);
-            m.base_learner = HistogramLearner::new(a.depth);
+            m.base_learner = HistogramLearner::with_params(a.depth, 255, a.min_leaf, 2);
             m.early_stopping_rounds = Some(a.patience);
             m.random_state = Some(seed);
             if let Err(e) = m.fit(xtr, ytr, xva, yva) {
@@ -2529,6 +2646,9 @@ fn main() {
                     "bernoulli" => {
                         run_one_bernoulli(v, &a, seed, &xtr, &ytr, &xva, &yva, &xte, &yte)
                     }
+                    "studenttfv" => run_one_generic::<StudentTFiniteVar, LogScore>(
+                        None, v, &a, seed, &xtr, &ytr, &xva, &yva, &xte, &yte,
+                    ),
                     "studenttcrps" => run_one_generic::<StudentT, CRPScore>(
                         Some(exact_crps::<StudentT>),
                         v,
@@ -2543,6 +2663,18 @@ fn main() {
                     ),
                     "poissoncrps" => run_one_generic::<Poisson, CRPScore>(
                         Some(exact_crps::<Poisson>),
+                        v,
+                        &a,
+                        seed,
+                        &xtr,
+                        &ytr,
+                        &xva,
+                        &yva,
+                        &xte,
+                        &yte,
+                    ),
+                    "gammamean" => run_one_generic::<GammaMean, LogScore>(
+                        Some(|d: &GammaMean, y: &Array1<f64>| exact_crps(d.as_gamma(), y)),
                         v,
                         &a,
                         seed,

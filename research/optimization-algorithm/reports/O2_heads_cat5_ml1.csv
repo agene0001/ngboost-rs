@@ -1,0 +1,15 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+cat5_nl,0,base,87,0.17,1.15273,1.26425,0.64977,NaN,0.4600,NaN,0.0287,NaN,0.0130,NaN
+cat5_nl,1,base,59,0.20,1.14713,1.20764,0.62327,NaN,0.5008,NaN,0.0433,NaN,0.0250,NaN
+cat5_nl,2,base,35,0.10,1.19004,1.27143,0.65303,NaN,0.4592,NaN,0.0452,NaN,0.0081,NaN
+cat5_nl,3,base,116,0.19,1.10733,1.23858,0.64264,NaN,0.4567,NaN,0.0300,NaN,0.0334,NaN
+cat5_nl,4,base,53,0.12,1.17589,1.27667,0.65939,NaN,0.4642,NaN,0.0306,NaN,0.0187,NaN
+cat5_nl,5,base,43,0.11,1.18325,1.25565,0.65031,NaN,0.4625,NaN,0.0364,NaN,0.0177,NaN
+cat5_nl,6,base,68,0.13,1.16313,1.23561,0.64249,NaN,0.4792,NaN,0.0169,NaN,0.0171,NaN
+cat5_nl,7,base,38,0.10,1.20435,1.24095,0.64280,NaN,0.4717,NaN,0.0361,NaN,0.0175,NaN
+cat5_nl,8,base,160,0.27,1.07097,1.22488,0.63545,NaN,0.4875,NaN,0.0153,NaN,0.0133,NaN
+cat5_nl,9,base,151,0.23,1.09634,1.26213,0.64817,NaN,0.4800,NaN,0.0209,NaN,0.0235,NaN
+
+# SUMMARY (mean ± sd over 10 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# cat5_nl  base            81   1.2478±0.0220    0.6447±0.0101       NaN±NaN       0.472     NaN   0.030   0.019     NaN

@@ -12,17 +12,67 @@
 //! score, and learner without baking in any knowledge of which params belong
 //! where.
 //!
-//! # Example
+//! # Recommended search (since 1.3.0)
+//!
+//! [`default_search_space`] with [`default_histogram_model`] is the space
+//! measured in research Cycle 18 (`research/automl-hyperparameter/`): tuned
+//! configurations beat the library defaults by 0.06–0.27 held-out NLL on
+//! five of six datasets, with `min_samples_leaf` the strongest knob. Run
+//! end to end through this module (Cycle 19: 30 trials, 5 folds, five
+//! datasets × 8 seeds, the winner refitted and scored on untouched rows)
+//! it beat the 1.2.0 module example's space by 0.093 NLL on average (lower
+//! on 37 of 40 searches) and the untuned default by 0.077 (36 of 40); the
+//! 1.2.0 recipe was no better than not tuning (+0.016, 22 of 40). On
+//! LogNormal, Poisson and NegativeBinomial (Cycle 20, five datasets × 8
+//! seeds) the margins are about half: −0.045 against the 1.2.0 space (31
+//! of 40) and −0.037 against no tuning (34 of 40), never worse than not
+//! tuning, and no gain on a Poisson rate that barely varies. Those
+//! numbers are for the space without `max_bins`; adding that key (Cycle
+//! 23, eight dataset-head pairs × 8 seeds, same trial budget) lowered NLL
+//! by a further 0.009 (41 of 64 searches) — 0.03–0.05 on one smooth target,
+//! nothing beyond noise elsewhere.
+//!
+//! For heads with a staged fit, [`default_search_space_with_crossfit`]
+//! adds cross-fitting as a two-way choice: a further −0.043 NLL at the same
+//! trial count (42 of 56 searches), at several times the search time.
+//! Choosing the *head* by comparing two searches' CV scores did not pay
+//! (Cycle 24: +0.007 at equal total budget, and it picked the worse head on
+//! one dataset): choose the head from what you know about the target.
+//!
 //! ```ignore
-//! use ngboost_rs::hyper_opt::{hyper_opt_with_config, HyperOptConfig, PruningStrategy};
+//! use ngboost_rs::hyper_opt::{
+//!     default_histogram_model, default_search_space, hyper_opt_with_config, HyperOptConfig,
+//! };
+//! use ngboost_rs::{dist::Normal, learners::HistogramLearner, scores::LogScore};
+//!
+//! let cfg = HyperOptConfig { n_trials: 40, n_folds: 5, ..Default::default() };
+//! let result = hyper_opt_with_config::<Normal, LogScore, HistogramLearner, _>(
+//!     &x_train, &y_train, &default_search_space(), cfg,
+//!     default_histogram_model::<Normal, LogScore>,
+//! )?;
+//! // the deployable model: same builder, the winning parameters
+//! let mut model = default_histogram_model::<Normal, LogScore>(&result.best_params);
+//! model.fit(&x_train, &y_train)?;
+//! ```
+//!
+//! `n_estimators` is deliberately **not** searched. With early stopping it
+//! is only a cap, and a sampled cap of a few hundred rounds truncates low
+//! learning rates (0.05–0.3 NLL lost at learning rate ≤ 0.01 with caps of
+//! 500–1500). The builder sets the cap from the learning rate
+//! ([`default_round_cap`]) and lets early stopping choose the round count;
+//! [`HyperOptResult::opt_rounds`] reports what it chose.
+//!
+//! # Custom spaces
+//! ```ignore
+//! use ngboost_rs::hyper_opt::{default_round_cap, hyper_opt_with_config, HyperOptConfig, PruningStrategy};
 //! use ngboost_rs::{NGBoost, learners::HistogramLearner, dist::Poisson, scores::LogScore};
 //! use serde_json::json;
 //! use std::collections::HashMap;
 //!
 //! let mut hp = HashMap::new();
-//! hp.insert("learning_rate".into(), json!({"low": 0.005, "high": 0.1, "log": true}));
-//! hp.insert("max_depth".into(),     json!({"low": 2, "high": 8, "type": "int"}));
-//! hp.insert("n_estimators".into(),  json!({"low": 200, "high": 1500, "type": "int"}));
+//! hp.insert("learning_rate".into(),    json!({"low": 0.02, "high": 0.2, "log": true}));
+//! hp.insert("max_depth".into(),        json!({"low": 2, "high": 8, "type": "int"}));
+//! hp.insert("min_samples_leaf".into(), json!({"low": 5, "high": 200, "type": "int", "log": true}));
 //!
 //! let cfg = HyperOptConfig {
 //!     n_trials: 50,
@@ -34,18 +84,22 @@
 //! let result = hyper_opt_with_config::<Poisson, LogScore, HistogramLearner, _>(
 //!     &x_train, &y_train, &hp, cfg,
 //!     |params| {
-//!         let lr = params.get("learning_rate").and_then(|v| v.as_f64()).unwrap_or(0.01);
+//!         let lr = params.get("learning_rate").and_then(|v| v.as_f64()).unwrap_or(0.05);
 //!         let depth = params.get("max_depth").and_then(|v| v.as_i64()).unwrap_or(3) as usize;
-//!         let n_est = params.get("n_estimators").and_then(|v| v.as_i64()).unwrap_or(500) as u32;
+//!         let leaf = params.get("min_samples_leaf").and_then(|v| v.as_i64()).unwrap_or(20) as usize;
 //!         NGBoost::<Poisson, LogScore, HistogramLearner>::new(
-//!             n_est, lr, HistogramLearner::new(depth),
+//!             default_round_cap(lr), lr, HistogramLearner::with_params(depth, 255, leaf, 2),
 //!         )
 //!     },
 //! )?;
 //! ```
+//!
+//! Fold fits early-stop on the scoring fold with the builder's
+//! `early_stopping_rounds`, or [`cv_early_stopping_rounds`] of the model's
+//! learning rate when the builder leaves it unset.
 
 use crate::dist::{Distribution, DistributionMethods};
-use crate::learners::BaseLearner;
+use crate::learners::{BaseLearner, HistogramLearner};
 use crate::ngboost::NGBoost;
 use crate::scores::{Scorable, Score};
 use ndarray::{Array1, Array2, Axis, s};
@@ -792,9 +846,153 @@ fn value_to_raw(param_type: &HyperParamType, value: &Value) -> Option<f64> {
 // ============================================================================
 
 /// Early-stopping patience used for CV fold fits when the builder didn't set
-/// one. A fold model that stops improving for this many rounds halts instead of
-/// grinding through every sampled `n_estimators` — the dominant CV speedup.
-const CV_EARLY_STOPPING_ROUNDS: u32 = 50;
+/// one: `round(2.5 / learning_rate)`, clamped to 50…200 rounds. A fold model
+/// that stops improving for this many rounds halts instead of grinding
+/// through every round up to `n_estimators` — the dominant CV speedup.
+///
+/// Before 1.3.0 this was a fixed 50 rounds. A fixed count is a *shrinking*
+/// budget as the learning rate falls — 50 rounds at 0.01 move the model as
+/// far as 5 rounds at 0.1 — so low learning rates were stopped on noise:
+/// 0.01–0.04 held-out NLL lost at learning rate 0.01 (research Cycle 18,
+/// `research/automl-hyperparameter/reports/A3_lrcap_summary.txt`). The rule
+/// keeps the patience's shrinkage budget constant. Learning rates ≥ 0.05
+/// keep the old 50.
+pub fn cv_early_stopping_rounds(learning_rate: f64) -> u32 {
+    let r = (2.5 / learning_rate).round();
+    if r.is_finite() {
+        (r as u32).clamp(50, 200)
+    } else {
+        50
+    }
+}
+
+/// Round cap that does not truncate a learning rate: `ceil(100 /
+/// learning_rate)`, at most 6000. Meant as `n_estimators` wherever early
+/// stopping picks the actual round count (every `hyper_opt` fold): in
+/// Cycle 18 no early-stopped fit at learning rate 0.02–0.2 came within
+/// reach of it, while caps of 500–1500 cost 0.05–0.3 NLL at ≤ 0.01.
+pub fn default_round_cap(learning_rate: f64) -> u32 {
+    let r = (100.0 / learning_rate).ceil();
+    if r.is_finite() && r >= 1.0 {
+        (r as u32).min(6000)
+    } else {
+        6000
+    }
+}
+
+/// The recommended search space for `HistogramLearner` models, to be used
+/// with [`default_histogram_model`] as the builder:
+///
+/// | key | range | scale | why |
+/// |---|---|---|---|
+/// | `learning_rate` | 0.02 – 0.2 | log | nearly free once the round cap and patience scale with it; lower only costs time |
+/// | `max_depth` | 2 – 8 | linear int | the better direction is data-dependent |
+/// | `min_samples_leaf` | 5 – 200 | log int | the strongest single knob (selected median ≈ 50) |
+/// | `max_bins` | 8 – 255 | log int | coarse bins regularise smooth targets (kin8nm: selected median 18–19, −0.03…−0.05 NLL); others keep 60–175 |
+/// | `col_sample` | 0.6 – 1.0 | linear | below ≈ 0.6 it only hurt |
+///
+/// Not searched: `n_estimators` (a cap, see [`default_round_cap`]) and
+/// `minibatch_frac` (no measurable effect). The first four keys were
+/// measured with the Normal head under `LogScore` on six datasets of up to
+/// 12 000 rows; 20–40 trials is where the curve flattened. `max_bins` was
+/// added in 1.3.0 after a search with it beat the same search without it
+/// by 0.009 NLL on eight dataset-head pairs (lower on 41 of 64 searches,
+/// 30 trials each). To search without it, remove the key from the returned
+/// map. Add or override keys freely — the builder
+/// ignores keys it does not know and falls back to its defaults for
+/// missing ones.
+pub fn default_search_space() -> HashMap<String, Value> {
+    use serde_json::json;
+    let mut hp = HashMap::new();
+    hp.insert(
+        "learning_rate".to_string(),
+        json!({"low": 0.02, "high": 0.2, "log": true}),
+    );
+    hp.insert(
+        "max_depth".to_string(),
+        json!({"low": 2, "high": 8, "type": "int"}),
+    );
+    hp.insert(
+        "min_samples_leaf".to_string(),
+        json!({"low": 5, "high": 200, "type": "int", "log": true}),
+    );
+    hp.insert(
+        "max_bins".to_string(),
+        json!({"low": 8, "high": 255, "type": "int", "log": true}),
+    );
+    hp.insert("col_sample".to_string(), json!({"low": 0.6, "high": 1.0}));
+    hp
+}
+
+/// [`default_search_space`] plus `staged_crossfit_folds` ∈ {0, 5}: lets the
+/// search decide whether the staged fit's scale stages see cross-fitted
+/// residuals (`NGBoost::staged_crossfit_folds`). For heads with a staged
+/// fit only — Normal, LogNormal, StudentT, StudentTFiniteVar, GammaMean;
+/// on any other head the key does nothing and wastes a dimension.
+///
+/// Measured against the default space at the same 30 trials (research
+/// Cycle 24, Normal on five datasets and LogNormal on two, 8 seeds each):
+/// held-out NLL −0.043 pooled, lower on 42 of 56 searches, no dataset
+/// significantly worse (−0.16 … +0.004); the winning model used
+/// cross-fitting in 52 of 56 searches. RMSE did not improve (two datasets
+/// about 1 % worse, 1.6 standard errors). Cross-fitted trials cost several
+/// times a plain trial (a single fit is 2.4–6.6× slower), which is why the
+/// key is not in the default space.
+pub fn default_search_space_with_crossfit() -> HashMap<String, Value> {
+    let mut hp = default_search_space();
+    hp.insert(
+        "staged_crossfit_folds".to_string(),
+        serde_json::json!({"choices": [0, 5]}),
+    );
+    hp
+}
+
+/// Builder for [`default_search_space`]: a `HistogramLearner` model from a
+/// sampled (or winning) parameter map.
+///
+/// Reads `learning_rate` (default 0.05), `max_depth` (3),
+/// `min_samples_leaf` ([`HistogramLearner::DEFAULT_MIN_SAMPLES_LEAF`]),
+/// `max_bins` (255; clamped to 2–255), `col_sample` (1.0),
+/// `minibatch_frac` (1.0) and `staged_crossfit_folds` (0 = off; only acts
+/// on heads with a staged fit); out-of-range values are clamped into the
+/// valid domain. `n_estimators` is
+/// [`default_round_cap`] of the learning rate (an `n_estimators` key, if
+/// present, overrides it) and `early_stopping_rounds` is
+/// [`cv_early_stopping_rounds`], so the returned model early-stops both
+/// inside the search folds and in a later `fit` on the full training data
+/// (which then holds out `validation_fraction` of it).
+pub fn default_histogram_model<D, S>(
+    params: &HashMap<String, Value>,
+) -> NGBoost<D, S, HistogramLearner>
+where
+    D: Distribution + Scorable<S> + Clone,
+    S: Score,
+{
+    let f = |k: &str| params.get(k).and_then(|v| v.as_f64());
+    let lr = f("learning_rate")
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.05);
+    let depth = f("max_depth").map_or(3, |v| v.round().max(1.0) as usize);
+    // no key: the library default, which adapts to small data; a sampled
+    // leaf size is used exactly as given
+    let mut learner = match f("min_samples_leaf") {
+        Some(v) => HistogramLearner::with_params(depth, 255, v.round().max(1.0) as usize, 2),
+        None => HistogramLearner::new(depth),
+    };
+    if let Some(b) = f("max_bins").filter(|v| v.is_finite()) {
+        learner.max_bins = (b.round().max(2.0) as usize).min(255);
+    }
+    let rounds = f("n_estimators").map_or(default_round_cap(lr), |v| v.round().max(1.0) as u32);
+    let mut m = NGBoost::<D, S, HistogramLearner>::new(rounds, lr, learner);
+    let frac = |v: f64| if v > 0.0 { v.min(1.0) } else { 1.0 };
+    m.col_sample = f("col_sample").map_or(1.0, frac);
+    m.minibatch_frac = f("minibatch_frac").map_or(1.0, frac);
+    m.early_stopping_rounds = Some(cv_early_stopping_rounds(lr));
+    if let Some(k) = f("staged_crossfit_folds").filter(|v| v.is_finite()) {
+        m.staged_crossfit_folds = k.round().max(0.0) as usize;
+    }
+    m
+}
 
 /// Sequentially fits a fresh `NGBoost` on each (k-1)/k slice of the data, scores
 /// it against the held-out fold, and returns `(mean_score, was_pruned,
@@ -993,7 +1191,7 @@ where
         // recalibration (`auto_calibrate_scale`): it is fitted on this fold,
         // so each trial is scored as the calibrated model it would deploy as.
         if model.early_stopping_rounds.is_none() {
-            model.early_stopping_rounds = Some(CV_EARLY_STOPPING_ROUNDS);
+            model.early_stopping_rounds = Some(cv_early_stopping_rounds(model.learning_rate));
         }
 
         // Weight the fold's TRAIN rows the same way the caller's final fit
@@ -1291,6 +1489,169 @@ mod tests {
     use crate::scores::LogScore;
     use ndarray::Array;
     use serde_json::json;
+
+    #[test]
+    fn fold_patience_and_round_cap_scale_with_the_learning_rate() {
+        // ≥ 0.05 keeps the pre-1.3 patience of 50
+        for lr in [0.05, 0.1, 0.2, 1.0] {
+            assert_eq!(cv_early_stopping_rounds(lr), 50, "lr {lr}");
+        }
+        assert_eq!(cv_early_stopping_rounds(0.02), 125);
+        assert_eq!(cv_early_stopping_rounds(0.0125), 200);
+        assert_eq!(cv_early_stopping_rounds(0.001), 200);
+        // degenerate learning rates never produce 0 or overflow
+        assert_eq!(cv_early_stopping_rounds(0.0), 50);
+        assert_eq!(cv_early_stopping_rounds(f64::NAN), 50);
+        assert_eq!(cv_early_stopping_rounds(-1.0), 50);
+
+        assert_eq!(default_round_cap(0.2), 500);
+        assert_eq!(default_round_cap(0.05), 2000);
+        assert_eq!(default_round_cap(0.02), 5000);
+        assert_eq!(default_round_cap(0.01), 6000);
+        assert_eq!(default_round_cap(0.0), 6000);
+        assert_eq!(default_round_cap(f64::NAN), 6000);
+        assert_eq!(default_round_cap(500.0), 1);
+    }
+
+    #[test]
+    fn default_space_parses_and_omits_n_estimators() {
+        let specs = parse_hp_specs(&default_search_space()).unwrap();
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "col_sample",
+                "learning_rate",
+                "max_bins",
+                "max_depth",
+                "min_samples_leaf"
+            ]
+        );
+        for spec in &specs {
+            match (&spec.name[..], &spec.param_type) {
+                ("learning_rate", HyperParamType::Float { log: true, .. })
+                | ("col_sample", HyperParamType::Float { log: false, .. })
+                | ("max_depth", HyperParamType::Int { log: false, .. })
+                | ("max_bins", HyperParamType::Int { log: true, .. })
+                | ("min_samples_leaf", HyperParamType::Int { log: true, .. }) => {}
+                other => panic!("unexpected spec {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn default_builder_reads_the_space_and_sets_the_budget() {
+        let mut p: HashMap<String, Value> = HashMap::new();
+        let m = default_histogram_model::<Normal, LogScore>(&p);
+        assert_eq!(m.learning_rate, 0.05);
+        assert_eq!(m.n_estimators, 2000);
+        assert_eq!(m.early_stopping_rounds, Some(50));
+        assert_eq!((m.col_sample, m.minibatch_frac), (1.0, 1.0));
+
+        p.insert("learning_rate".into(), json!(0.02));
+        p.insert("max_depth".into(), json!(5));
+        p.insert("min_samples_leaf".into(), json!(40.0)); // JSON float round-trip
+        p.insert("col_sample".into(), json!(0.7));
+        p.insert("unknown_key".into(), json!("ignored"));
+        let m = default_histogram_model::<Normal, LogScore>(&p);
+        assert_eq!(m.learning_rate, 0.02);
+        assert_eq!(m.n_estimators, 5000);
+        assert_eq!(m.early_stopping_rounds, Some(125));
+        assert_eq!(m.col_sample, 0.7);
+
+        // tree shape: the library's adaptive default leaf without a leaf
+        // key, the sampled leaf exactly with one; `max_bins` either way
+        let d = default_histogram_model::<Normal, LogScore>(&HashMap::new());
+        let l = d.base_learner();
+        assert_eq!(
+            (l.max_depth, l.max_bins, l.min_samples_leaf, l.adaptive_leaf),
+            (3, 255, 20, true)
+        );
+        let l = m.base_learner();
+        assert_eq!(
+            (l.max_depth, l.max_bins, l.min_samples_leaf, l.adaptive_leaf),
+            (5, 255, 40, false)
+        );
+        for (given, want) in [(32.0, 32), (8.4, 8), (1.0, 2), (4000.0, 255)] {
+            p.insert("max_bins".into(), json!(given));
+            let b = default_histogram_model::<Normal, LogScore>(&p);
+            assert_eq!(b.base_learner().max_bins, want, "max_bins {given}");
+            assert_eq!(b.base_learner().min_samples_leaf, 40);
+        }
+        let mut only_bins: HashMap<String, Value> = HashMap::new();
+        only_bins.insert("max_bins".into(), json!(16));
+        let b = default_histogram_model::<Normal, LogScore>(&only_bins);
+        assert_eq!(
+            (b.base_learner().max_bins, b.base_learner().adaptive_leaf),
+            (16, true)
+        );
+
+        // cross-fitting is off unless the key is there
+        assert_eq!(b.staged_crossfit_folds, 0);
+        only_bins.insert("staged_crossfit_folds".into(), json!(5));
+        let b = default_histogram_model::<Normal, LogScore>(&only_bins);
+        assert_eq!(b.staged_crossfit_folds, 5);
+        only_bins.insert("staged_crossfit_folds".into(), json!(-3));
+        let b = default_histogram_model::<Normal, LogScore>(&only_bins);
+        assert_eq!(b.staged_crossfit_folds, 0);
+        // a two-way choice parses as a categorical key
+        let hp = default_search_space_with_crossfit();
+        assert_eq!(hp.len(), default_search_space().len() + 1);
+        assert!(parse_hp_specs(&hp).unwrap().iter().any(|s| {
+            s.name == "staged_crossfit_folds"
+                && matches!(s.param_type, HyperParamType::Categorical { .. })
+        }));
+
+        // invalid values fall back instead of producing an unfittable model
+        p.insert("learning_rate".into(), json!(-1.0));
+        p.insert("col_sample".into(), json!(7.0));
+        p.insert("min_samples_leaf".into(), json!(0));
+        let m = default_histogram_model::<Normal, LogScore>(&p);
+        assert_eq!(m.learning_rate, 0.05);
+        assert_eq!(m.col_sample, 1.0);
+    }
+
+    /// The recommended search end to end: finite scores, parameters from
+    /// the space, and a round count chosen by early stopping, not the cap.
+    #[test]
+    fn default_space_search_runs_end_to_end() {
+        let n = 400usize;
+        let features = Array::from_shape_fn((n, 3), |(i, j)| {
+            (((i * 37 + j * 101) % 97) as f64 / 97.0) * 4.0 - 2.0
+        });
+        let labels = Array::from_shape_fn(n, |i| {
+            let x0 = features[[i, 0]];
+            x0.sin() * 2.0 + features[[i, 1]] + (((i * 53) % 29) as f64 / 29.0 - 0.5)
+        });
+        let config = HyperOptConfig {
+            n_trials: 4,
+            n_folds: 2,
+            seed: 3,
+            verbose: false,
+            ..Default::default()
+        };
+        let r = hyper_opt_with_config::<Normal, LogScore, HistogramLearner, _>(
+            &features,
+            &labels,
+            &default_search_space(),
+            config,
+            default_histogram_model::<Normal, LogScore>,
+        )
+        .expect("search should not error");
+        assert!(r.best_score.is_finite());
+        assert_eq!(r.trials.len(), 4);
+        let lr = r.best_params["learning_rate"].as_f64().unwrap();
+        assert!((0.02..=0.2).contains(&lr));
+        let leaf = r.best_params["min_samples_leaf"].as_i64().unwrap();
+        assert!((5..=200).contains(&leaf));
+        assert!(!r.best_params.contains_key("n_estimators"));
+        assert!(
+            r.opt_rounds > 0 && (r.opt_rounds as u32) < default_round_cap(lr),
+            "early stopping should pick the rounds: {} of cap {}",
+            r.opt_rounds,
+            default_round_cap(lr)
+        );
+    }
 
     /// A weighted CV search must actually SEARCH. `fit_internal` rejects a
     /// weighted train set paired with `None` validation weights whenever

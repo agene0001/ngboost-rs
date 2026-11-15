@@ -680,30 +680,70 @@ pub fn ridge_learner(alpha: f64) -> RidgeLearner {
 pub struct HistogramLearner {
     pub max_depth: usize,
     pub max_bins: usize,
+    /// Minimum rows per leaf. With [`Self::adaptive_leaf`] this is the upper
+    /// bound of the size actually used.
     pub min_samples_leaf: usize,
     pub min_samples_split: usize,
+    /// Shrink the leaf size on small data: a tree fitted on `n` rows uses
+    /// [`adaptive_min_samples_leaf`]`(min_samples_leaf, n)` = `min(
+    /// min_samples_leaf, max(1, n / 10))`. On for [`HistogramLearner::new`]
+    /// and [`HistogramLearner::default_histogram`], off for
+    /// [`HistogramLearner::with_params`] (an explicit leaf size is used as
+    /// given). Since 1.3.0.
+    pub adaptive_leaf: bool,
 }
 
 impl HistogramLearner {
+    /// Default `min_samples_leaf` of [`HistogramLearner::new`] and
+    /// [`HistogramLearner::default_histogram`] (1 before 1.3.0).
+    ///
+    /// Measured (research Cycle 18, `research/optimization-algorithm/
+    /// proposals/O2_leaf_regularisation.md`): against leaf 1 at depth 3,
+    /// leaf 20 lowered held-out NLL by 0.014–0.062 on six datasets at 2100
+    /// training rows (8–10 of 10 seeds each) and more at 210–490 rows, and
+    /// was never significantly worse in 50 dataset × head cases (Normal,
+    /// LogNormal, Laplace, Poisson, NegativeBinomial, Bernoulli, GammaMean,
+    /// Categorical K = 3…8, the hurdle heads, NormalMixture2).
+    /// The gain comes from the location trees. It is also the default of
+    /// LightGBM (`min_data_in_leaf`) and scikit-learn's
+    /// `HistGradientBoostingRegressor`.
+    ///
+    /// Below 200 training rows a leaf of 20 is too coarse (at 70–140 rows
+    /// one dataset lost 4–25 % RMSE to it), so the default constructors also
+    /// set [`Self::adaptive_leaf`]: the leaf shrinks to a tenth of the rows
+    /// the tree is fitted on (see [`adaptive_min_samples_leaf`]). Pass 1
+    /// through [`Self::with_params`] to reproduce pre-1.3 fits.
+    pub const DEFAULT_MIN_SAMPLES_LEAF: usize = 20;
+
+    /// A depth-`max_depth` histogram tree with 255 bins,
+    /// `min_samples_leaf` = [`Self::DEFAULT_MIN_SAMPLES_LEAF`] and
+    /// [`Self::adaptive_leaf`] on.
     pub fn new(max_depth: usize) -> Self {
         HistogramLearner {
             max_depth,
             max_bins: 255, // Like LightGBM default
-            min_samples_leaf: 1,
+            min_samples_leaf: Self::DEFAULT_MIN_SAMPLES_LEAF,
             min_samples_split: 2,
+            adaptive_leaf: true,
+        }
+    }
+
+    /// The leaf size used for a tree fitted on `n_rows` rows.
+    pub fn effective_min_samples_leaf(&self, n_rows: usize) -> usize {
+        if self.adaptive_leaf {
+            adaptive_min_samples_leaf(self.min_samples_leaf, n_rows)
+        } else {
+            self.min_samples_leaf
         }
     }
 
     /// Create with default settings matching typical gradient boosting defaults
     pub fn default_histogram() -> Self {
-        HistogramLearner {
-            max_depth: 3,
-            max_bins: 255,
-            min_samples_leaf: 1,
-            min_samples_split: 2,
-        }
+        Self::new(3)
     }
 
+    /// Explicit settings; `min_samples_leaf` is used exactly as given
+    /// ([`Self::adaptive_leaf`] off).
     pub fn with_params(
         max_depth: usize,
         max_bins: usize,
@@ -715,6 +755,7 @@ impl HistogramLearner {
             max_bins,
             min_samples_leaf,
             min_samples_split,
+            adaptive_leaf: false,
         }
     }
 }
@@ -933,6 +974,7 @@ impl HistogramLearner {
             return Err("y length does not match cached X");
         }
 
+        let min_samples_leaf = self.effective_min_samples_leaf(indices.len());
         let root_hists = FeatureHists::build(cache, &indices, y, sample_weight);
         let root = build_histogram_tree_node(
             cache,
@@ -943,7 +985,7 @@ impl HistogramLearner {
             0,
             self.max_depth,
             self.min_samples_split,
-            self.min_samples_leaf,
+            min_samples_leaf,
             preds,
         );
 
@@ -973,6 +1015,7 @@ impl HistogramLearner {
             return Err("cols contains an out-of-range feature index");
         }
 
+        let min_samples_leaf = self.effective_min_samples_leaf(indices.len());
         let root_hists = FeatureHists::build_cols(cache, &indices, y, sample_weight, cols);
         let root = build_histogram_tree_node_cols(
             cache,
@@ -984,7 +1027,7 @@ impl HistogramLearner {
             0,
             self.max_depth,
             self.min_samples_split,
-            self.min_samples_leaf,
+            min_samples_leaf,
             preds,
         );
 
@@ -2240,6 +2283,21 @@ pub fn histogram_learner() -> HistogramLearner {
     HistogramLearner::default_histogram()
 }
 
+/// Leaf size of the default tree learners on `n_rows` training rows:
+/// `min(cap, max(1, n_rows / 10))` — a tenth of the rows, at most `cap`
+/// (20 for the default constructors, so nothing changes from 200 rows up).
+///
+/// Measured (research Cycle 19, `research/optimization-algorithm/
+/// proposals/O6_adaptive_leaf.md`; Normal head, six datasets × 20 seeds)
+/// against a fixed leaf of 20: RMSE −5.0 % (se 1.2) at 70 training rows,
+/// −1.7 % (0.8) at 105 and −1.2 % (0.5) at 140, pooled over datasets, with
+/// lower NLL on 207 of 360 fits; one dataset carries most of it (−4…−25 %
+/// RMSE) and none was significantly worse. At 210 rows every smaller leaf
+/// lost to 20.
+pub fn adaptive_min_samples_leaf(cap: usize, n_rows: usize) -> usize {
+    cap.min((n_rows / 10).max(1))
+}
+
 // ============================================================================
 // Decision Tree Learner (configurable depth, matching sklearn's default behavior)
 // ============================================================================
@@ -2250,24 +2308,51 @@ pub fn histogram_learner() -> HistogramLearner {
 pub struct DecisionTreeLearner {
     pub max_depth: usize,
     pub min_samples_split: usize,
+    /// Minimum rows per leaf. With [`Self::adaptive_leaf`] this is the upper
+    /// bound of the size actually used.
     pub min_samples_leaf: usize,
+    /// Shrink the leaf size on small data, as
+    /// [`HistogramLearner::adaptive_leaf`] does. On for [`Self::new`], off
+    /// for [`Self::default_sklearn`] and [`Self::with_params`]. Since 1.3.0.
+    pub adaptive_leaf: bool,
 }
 
 impl DecisionTreeLearner {
+    /// A depth-`max_depth` tree with the library's default leaf size:
+    /// `min_samples_leaf` = [`HistogramLearner::DEFAULT_MIN_SAMPLES_LEAF`]
+    /// (1 before 1.3.0) with [`Self::adaptive_leaf`] on, the same as
+    /// [`HistogramLearner::new`]. Measured for this learner (research
+    /// Cycle 19, Normal head, six datasets × 10 seeds): against leaf 1,
+    /// held-out NLL −0.01…−0.17 at 210, 490 and 2100 training rows, lower
+    /// on 7–10 of 10 seeds in all 18 cases. For scikit-learn's defaults
+    /// (leaf 1) use [`Self::default_sklearn`].
     pub fn new(max_depth: usize) -> Self {
         DecisionTreeLearner {
             max_depth,
             min_samples_split: 2,
-            min_samples_leaf: 1,
+            min_samples_leaf: HistogramLearner::DEFAULT_MIN_SAMPLES_LEAF,
+            adaptive_leaf: true,
         }
     }
 
-    /// Create a decision tree learner matching Python's default settings
+    /// The leaf size used for a tree fitted on `n_rows` rows.
+    pub fn effective_min_samples_leaf(&self, n_rows: usize) -> usize {
+        if self.adaptive_leaf {
+            adaptive_min_samples_leaf(self.min_samples_leaf, n_rows)
+        } else {
+            self.min_samples_leaf
+        }
+    }
+
+    /// A decision tree learner matching Python NGBoost's default base
+    /// learner (scikit-learn defaults: depth 3, `min_samples_leaf` 1, not
+    /// adaptive). [`Self::new`] uses the library's own leaf default instead.
     pub fn default_sklearn() -> Self {
         DecisionTreeLearner {
             max_depth: 3,
             min_samples_split: 2,
             min_samples_leaf: 1,
+            adaptive_leaf: false,
         }
     }
 
@@ -2280,6 +2365,7 @@ impl DecisionTreeLearner {
             max_depth,
             min_samples_split,
             min_samples_leaf,
+            adaptive_leaf: false,
         }
     }
 }
@@ -2305,7 +2391,7 @@ impl BaseLearner for DecisionTreeLearner {
             0,
             self.max_depth,
             self.min_samples_split,
-            self.min_samples_leaf,
+            self.effective_min_samples_leaf(x.nrows()),
             &mut goes_left,
         );
 
@@ -2768,24 +2854,51 @@ impl TrainedBaseLearner for ArenaDecisionTree {
 pub struct ArenaDecisionTreeLearner {
     pub max_depth: usize,
     pub min_samples_split: usize,
+    /// Minimum rows per leaf. With [`Self::adaptive_leaf`] this is the upper
+    /// bound of the size actually used.
     pub min_samples_leaf: usize,
+    /// Shrink the leaf size on small data, as
+    /// [`HistogramLearner::adaptive_leaf`] does. On for [`Self::new`], off
+    /// for [`Self::default_sklearn`] and [`Self::with_params`]. Since 1.3.0.
+    pub adaptive_leaf: bool,
 }
 
 impl ArenaDecisionTreeLearner {
+    /// A depth-`max_depth` tree with the library's default leaf size:
+    /// `min_samples_leaf` = [`HistogramLearner::DEFAULT_MIN_SAMPLES_LEAF`]
+    /// (1 before 1.3.0) with [`Self::adaptive_leaf`] on, the same as
+    /// [`HistogramLearner::new`]. Measured for this learner (research
+    /// Cycle 19, Normal head, six datasets × 10 seeds, 2100 training rows):
+    /// against leaf 1, held-out NLL −0.02…−0.08 on five datasets (7–10 of
+    /// 10 seeds) and unchanged on the sixth. For scikit-learn's defaults
+    /// (leaf 1) use [`Self::default_sklearn`].
     pub fn new(max_depth: usize) -> Self {
         ArenaDecisionTreeLearner {
             max_depth,
             min_samples_split: 2,
-            min_samples_leaf: 1,
+            min_samples_leaf: HistogramLearner::DEFAULT_MIN_SAMPLES_LEAF,
+            adaptive_leaf: true,
         }
     }
 
-    /// Create an arena tree learner matching Python's default settings
+    /// The leaf size used for a tree fitted on `n_rows` rows.
+    pub fn effective_min_samples_leaf(&self, n_rows: usize) -> usize {
+        if self.adaptive_leaf {
+            adaptive_min_samples_leaf(self.min_samples_leaf, n_rows)
+        } else {
+            self.min_samples_leaf
+        }
+    }
+
+    /// An arena tree learner matching Python NGBoost's default base learner
+    /// (scikit-learn defaults: depth 3, `min_samples_leaf` 1, not adaptive).
+    /// [`Self::new`] uses the library's own leaf default instead.
     pub fn default_sklearn() -> Self {
         ArenaDecisionTreeLearner {
             max_depth: 3,
             min_samples_split: 2,
             min_samples_leaf: 1,
+            adaptive_leaf: false,
         }
     }
 
@@ -2798,6 +2911,7 @@ impl ArenaDecisionTreeLearner {
             max_depth,
             min_samples_split,
             min_samples_leaf,
+            adaptive_leaf: false,
         }
     }
 }
@@ -2837,7 +2951,7 @@ impl BaseLearner for ArenaDecisionTreeLearner {
             0,
             self.max_depth,
             self.min_samples_split,
-            self.min_samples_leaf,
+            self.effective_min_samples_leaf(x.nrows()),
             &mut sort_buf,
         );
 
@@ -3993,6 +4107,7 @@ mod histogram_tests {
             max_bins: 255,
             min_samples_leaf: 400,
             min_samples_split: 2,
+            adaptive_leaf: false,
         };
         let (fitted, scattered) = learner.fit_predict_cached(&x, &y, None, None).unwrap();
         let walked = fitted.predict(&x);

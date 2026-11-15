@@ -1,0 +1,25 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+cat3_nl,0,base,13,0.06,0.76063,0.98219,0.58952,NaN,0.4750,NaN,0.0861,NaN,0.0720,NaN
+cat3_nl,1,base,10,0.08,0.80242,0.95225,0.56580,NaN,0.6000,NaN,0.1552,NaN,0.0114,NaN
+cat3_nl,2,base,18,0.02,0.65180,0.95420,0.56723,NaN,0.6000,NaN,0.1165,NaN,0.0607,NaN
+cat3_nl,3,base,54,0.03,0.56987,1.14645,0.69850,NaN,0.4500,NaN,0.2078,NaN,0.1404,NaN
+cat3_nl,4,base,7,0.02,0.90266,0.95216,0.56229,NaN,0.6000,NaN,0.1526,NaN,0.0756,NaN
+cat3_nl,5,base,2,0.02,1.00317,1.05156,0.63581,NaN,0.5000,NaN,0.1433,NaN,0.0387,NaN
+cat3_nl,6,base,33,0.03,0.49084,0.84204,0.51044,NaN,0.6000,NaN,0.1785,NaN,0.1201,NaN
+cat3_nl,7,base,74,0.06,0.39033,1.15272,0.70218,NaN,0.5000,NaN,0.2188,NaN,0.1448,NaN
+cat3_nl,8,base,158,0.08,0.29517,1.31690,0.80912,NaN,0.3250,NaN,0.3278,NaN,0.0185,NaN
+cat3_nl,9,base,21,0.02,0.58160,1.03268,0.61274,NaN,0.5000,NaN,0.2044,NaN,0.1377,NaN
+cat3_nl,10,base,86,0.03,0.41248,1.14649,0.65716,NaN,0.4500,NaN,0.2071,NaN,0.1249,NaN
+cat3_nl,11,base,17,0.03,0.66867,0.88571,0.52979,NaN,0.5500,NaN,0.1029,NaN,0.0680,NaN
+cat3_nl,12,base,11,0.02,0.76964,1.00868,0.61489,NaN,0.3750,NaN,0.1967,NaN,0.0860,NaN
+cat3_nl,13,base,8,0.02,0.84409,1.01078,0.59670,NaN,0.5500,NaN,0.1126,NaN,0.0251,NaN
+cat3_nl,14,base,18,0.04,0.72958,0.99121,0.59671,NaN,0.5500,NaN,0.2923,NaN,0.0660,NaN
+cat3_nl,15,base,10,0.04,0.82292,1.05653,0.63483,NaN,0.4500,NaN,0.0831,NaN,0.0566,NaN
+cat3_nl,16,base,2,0.03,1.00037,1.10887,0.67155,NaN,0.3500,NaN,0.0529,NaN,0.2742,NaN
+cat3_nl,17,base,3,0.03,0.96036,1.01534,0.61198,NaN,0.5750,NaN,0.1574,NaN,0.0126,NaN
+cat3_nl,18,base,8,0.03,0.81644,1.03646,0.61729,NaN,0.5000,NaN,0.0593,NaN,0.0545,NaN
+cat3_nl,19,base,3,0.03,0.97444,1.02050,0.61301,NaN,0.4500,NaN,0.1816,NaN,0.0572,NaN
+
+# SUMMARY (mean ± sd over 20 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# cat3_nl  base            28   1.0332±0.1053    0.6199±0.0667       NaN±NaN       0.497     NaN   0.162   0.082     NaN

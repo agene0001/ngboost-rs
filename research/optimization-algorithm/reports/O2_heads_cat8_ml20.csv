@@ -1,0 +1,15 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+support_dzgroup,0,base,271,0.98,0.78719,1.10489,0.53400,NaN,0.5993,NaN,0.0247,NaN,0.0189,NaN
+support_dzgroup,1,base,162,0.68,0.85254,1.10153,0.53674,NaN,0.5922,NaN,0.0271,NaN,0.0086,NaN
+support_dzgroup,2,base,205,0.76,0.80750,1.07776,0.52905,NaN,0.5988,NaN,0.0168,NaN,0.0097,NaN
+support_dzgroup,3,base,220,0.80,0.80564,1.10660,0.54018,NaN,0.5911,NaN,0.0350,NaN,0.0158,NaN
+support_dzgroup,4,base,156,0.61,0.87875,1.11728,0.54140,NaN,0.6004,NaN,0.0190,NaN,0.0105,NaN
+support_dzgroup,5,base,157,0.69,0.86224,1.09239,0.53491,NaN,0.5960,NaN,0.0185,NaN,0.0173,NaN
+support_dzgroup,6,base,226,0.81,0.79125,1.08977,0.53601,NaN,0.5966,NaN,0.0320,NaN,0.0079,NaN
+support_dzgroup,7,base,155,0.60,0.85606,1.09426,0.53440,NaN,0.5982,NaN,0.0195,NaN,0.0112,NaN
+support_dzgroup,8,base,245,0.91,0.80764,1.11544,0.53274,NaN,0.6081,NaN,0.0246,NaN,0.0181,NaN
+support_dzgroup,9,base,291,1.02,0.76424,1.14687,0.54279,NaN,0.6026,NaN,0.0268,NaN,0.0100,NaN
+
+# SUMMARY (mean ± sd over 10 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# support_dzgroup base           209   1.1047±0.0191    0.5362±0.0042       NaN±NaN       0.598     NaN   0.024   0.013     NaN

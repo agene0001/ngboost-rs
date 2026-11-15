@@ -1,0 +1,38 @@
+arm k5 - off, rule U
+paired fits: 80; non-finite or failed: off 0, k5 0
+
+By pool size (mean over head x dataset pairs; se over pair means)
+  size pairs     dNLL     se     lower  dRMSE%    se cov off  cov on time x staged off
+   800     4  -0.0214 0.0306   29/40     -1.07  0.47   0.886   0.890   4.65    40/40  
+  3200     4  -0.0626 0.0118   37/40     -0.86  0.51   0.897   0.903   4.39    40/40  
+
+By head x dataset (per-seed mean over sizes; se over seeds)
+head        dataset          dNLL     se     t     lower  dRMSE%    se     t
+lognormal   kin8nm        -0.0693 0.0081  -8.6   17/20     -1.47  1.26  -1.2
+normal      het_a         -0.0702 0.0242  -2.9   17/20     -1.94  2.73  -0.7
+normal      kin8nm        -0.0384 0.0054  -7.1   19/20     -0.42  0.31  -1.4
+normal      protein       +0.0099 0.0262  +0.4   13/20     -0.04  0.29  -0.1
+
+Cells
+head        dataset        size     dNLL     se     t   low  dRMSE% cov off cov on time x off is
+lognormal   kin8nm          800  -0.0426 0.0147  -2.9  7/10   -1.17  0.888  0.902   5.65 staged
+lognormal   kin8nm         3200  -0.0959 0.0119  -8.0 10/10   -1.78  0.901  0.907   3.29 staged
+normal      het_a           800  -0.0774 0.0322  -2.4  9/10   -2.19  0.902  0.900   4.12 staged
+normal      het_a          3200  -0.0630 0.0229  -2.7  8/10   -1.69  0.892  0.898   4.79 staged
+normal      kin8nm          800  -0.0312 0.0078  -4.0  9/10   -1.05  0.866  0.873   4.21 staged
+normal      kin8nm         3200  -0.0456 0.0061  -7.5 10/10   +0.21  0.891  0.893   4.81 staged
+normal      protein         800  +0.0655 0.0441  +1.5  4/10   +0.11  0.886  0.885   4.83 staged
+normal      protein        3200  -0.0457 0.0367  -1.2  9/10   -0.19  0.904  0.912   4.81 staged
+
+Pooled
+  dNLL over fits -0.0420; over pair means -0.0420 (se 0.0188, t -2.2, 4 pairs)
+  lower on 66/80 fits (82 %)
+  dRMSE over pair means -0.97 % (se 0.44)
+  coverage off 0.891, on 0.896
+  wall time, sum on / sum off: 4.44
+
+Decision rule
+  R1 benefit           pass
+  R2 no harm           pass  pairs [] cells []
+  R3 point predictions pass  pairs []
+  R4 robustness        pass

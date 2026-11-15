@@ -1,0 +1,44 @@
+Δ = arm − newbins on the test block (negative = better); n = seeds present in both
+
+test_nll
+  lognormal_kin8nm | new +0.0509 (0.0127) 0/8 | newbins -0.4267 (n=8) | xfit -0.1586 (0.0184) 8/8
+  lognormal_lognorm_het | new +0.0070 (0.0070) 2/8 | newbins 1.9367 (n=8) | xfit +0.0010 (0.0083) 4/8
+  normal_het_a | new -0.0009 (0.0074) 4/8 | newbins 1.2095 (n=8) | xfit -0.0300 (0.0133) 7/8
+  normal_het_b | new -0.0235 (0.0155) 5/8 | newbins 0.6270 (n=8) | xfit +0.0037 (0.0100) 4/8
+  normal_kin8nm | new +0.0259 (0.0136) 1/8 | newbins -0.5935 (n=8) | xfit -0.0387 (0.0161) 6/8
+  normal_protein | new +0.0096 (0.0082) 2/8 | newbins 2.9154 (n=8) | xfit -0.0115 (0.0136) 6/8
+  normal_tnoise | new +0.0091 (0.0186) 4/8 | newbins 1.2996 (n=8) | xfit -0.0637 (0.0246) 7/8
+  pooled   | new +0.0112 (0.0053) 18/56 | xfit -0.0425 (0.0090) 42/56
+
+test_rmse
+  lognormal_kin8nm | new +0.0051 (0.0019) 1/8 | newbins 0.1378 (n=8) | xfit -0.0050 (0.0013) 8/8
+  lognormal_lognorm_het | new +0.0305 (0.0469) 4/8 | newbins 4.5782 (n=8) | xfit +0.0520 (0.0309) 3/8
+  normal_het_a | new +0.0044 (0.0054) 4/8 | newbins 1.0202 (n=8) | xfit +0.0019 (0.0068) 4/8
+  normal_het_b | new -0.0022 (0.0073) 5/8 | newbins 0.9503 (n=8) | xfit +0.0014 (0.0062) 2/8
+  normal_kin8nm | new +0.0052 (0.0017) 1/8 | newbins 0.1367 (n=8) | xfit +0.0039 (0.0026) 3/8
+  normal_protein | new +0.0157 (0.0253) 4/8 | newbins 4.5663 (n=8) | xfit +0.0472 (0.0289) 3/8
+  normal_tnoise | new +0.0010 (0.0049) 3/8 | newbins 1.1197 (n=8) | xfit -0.0039 (0.0055) 5/8
+  pooled   | new +0.0085 (0.0075) 22/56 | xfit +0.0139 (0.0066) 28/56
+
+search seconds (mean), refit rounds (mean), winning parameters (median)
+  lognormal_kin8nm new       secs    95.5  rounds     819  cap   3051  lr 0.033 depth 7 leaf 83 col 0.85
+  lognormal_kin8nm newbins   secs    63.2  rounds     638  cap   2641  lr 0.040 depth 6 leaf 70 col 0.91 bins 19
+  lognormal_kin8nm xfit      secs   450.8  rounds    1052  cap   2248  lr 0.049 depth 7 leaf 109 col 0.94 bins 29
+  lognormal_lognorm_het new       secs    50.5  rounds     379  cap   1849  lr 0.060 depth 3 leaf 120 col 0.86
+  lognormal_lognorm_het newbins   secs    43.7  rounds     582  cap   3184  lr 0.034 depth 3 leaf 134 col 0.87 bins 128
+  lognormal_lognorm_het xfit      secs   169.2  rounds     485  cap   1742  lr 0.062 depth 3 leaf 111 col 0.90 bins 51
+  normal_het_a new       secs    68.5  rounds     924  cap   1890  lr 0.068 depth 3 leaf 122 col 0.79
+  normal_het_a newbins   secs    55.0  rounds    1343  cap   2548  lr 0.040 depth 3 leaf 113 col 0.78 bins 150
+  normal_het_a xfit      secs   264.4  rounds     895  cap   2010  lr 0.070 depth 4 leaf 105 col 0.75 bins 78
+  normal_het_b new       secs    36.1  rounds     580  cap   2818  lr 0.047 depth 2 leaf 16 col 0.84
+  normal_het_b newbins   secs    29.7  rounds     623  cap   3195  lr 0.053 depth 2 leaf 36 col 0.84 bins 175
+  normal_het_b xfit      secs   105.2  rounds     698  cap   2783  lr 0.056 depth 2 leaf 10 col 0.77 bins 148
+  normal_kin8nm new       secs   113.0  rounds    1472  cap   3213  lr 0.035 depth 8 leaf 106 col 0.93
+  normal_kin8nm newbins   secs    61.2  rounds     752  cap   1806  lr 0.061 depth 7 leaf 78 col 0.96 bins 18
+  normal_kin8nm xfit      secs   447.7  rounds    1126  cap   2248  lr 0.047 depth 7 leaf 99 col 0.91 bins 35
+  normal_protein new       secs    64.3  rounds     516  cap   2508  lr 0.043 depth 6 leaf 21 col 0.76
+  normal_protein newbins   secs    43.6  rounds     344  cap   2899  lr 0.047 depth 6 leaf 17 col 0.80 bins 68
+  normal_protein xfit      secs   216.8  rounds     314  cap   2071  lr 0.074 depth 7 leaf 10 col 0.76 bins 121
+  normal_tnoise new       secs    61.8  rounds     576  cap   1746  lr 0.080 depth 4 leaf 126 col 0.85
+  normal_tnoise newbins   secs    54.3  rounds    1093  cap   2223  lr 0.046 depth 3 leaf 121 col 0.87 bins 60
+  normal_tnoise xfit      secs   237.8  rounds     758  cap   1801  lr 0.057 depth 4 leaf 95 col 0.84 bins 81

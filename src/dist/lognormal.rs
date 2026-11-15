@@ -30,6 +30,13 @@ impl Distribution for LogNormal {
         Some(1)
     }
 
+    /// σ(x) ≤ 4 × the model's baseline σ at prediction time — see
+    /// [`Distribution::scale_ceiling`]. `Normal` on ln y is the same model
+    /// without the bound.
+    fn scale_ceiling() -> Option<f64> {
+        Some(4.0)
+    }
+
     fn from_params(params: &Array2<f64>) -> Self {
         let loc = params.column(0).to_owned();
         let scale = crate::vmath::exp_column(&params.column(1));
@@ -69,6 +76,29 @@ impl Distribution for LogNormal {
     fn predict(&self) -> Array1<f64> {
         // Mean of lognormal is exp(loc + scale^2 / 2)
         (&self.loc + &(&self.scale.mapv(|s| s.powi(2)) / 2.0)).mapv(f64::exp)
+    }
+
+    /// E[min(Y, c)] = exp(μ + σ²/2)·Φ((ln c − μ − σ²)/σ) + c·S((ln c − μ)/σ),
+    /// evaluated on the log scale so that a huge σ gives a finite value
+    /// (the first factor overflows exactly where the second underflows).
+    fn winsorized_mean(&self, cap: f64) -> Option<Array1<f64>> {
+        if cap.is_nan() || cap <= 0.0 {
+            return None;
+        }
+        if cap == f64::INFINITY {
+            return Some(self.predict());
+        }
+        let lc = cap.ln();
+        Some(Array1::from_shape_fn(self.loc.len(), |i| {
+            let (mu, sg) = (self.loc[i], self.scale[i]);
+            if sg <= 0.0 || !sg.is_finite() || !mu.is_finite() {
+                return f64::NAN;
+            }
+            // ln Φ(a) = ln S(−a)
+            let below = (mu + 0.5 * sg * sg + norm_ln_sf(-(lc - mu - sg * sg) / sg)).exp();
+            let above = cap * norm_ln_sf((lc - mu) / sg).exp();
+            (below + above).clamp(0.0, cap)
+        }))
     }
 
     fn params(&self) -> Array2<f64> {

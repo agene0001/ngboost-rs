@@ -1,0 +1,37 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+sprint_cvd,0,base,78,0.20,0.17419,0.20544,0.05118,NaN,0.9455,NaN,0.0069,NaN,0.9501,1.0021
+sprint_cvd,1,base,124,0.43,0.17301,0.20021,0.05090,NaN,0.9438,NaN,0.0056,NaN,0.9592,1.0013
+sprint_cvd,2,base,59,0.31,0.18514,0.20696,0.05122,NaN,0.9449,NaN,0.0069,NaN,1.0096,1.0025
+sprint_cvd,3,base,113,0.63,0.17473,0.20050,0.04877,NaN,0.9477,NaN,0.0091,NaN,0.9953,1.0013
+sprint_cvd,4,base,56,0.30,0.19088,0.19437,0.04812,NaN,0.9477,NaN,0.0063,NaN,1.0877,1.0024
+sprint_cvd,5,base,8,0.18,0.19952,0.21269,0.05261,NaN,0.9438,NaN,0.0031,NaN,0.9445,1.0024
+sprint_cvd,6,base,124,0.52,0.17443,0.19362,0.04666,NaN,0.9504,NaN,0.0086,NaN,1.1278,1.0014
+sprint_cvd,7,base,246,0.73,0.15899,0.20374,0.04951,NaN,0.9471,NaN,0.0157,NaN,1.0869,1.0011
+sprint_cvd,8,base,15,0.07,0.19154,0.21526,0.05386,NaN,0.9421,NaN,0.0067,NaN,0.8958,1.0036
+sprint_cvd,9,base,16,0.33,0.19566,0.20528,0.05053,NaN,0.9460,NaN,0.0013,NaN,0.9974,1.0036
+flchain_death,0,base,182,0.39,0.37442,0.41721,0.13016,NaN,0.8274,NaN,0.0251,NaN,0.9429,1.0001
+flchain_death,1,base,62,0.33,0.39583,0.42073,0.13360,NaN,0.8160,NaN,0.0314,NaN,0.9420,1.0002
+flchain_death,2,base,71,0.20,0.38851,0.42907,0.13685,NaN,0.8065,NaN,0.0365,NaN,1.0005,1.0001
+flchain_death,3,base,84,0.24,0.38238,0.44255,0.13957,NaN,0.8103,NaN,0.0304,NaN,0.9948,1.0001
+flchain_death,4,base,146,0.21,0.37764,0.42846,0.13478,NaN,0.8236,NaN,0.0331,NaN,0.9708,1.0001
+flchain_death,5,base,80,0.28,0.39432,0.41172,0.12919,NaN,0.8154,NaN,0.0183,NaN,1.0177,1.0001
+flchain_death,6,base,49,0.12,0.39631,0.42283,0.13185,NaN,0.8280,NaN,0.0222,NaN,1.0258,1.0004
+flchain_death,7,base,41,0.06,0.39577,0.43399,0.13742,NaN,0.8128,NaN,0.0190,NaN,0.9493,1.0006
+flchain_death,8,base,64,0.09,0.38618,0.43460,0.13814,NaN,0.8071,NaN,0.0261,NaN,0.9253,1.0001
+flchain_death,9,base,48,0.08,0.40098,0.41848,0.13140,NaN,0.8249,NaN,0.0222,NaN,0.9588,1.0003
+support_hospdead,0,base,115,0.41,0.30298,0.33921,0.10448,NaN,0.8573,NaN,0.0187,NaN,1.0230,0.9998
+support_hospdead,1,base,117,0.21,0.30170,0.33530,0.10407,NaN,0.8546,NaN,0.0163,NaN,0.9763,1.0001
+support_hospdead,2,base,158,1.02,0.28198,0.37423,0.11810,NaN,0.8293,NaN,0.0284,NaN,0.9804,1.0001
+support_hospdead,3,base,113,0.63,0.29708,0.35003,0.10990,NaN,0.8474,NaN,0.0216,NaN,0.9886,1.0001
+support_hospdead,4,base,136,0.57,0.28774,0.34884,0.10743,NaN,0.8458,NaN,0.0221,NaN,0.9628,1.0001
+support_hospdead,5,base,156,0.75,0.29521,0.32405,0.10016,NaN,0.8644,NaN,0.0341,NaN,1.0068,1.0001
+support_hospdead,6,base,86,0.57,0.30778,0.33221,0.10245,NaN,0.8639,NaN,0.0195,NaN,1.0288,1.0000
+support_hospdead,7,base,85,0.33,0.31080,0.34360,0.10706,NaN,0.8474,NaN,0.0220,NaN,0.9931,1.0001
+support_hospdead,8,base,82,0.51,0.30477,0.35644,0.11166,NaN,0.8485,NaN,0.0185,NaN,0.9919,1.0002
+support_hospdead,9,base,67,0.67,0.31606,0.34607,0.10693,NaN,0.8513,NaN,0.0217,NaN,1.0615,1.0002
+
+# SUMMARY (mean ± sd over 10 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# sprint_cvd base            84   0.2038±0.0070    0.0503±0.0021       NaN±NaN       0.946     NaN   0.007   1.005   1.002
+# flchain_death base            83   0.4260±0.0094    0.1343±0.0036       NaN±NaN       0.817     NaN   0.026   0.973   1.000
+# support_hospdead base           112   0.3450±0.0140    0.1072±0.0051       NaN±NaN       0.851     NaN   0.022   1.001   1.000

@@ -1,0 +1,311 @@
+--- a/src/ngboost.rs
++++ b/src/ngboost.rs
+@@ -299,6 +299,8 @@
+     /// GammaMean and StudentTFiniteVar since 1.3.0),
+     /// `Some(false)` = the joint upstream fit. See [`NGBoost::fit_staged`].
+     pub staged_fit: Option<bool>,
++    /// Exact leaf step for a Gaussian log-scale column (prototype doc).
++    pub exact_scale_step: Option<bool>,
+     /// Opt-in (since 1.3.0; 0 or 1 = off, the default): number of folds for
+     /// **cross-fitted location residuals** in the staged fit.
+     ///
+@@ -440,6 +442,7 @@
+             per_param_line_search: false,
+             staged_fit: None,
+             staged_crossfit_folds: 0,
++            exact_scale_step: None,
+             staged_train_override: None,
+             round_limit: None,
+             frozen_columns: Vec::new(),
+@@ -496,6 +499,7 @@
+             per_param_line_search: false,
+             staged_fit: None,
+             staged_crossfit_folds: 0,
++            exact_scale_step: None,
+             staged_train_override: None,
+             round_limit: None,
+             frozen_columns: Vec::new(),
+@@ -580,6 +584,7 @@
+             per_param_line_search: false,
+             staged_fit: None,
+             staged_crossfit_folds: 0,
++            exact_scale_step: None,
+             staged_train_override: None,
+             round_limit: None,
+             frozen_columns: Vec::new(),
+@@ -654,6 +659,7 @@
+             per_param_line_search: false,
+             staged_fit: None,
+             staged_crossfit_folds: 0,
++            exact_scale_step: None,
+             staged_train_override: None,
+             round_limit: None,
+             frozen_columns: Vec::new(),
+@@ -725,6 +731,7 @@
+             per_param_line_search: false,
+             staged_fit: None,
+             staged_crossfit_folds: 0,
++            exact_scale_step: None,
+             staged_train_override: None,
+             round_limit: None,
+             frozen_columns: Vec::new(),
+@@ -801,6 +808,7 @@
+             per_param_line_search: false,
+             staged_fit: None,
+             staged_crossfit_folds: 0,
++            exact_scale_step: None,
+             staged_train_override: None,
+             round_limit: None,
+             frozen_columns: Vec::new(),
+@@ -912,6 +920,7 @@
+         m.per_param_line_search = self.per_param_line_search;
+         m.staged_fit = self.staged_fit;
+         m.staged_crossfit_folds = self.staged_crossfit_folds;
++        m.exact_scale_step = self.exact_scale_step;
+         m.refit_intercept = self.refit_intercept;
+         m.auto_calibrate_scale = self.auto_calibrate_scale;
+         m.validation_split = self.validation_split;
+@@ -978,6 +987,7 @@
+         m.n_estimators = self.n_estimators;
+         m.early_stopping_rounds = self.early_stopping_rounds;
+         m.staged_fit = self.staged_fit;
++        m.exact_scale_step = self.exact_scale_step;
+         m.auto_calibrate_scale = self.auto_calibrate_scale;
+         Ok(m)
+     }
+@@ -1720,6 +1730,15 @@
+         let mut prof_rounds = 0usize;
+         let mut prof_t = std::time::Instant::now();
+ 
++        // exact leaf step for a Gaussian log-scale column (see the use below)
++        let exact_scale_col: Option<usize> = (self
++            .exact_scale_step
++            .unwrap_or_else(D::default_exact_scale_step)
++            && self.natural_gradient
++            && std::any::TypeId::of::<S>() == std::any::TypeId::of::<LogScore>())
++        .then(D::gaussian_log_scale_column)
++        .flatten();
++
+         for itr in 0..self.n_estimators.min(self.round_limit.unwrap_or(u32::MAX)) {
+             if profile {
+                 prof_t = std::time::Instant::now();
+@@ -1978,6 +1997,26 @@
+                 fitted_learners.push(fitted);
+                 predictions_cols.push(preds);
+             }
++            // Exact leaf step for a Gaussian log-scale column. A leaf's value
++            // v is the (weighted) mean of the natural gradient (1 − z²)/(2+τ),
++            // i.e. mean z² = 1 − (2+τ)·v; the shift that minimises the leaf's
++            // score is ½·ln(mean z²), which the natural-gradient value
++            // (mean z² − 1)/2 over-states without bound when mean z² ≫ 1.
++            if let Some(j) = exact_scale_col
++                && !self.frozen_columns.contains(&j)
++            {
++                let p = 2.0 + self.tikhonov_reg;
++                let phi = move |v: f64| {
++                    if v < 0.0 {
++                        -0.5 * (1.0 - p * v).ln()
++                    } else {
++                        v
++                    }
++                };
++                if fitted_learners[j].map_output(&phi) {
++                    predictions_cols[j].mapv_inplace(phi);
++                }
++            }
+             if profile {
+                 let now = std::time::Instant::now();
+                 prof[2] += now - prof_t;
+--- a/src/dist/mod.rs
++++ b/src/dist/mod.rs
+@@ -128,6 +128,21 @@
+         None
+     }
+ 
++    /// Index of a parameter column `s` that is the logarithm of a Gaussian
++    /// scale: the per-row LogScore depends on it as `s + r²·e^(−2s)/2` (plus
++    /// terms without `s`), so its Fisher entry is exactly 2 and a leaf's
++    /// score-minimising shift is `½·ln(mean z²)`. Enables the exact leaf step
++    /// (`NGBoost::exact_scale_step`). Normal and LogNormal return `Some(1)`.
++    fn gaussian_log_scale_column() -> Option<usize> {
++        None
++    }
++
++    /// Whether the exact log-scale leaf step is on when the model leaves
++    /// `NGBoost::exact_scale_step` unset.
++    fn default_exact_scale_step() -> bool {
++        false
++    }
++
+     /// Index of the **location** column for the staged fit
+     /// (`NGBoost::fit_staged`): location first, then the remaining columns,
+     /// then the location again weighted by its Fisher entry (feasible GLS),
+--- a/src/dist/normal.rs
++++ b/src/dist/normal.rs
+@@ -51,6 +51,10 @@
+     }
+ 
+     fn scale_param_index() -> Option<usize> {
++        Some(1)
++    }
++
++    fn gaussian_log_scale_column() -> Option<usize> {
+         Some(1)
+     }
+ 
+--- a/src/dist/lognormal.rs
++++ b/src/dist/lognormal.rs
+@@ -27,6 +27,10 @@
+     }
+ 
+     fn scale_param_index() -> Option<usize> {
++        Some(1)
++    }
++
++    fn gaussian_log_scale_column() -> Option<usize> {
+         Some(1)
+     }
+ 
+--- a/src/learners/mod.rs
++++ b/src/learners/mod.rs
+@@ -212,6 +212,15 @@
+     /// not support it. `factor = 1.0` is a bit-exact no-op usable as a
+     /// support probe.
+     fn scale_output(&mut self, _factor: f64) -> bool {
++        false
++    }
++
++    /// Replace every prediction `v` of this learner by `f(v)`, in place.
++    /// Only meaningful for piecewise-constant learners (trees, stumps),
++    /// where it rewrites the leaf values; used by the exact log-scale leaf
++    /// step (`NGBoost::exact_scale_step`). Returns `false` — and must not
++    /// modify anything — when the learner is not piecewise constant.
++    fn map_output(&mut self, _f: &dyn Fn(f64) -> f64) -> bool {
+         false
+     }
+ }
+@@ -286,6 +295,16 @@
+             SerializableTrainedLearner::HistogramTree(h) => h.scale_output(factor),
+             SerializableTrainedLearner::Ridge(r) => r.scale_output(factor),
+             SerializableTrainedLearner::ArenaTree(a) => a.scale_output(factor),
++        }
++    }
++
++    fn map_output(&mut self, f: &dyn Fn(f64) -> f64) -> bool {
++        match self {
++            SerializableTrainedLearner::Stump(s) => s.map_output(f),
++            SerializableTrainedLearner::DecisionTree(t) => t.map_output(f),
++            SerializableTrainedLearner::HistogramTree(h) => h.map_output(f),
++            SerializableTrainedLearner::Ridge(_) => false,
++            SerializableTrainedLearner::ArenaTree(a) => a.map_output(f),
+         }
+     }
+ 
+@@ -434,6 +453,12 @@
+         true
+     }
+ 
++    fn map_output(&mut self, f: &dyn Fn(f64) -> f64) -> bool {
++        self.left_value = f(self.left_value);
++        self.right_value = f(self.right_value);
++        true
++    }
++
+     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
+         Some(SerializableTrainedLearner::Stump(self.clone()))
+     }
+@@ -2030,6 +2055,16 @@
+         }
+     }
+ 
++    fn map_leaves(&mut self, f: &dyn Fn(f64) -> f64) {
++        match self {
++            HistTreeNode::Leaf { value } => *value = f(*value),
++            HistTreeNode::Split { left, right, .. } => {
++                left.map_leaves(f);
++                right.map_leaves(f);
++            }
++        }
++    }
++
+     /// Predict for a single row using direct array indexing (no allocation)
+     #[inline]
+     fn predict_row(&self, x: &Array2<f64>, row_idx: usize) -> f64 {
+@@ -2269,6 +2304,12 @@
+     fn scale_output(&mut self, factor: f64) -> bool {
+         self.root.scale_leaves(factor);
+         // Drop the flattened prediction cache; it is rebuilt lazily from `root`.
++        self.flat = std::sync::OnceLock::new();
++        true
++    }
++
++    fn map_output(&mut self, f: &dyn Fn(f64) -> f64) -> bool {
++        self.root.map_leaves(f);
+         self.flat = std::sync::OnceLock::new();
+         true
+     }
+@@ -2661,6 +2702,16 @@
+             TreeNode::Split { left, right, .. } => {
+                 left.scale_leaves(factor);
+                 right.scale_leaves(factor);
++            }
++        }
++    }
++
++    fn map_leaves(&mut self, f: &dyn Fn(f64) -> f64) {
++        match self {
++            TreeNode::Leaf { value } => *value = f(*value),
++            TreeNode::Split { left, right, .. } => {
++                left.map_leaves(f);
++                right.map_leaves(f);
+             }
+         }
+     }
+@@ -2843,6 +2894,15 @@
+         true
+     }
+ 
++    fn map_output(&mut self, f: &dyn Fn(f64) -> f64) -> bool {
++        for n in self.nodes.iter_mut() {
++            if n.is_leaf() {
++                n.threshold_or_value = f(n.threshold_or_value);
++            }
++        }
++        true
++    }
++
+     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
+         Some(SerializableTrainedLearner::ArenaTree(self.clone()))
+     }
+@@ -3127,6 +3187,11 @@
+         true
+     }
+ 
++    fn map_output(&mut self, f: &dyn Fn(f64) -> f64) -> bool {
++        self.root.map_leaves(f);
++        true
++    }
++
+     fn to_serializable(&self) -> Option<SerializableTrainedLearner> {
+         Some(SerializableTrainedLearner::DecisionTree(self.clone()))
+     }
+--- a/examples/research_bench.rs
++++ b/examples/research_bench.rs
+@@ -942,6 +942,8 @@
+             "joint" => m.staged_fit = Some(false),
+             "staged" => m.staged_fit = Some(true),
+             "xfit" => m.staged_crossfit_folds = 5,
++            "exs" => m.exact_scale_step = Some(true),
++            "noexs" => m.exact_scale_step = Some(false),
+             // select β ∈ {0, 0.5, 1} by validation score (realistic user procedure)
+             "fwsel" => m.fisher_weight_power = Some(f64::NAN),
+             t if t.starts_with("fwp") => {
+@@ -1139,6 +1141,8 @@
+             "joint" => m.staged_fit = Some(false),
+             "staged" => m.staged_fit = Some(true),
+             "xfit" => m.staged_crossfit_folds = 5,
++            "exs" => m.exact_scale_step = Some(true),
++            "noexs" => m.exact_scale_step = Some(false),
+             "fw" => m.fisher_weighted_learner = true,
+             t if t.starts_with("fwp") => {
+                 m.fisher_weight_power = Some(t[3..].parse().expect("fwp<beta>"));

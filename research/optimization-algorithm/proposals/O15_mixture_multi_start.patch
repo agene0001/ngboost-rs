@@ -1,0 +1,171 @@
+diff --git a/src/dist/normal_mixture.rs b/src/dist/normal_mixture.rs
+index 1d3ba2c..110bdc6 100644
+--- a/src/dist/normal_mixture.rs
++++ b/src/dist/normal_mixture.rs
+@@ -105,6 +105,64 @@ fn a_fn(m: f64, s: f64) -> (f64, f64, f64) {
+ }
+ 
+ impl<const K: usize> NormalMixture<K> {
++    /// EM from a partition of the sorted sample `v` into K contiguous
++    /// groups (`cuts` has K + 1 increasing entries, 0 … n): group means and
++    /// standard deviations as the start, equal weights.
++    fn em_from_groups(
++        y: &Array1<f64>,
++        v: &[f64],
++        cuts: &[usize],
++        floor: f64,
++        sd: f64,
++    ) -> ([f64; K], [f64; K], [f64; K]) {
++        let n = y.len();
++        let (mut pi, mut m, mut s) = ([1.0 / K as f64; K], [0.0f64; K], [0.0f64; K]);
++        for k in 0..K {
++            let g = &v[cuts[k]..cuts[k + 1].max(cuts[k] + 1)];
++            let gm = g.iter().sum::<f64>() / g.len() as f64;
++            m[k] = gm;
++            s[k] = (g.iter().map(|x| (x - gm).powi(2)).sum::<f64>() / g.len() as f64)
++                .sqrt()
++                .max(floor);
++        }
++        for _ in 0..300 {
++            let (mut w, mut a, mut b) = ([0.0f64; K], [0.0f64; K], [0.0f64; K]);
++            for &yi in y.iter() {
++                let mut t = [0.0f64; K];
++                let mut mx = f64::NEG_INFINITY;
++                for k in 0..K {
++                    let z = (yi - m[k]) / s[k];
++                    t[k] = pi[k].ln() - s[k].ln() - 0.5 * z * z;
++                    mx = mx.max(t[k]);
++                }
++                let tot: f64 = t.iter().map(|x| (x - mx).exp()).sum();
++                for k in 0..K {
++                    let r = (t[k] - mx).exp() / tot;
++                    w[k] += r;
++                    a[k] += r * yi;
++                    b[k] += r * yi * yi;
++                }
++            }
++            if w.iter().any(|&x| x < 1e-9) {
++                break;
++            }
++            let mut delta = 0.0;
++            for k in 0..K {
++                let nm = a[k] / w[k];
++                let ns = (b[k] / w[k] - nm * nm).max(floor * floor).sqrt();
++                let np = (w[k] / n as f64).clamp(0.01, 0.99);
++                delta += (nm - m[k]).abs() + (np - pi[k]).abs();
++                (m[k], s[k], pi[k]) = (nm, ns, np);
++            }
++            let tot: f64 = pi.iter().sum();
++            pi.iter_mut().for_each(|p| *p /= tot);
++            if delta < 1e-10 * (1.0 + sd) {
++                break;
++            }
++        }
++        (pi, m, s)
++    }
++
+     #[inline]
+     fn mu_col(k: usize) -> usize {
+         (K - 1) + 2 * k
+@@ -316,48 +374,61 @@ impl<const K: usize> Distribution for NormalMixture<K> {
+         v.sort_by(|a, b| a.total_cmp(b));
+         let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+         let floor = (1e-3 * sd).max(1e-9);
+-        let (mut pi, mut m, mut s) = ([1.0 / K as f64; K], [0.0f64; K], [0.0f64; K]);
+-        for k in 0..K {
+-            let g = &v[k * n / K..((k + 1) * n / K).max(k * n / K + 1)];
+-            let gm = g.iter().sum::<f64>() / g.len() as f64;
+-            m[k] = gm;
+-            s[k] = (g.iter().map(|x| (x - gm).powi(2)).sum::<f64>() / g.len() as f64)
+-                .sqrt()
+-                .max(floor);
+-        }
+-        for _ in 0..300 {
+-            let (mut w, mut a, mut b) = ([0.0f64; K], [0.0f64; K], [0.0f64; K]);
+-            for &yi in y.iter() {
+-                let mut t = [0.0f64; K];
+-                let mut mx = f64::NEG_INFINITY;
+-                for k in 0..K {
+-                    let z = (yi - m[k]) / s[k];
+-                    t[k] = pi[k].ln() - s[k].ln() - 0.5 * z * z;
+-                    mx = mx.max(t[k]);
++        // start: K equal-count quantile groups of the sorted sample
++        let quantile_cuts: Vec<usize> = (0..=K).map(|k| k * n / K).collect();
++        let (mut pi, mut m, mut s) = Self::em_from_groups(y, &v, &quantile_cuts, floor, sd);
++        // EXPERIMENT (research Cycle 22, O15; off unless NGBOOST_MIX_STARTS=1):
++        // also start from every split of the sorted sample at deciles and
++        // keep the fit with the highest likelihood.
++        if std::env::var("NGBOOST_MIX_STARTS").is_ok_and(|v| v.trim() == "1") {
++            let ll = |pi: &[f64; K], m: &[f64; K], s: &[f64; K]| -> f64 {
++                y.iter()
++                    .map(|&yi| {
++                        let mut mx = f64::NEG_INFINITY;
++                        let mut t = [0.0f64; K];
++                        for k in 0..K {
++                            let z = (yi - m[k]) / s[k];
++                            t[k] = pi[k].ln() - s[k].ln() - 0.5 * z * z;
++                            mx = mx.max(t[k]);
++                        }
++                        mx + t.iter().map(|x| (x - mx).exp()).sum::<f64>().ln()
++                    })
++                    .sum()
++            };
++            let mut best = ll(&pi, &m, &s);
++            // all increasing (K−1)-tuples of decile cut points
++            let grid: Vec<usize> = (1..10).map(|d| d * n / 10).collect();
++            let mut idx: Vec<usize> = (0..K - 1).collect();
++            loop {
++                let mut cuts = vec![0usize];
++                cuts.extend(idx.iter().map(|&i| grid[i]));
++                cuts.push(n);
++                let (p2, m2, s2) = Self::em_from_groups(y, &v, &cuts, floor, sd);
++                let l2 = ll(&p2, &m2, &s2);
++                if l2.is_finite() && l2 > best + 1e-9 * n as f64 {
++                    (best, pi, m, s) = (l2, p2, m2, s2);
+                 }
+-                let tot: f64 = t.iter().map(|x| (x - mx).exp()).sum();
+-                for k in 0..K {
+-                    let r = (t[k] - mx).exp() / tot;
+-                    w[k] += r;
+-                    a[k] += r * yi;
+-                    b[k] += r * yi * yi;
++                // next combination
++                let mut i = K - 1;
++                loop {
++                    if i == 0 {
++                        break;
++                    }
++                    i -= 1;
++                    if idx[i] < grid.len() - (K - 1 - i) {
++                        idx[i] += 1;
++                        for j in i + 1..K - 1 {
++                            idx[j] = idx[j - 1] + 1;
++                        }
++                        break;
++                    }
++                    if i == 0 {
++                        idx.clear();
++                    }
++                }
++                if idx.len() != K - 1 || K == 1 {
++                    break;
+                 }
+-            }
+-            if w.iter().any(|&x| x < 1e-9) {
+-                break;
+-            }
+-            let mut delta = 0.0;
+-            for k in 0..K {
+-                let nm = a[k] / w[k];
+-                let ns = (b[k] / w[k] - nm * nm).max(floor * floor).sqrt();
+-                let np = (w[k] / n as f64).clamp(0.01, 0.99);
+-                delta += (nm - m[k]).abs() + (np - pi[k]).abs();
+-                (m[k], s[k], pi[k]) = (nm, ns, np);
+-            }
+-            let tot: f64 = pi.iter().sum();
+-            pi.iter_mut().for_each(|p| *p /= tot);
+-            if delta < 1e-10 * (1.0 + sd) {
+-                break;
+             }
+         }
+         let mut order: Vec<usize> = (0..K).collect();

@@ -37,7 +37,7 @@ impl CalibrationResult {
 ///
 /// # Arguments
 /// * `ppf_fn` - Function that computes the percent point function (inverse CDF)
-///              given a percentile value. Should return an Array1<f64> of quantiles.
+///              given a percentile value. Should return an `Array1<f64>` of quantiles.
 /// * `y` - Observed values.
 /// * `bins` - Number of bins/percentiles to evaluate (default: 11).
 /// * `eps` - Small value to avoid edge effects (default: 1e-3).

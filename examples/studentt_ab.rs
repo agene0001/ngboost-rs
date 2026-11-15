@@ -1,11 +1,11 @@
 //! Quick A/B: StudentT LogScore fit quality (held-out NLL) across seeds.
 //! Run once on old metric (stash) and once on new; compare.
 use ndarray::{Array1, Array2};
+use ngboost_rs::LogScore;
 use ngboost_rs::dist::StudentT;
 use ngboost_rs::learners::HistogramLearner;
 use ngboost_rs::ngboost::NGBoost;
 use ngboost_rs::scores::Scorable;
-use ngboost_rs::{Distribution, LogScore};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 

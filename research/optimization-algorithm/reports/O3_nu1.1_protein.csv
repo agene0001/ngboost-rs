@@ -1,0 +1,15 @@
+dataset,seed,variant,n_iter,secs,train_nll,nll,crps,rmse,cov50,cov90,calib,mean_sigma,extra,extra2
+protein,0,auto+staged,1065,66.63,2.54985,2.78767,2.42057,4.64349,0.4942,0.8812,0.0000,inf,2.7399,NaN
+protein,1,auto+staged,1316,126.78,2.49277,2.73044,2.23586,4.31689,0.4975,0.8896,0.0000,inf,2.7206,NaN
+protein,2,auto+staged,1172,54.84,2.54939,2.74466,2.27968,4.40960,0.5021,0.9050,0.0000,inf,2.8090,NaN
+protein,3,auto+staged,785,29.34,2.56752,2.77184,2.36638,4.52795,0.4838,0.8867,0.0000,inf,2.7082,NaN
+protein,4,auto+staged,1046,20.93,2.52591,2.74437,2.27694,4.35871,0.4929,0.9000,0.0000,inf,2.7820,NaN
+protein,5,auto+staged,933,58.69,2.53059,2.74901,2.29125,4.38584,0.4896,0.9029,0.0000,inf,2.7353,NaN
+protein,6,auto+staged,840,60.95,2.57111,2.77685,2.34554,4.46088,0.4779,0.8833,0.0000,inf,2.7166,NaN
+protein,7,auto+staged,609,60.49,2.62830,2.75984,2.26295,4.42785,0.5088,0.9004,0.0000,inf,2.7918,NaN
+protein,8,auto+staged,863,41.04,2.54862,2.80139,2.41938,4.55596,0.4617,0.8867,0.0000,inf,2.7208,NaN
+protein,9,auto+staged,970,23.69,2.54334,2.74061,2.27920,4.36725,0.4750,0.8817,0.0000,inf,2.6731,NaN
+
+# SUMMARY (mean ± sd over 10 seeds)
+# dataset  variant      iters              NLL             CRPS             RMSE   cov50   cov90   calib   extra  extra2
+# protein  auto+staged     960   2.7607±0.0230    2.3178±0.0659    4.4454±0.1021    0.488   0.892   0.000   2.740     NaN

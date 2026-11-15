@@ -1,0 +1,58 @@
+Δ = arm − old on the test block (negative = better); n = seeds present in both
+
+test_nll
+  het_a    | untuned -0.0668 (0.0268) 7/8 | old 1.3924 (n=8) | oldspace -0.0641 (0.0289) 7/8 | new -0.1838 (0.0236) 8/8
+  het_b    | untuned +0.0353 (0.0124) 0/8 | old 0.6144 (n=8) | oldspace -0.0073 (0.0050) 6/8 | new -0.0108 (0.0052) 6/8
+  kin8nm   | untuned +0.0750 (0.0119) 0/8 | old -0.4990 (n=8) | oldspace -0.0470 (0.0133) 7/8 | new -0.0685 (0.0095) 8/8
+  protein  | untuned -0.0003 (0.0077) 3/8 | old 2.9398 (n=8) | oldspace -0.0072 (0.0052) 5/8 | new -0.0148 (0.0048) 7/8
+  tnoise   | untuned -0.1229 (0.0276) 8/8 | old 1.4959 (n=8) | oldspace -0.0721 (0.0233) 7/8 | new -0.1872 (0.0322) 8/8
+  pooled   | untuned -0.0159 (0.0140) 18/40 | oldspace -0.0395 (0.0088) 32/40 | new -0.0930 (0.0148) 37/40
+
+test_rmse
+  het_a    | untuned -0.0533 (0.0129) 8/8 | old 1.1287 (n=8) | oldspace -0.0527 (0.0145) 7/8 | new -0.1041 (0.0136) 8/8
+  het_b    | untuned +0.0144 (0.0078) 2/8 | old 0.9469 (n=8) | oldspace -0.0026 (0.0050) 5/8 | new +0.0012 (0.0056) 2/8
+  kin8nm   | untuned +0.0166 (0.0014) 0/8 | old 0.1463 (n=8) | oldspace -0.0056 (0.0017) 7/8 | new -0.0044 (0.0009) 8/8
+  protein  | untuned +0.0586 (0.0365) 2/8 | old 4.6242 (n=8) | oldspace -0.0160 (0.0338) 5/8 | new -0.0423 (0.0300) 5/8
+  tnoise   | untuned -0.0573 (0.0090) 8/8 | old 1.2257 (n=8) | oldspace -0.0447 (0.0132) 7/8 | new -0.1050 (0.0136) 8/8
+  pooled   | untuned -0.0042 (0.0105) 20/40 | oldspace -0.0243 (0.0082) 31/40 | new -0.0509 (0.0101) 31/40
+
+search seconds (mean), refit rounds (mean), winning parameters (median)
+  het_a    untuned   secs     0.0  rounds     835  cap   2000  lr nan depth nan leaf nan col nan
+  het_a    old       secs    64.1  rounds     531  cap   1038  lr 0.075 depth 3 leaf nan col nan
+  het_a    oldspace  secs    72.3  rounds     671  cap    816  lr 0.059 depth 3 leaf nan col nan
+  het_a    new       secs    76.7  rounds     924  cap   1890  lr 0.068 depth 3 leaf 122 col 0.79
+  het_b    untuned   secs     0.0  rounds     254  cap   2000  lr nan depth nan leaf nan col nan
+  het_b    old       secs    53.3  rounds     784  cap   1124  lr 0.027 depth 2 leaf nan col nan
+  het_b    oldspace  secs    71.2  rounds    1103  cap   1295  lr 0.020 depth 2 leaf nan col nan
+  het_b    new       secs    37.7  rounds     580  cap   2818  lr 0.047 depth 2 leaf 16 col 0.84
+  kin8nm   untuned   secs     0.0  rounds     752  cap   2000  lr nan depth nan leaf nan col nan
+  kin8nm   old       secs    69.0  rounds     596  cap    864  lr 0.040 depth 6 leaf nan col nan
+  kin8nm   oldspace  secs    75.5  rounds     799  cap   1010  lr 0.036 depth 7 leaf nan col nan
+  kin8nm   new       secs   125.0  rounds    1472  cap   3213  lr 0.035 depth 8 leaf 106 col 0.93
+  protein  untuned   secs     0.0  rounds     569  cap   2000  lr nan depth nan leaf nan col nan
+  protein  old       secs    71.0  rounds     434  cap    831  lr 0.018 depth 5 leaf nan col nan
+  protein  oldspace  secs    72.6  rounds     553  cap    792  lr 0.030 depth 6 leaf nan col nan
+  protein  new       secs    65.3  rounds     516  cap   2508  lr 0.043 depth 6 leaf 21 col 0.76
+  tnoise   untuned   secs     0.0  rounds     796  cap   2000  lr nan depth nan leaf nan col nan
+  tnoise   old       secs    68.1  rounds     682  cap   1159  lr 0.071 depth 3 leaf nan col nan
+  tnoise   oldspace  secs    74.7  rounds     765  cap   1143  lr 0.068 depth 3 leaf nan col nan
+  tnoise   new       secs    66.0  rounds     576  cap   1746  lr 0.080 depth 4 leaf 126 col 0.85
+
+=================== against the untuned default
+Δ = arm − untuned on the test block (negative = better); n = seeds present in both
+
+test_nll
+  het_a    | untuned 1.3257 (n=8) | old +0.0668 (0.0268) 1/8 | oldspace +0.0027 (0.0116) 4/8 | new -0.1171 (0.0165) 8/8
+  het_b    | untuned 0.6496 (n=8) | old -0.0353 (0.0124) 8/8 | oldspace -0.0426 (0.0108) 8/8 | new -0.0461 (0.0118) 8/8
+  kin8nm   | untuned -0.4240 (n=8) | old -0.0750 (0.0119) 8/8 | oldspace -0.1220 (0.0108) 8/8 | new -0.1435 (0.0120) 8/8
+  protein  | untuned 2.9396 (n=8) | old +0.0003 (0.0077) 5/8 | oldspace -0.0069 (0.0080) 7/8 | new -0.0146 (0.0084) 6/8
+  tnoise   | untuned 1.3730 (n=8) | old +0.1229 (0.0276) 0/8 | oldspace +0.0508 (0.0273) 1/8 | new -0.0642 (0.0320) 6/8
+  pooled   | old +0.0159 (0.0140) 22/40 | oldspace -0.0236 (0.0113) 28/40 | new -0.0771 (0.0108) 36/40
+
+test_rmse
+  het_a    | untuned 1.0753 (n=8) | old +0.0533 (0.0129) 0/8 | oldspace +0.0006 (0.0075) 5/8 | new -0.0507 (0.0073) 8/8
+  het_b    | untuned 0.9613 (n=8) | old -0.0144 (0.0078) 6/8 | oldspace -0.0170 (0.0068) 6/8 | new -0.0132 (0.0084) 6/8
+  kin8nm   | untuned 0.1628 (n=8) | old -0.0166 (0.0014) 8/8 | oldspace -0.0222 (0.0014) 8/8 | new -0.0209 (0.0019) 8/8
+  protein  | untuned 4.6828 (n=8) | old -0.0586 (0.0365) 6/8 | oldspace -0.0747 (0.0212) 7/8 | new -0.1009 (0.0277) 7/8
+  tnoise   | untuned 1.1683 (n=8) | old +0.0573 (0.0090) 0/8 | oldspace +0.0126 (0.0101) 2/8 | new -0.0476 (0.0103) 7/8
+  pooled   | old +0.0042 (0.0105) 20/40 | oldspace -0.0201 (0.0068) 28/40 | new -0.0467 (0.0078) 36/40

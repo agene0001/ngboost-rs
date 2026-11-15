@@ -138,10 +138,20 @@ impl<D: Distribution> Distribution for Hurdle<D> {
             .collect()
     }
 
-    /// The mean (1 − π)·E_D[Y].
+    /// The mean (1 − π)·E_D\[Y\].
     fn predict(&self) -> Array1<f64> {
         let m = self.inner.predict();
         Array1::from_shape_fn(m.len(), |i| (1.0 - self.pi[i]) * m[i])
+    }
+
+    /// (1 − π)·E_D\[min(Y, cap)\] where the continuous part provides a
+    /// winsorised mean (`LogNormal`), else `None`: see
+    /// [`Distribution::predict_capped`]. `HurdleNormal` is unaffected.
+    fn predict_capped(&self, cap: f64) -> Option<Array1<f64>> {
+        let m = self.inner.winsorized_mean(cap)?;
+        Some(Array1::from_shape_fn(m.len(), |i| {
+            (1.0 - self.pi[i]) * m[i]
+        }))
     }
 
     fn params(&self) -> Array2<f64> {

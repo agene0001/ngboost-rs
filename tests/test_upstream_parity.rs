@@ -2,8 +2,9 @@
 //!
 //! Every default changed since 1.1.2 has an opt-out. With all of them set —
 //! `auto_calibrate_scale = false`, `fisher_weight_power = Some(0.0)`,
-//! `refit_intercept = Some(false)`, `staged_fit = Some(false)`, and the
-//! process-wide `NGBOOST_NORMAL_GUARD=0`, `NGBOOST_CRPS_METRIC_LEGACY=1` —
+//! `refit_intercept = Some(false)`, `staged_fit = Some(false)`, the
+//! histogram learner built with `min_samples_leaf = 1` (20 since 1.3.0), and
+//! the process-wide `NGBOOST_NORMAL_GUARD=0`, `NGBOOST_CRPS_METRIC_LEGACY=1` —
 //! the fit must be bit-identical to 1.1.2 (the last release that matched
 //! upstream NGBoost's algorithm). The expected hashes of the test-set
 //! parameters were recorded by building this same probe against the 1.1.2
@@ -15,7 +16,7 @@
 //! process.
 use ndarray::{Array1, Array2};
 use ngboost_rs::dist::*;
-use ngboost_rs::learners::histogram_learner;
+use ngboost_rs::learners::HistogramLearner;
 use ngboost_rs::{CRPScore, LogScore, NGBoost};
 
 struct Lcg(u64);
@@ -52,7 +53,9 @@ macro_rules! knobs {
 
 macro_rules! case {
     ($out:ident; $name:expr, $d:ty, $s:ty, $x:expr, $y:expr, $xv:expr, $yv:expr, $xt:expr, $val:expr, $n:expr) => {{
-        let mut m = NGBoost::<$d, $s, _>::with_seed($n, 0.05, histogram_learner(), 7);
+        // the 1.1.2 default learner: depth 3, 255 bins, min_samples_leaf 1
+        let learner = HistogramLearner::with_params(3, 255, 1, 2);
+        let mut m = NGBoost::<$d, $s, _>::with_seed($n, 0.05, learner, 7);
         knobs!(m);
         let r = if $val == 1 {
             m.early_stopping_rounds = Some(20);

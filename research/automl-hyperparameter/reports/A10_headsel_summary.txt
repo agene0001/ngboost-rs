@@ -1,0 +1,14 @@
+held-out NLL; Δ against `single` (the first head, 30 trials); negative = better
+
+positive:kin8nm        n=8 lognormal  -0.4267 | gammamean alone +0.0372 (0.0119) | select 2x15 +0.0474 (0.0104) lower 0 equal 1, picked gammamean 7/8 | select 2x30 +0.0372 (0.0119) lower 1 equal 0, picked gammamean 8/8 | oracle -0.0002
+positive:lognorm_het   n=8 lognormal   1.9367 | gammamean alone +0.1089 (0.0290) | select 2x15 +0.0126 (0.0063) lower 1 equal 2, picked gammamean 0/8 | select 2x30 +0.0179 (0.0179) lower 0 equal 7, picked gammamean 1/8 | oracle +0.0000
+real:het_a             n=8 normal   1.2095 | studenttfv alone +0.0508 (0.0259) | select 2x15 +0.0176 (0.0146) lower 3 equal 1, picked studenttfv 1/8 | select 2x30 +0.0000 (0.0000) lower 0 equal 8, picked studenttfv 0/8 | oracle -0.0015
+real:het_b             n=8 normal   0.6270 | studenttfv alone +0.0582 (0.0133) | select 2x15 +0.0278 (0.0190) lower 2 equal 0, picked studenttfv 1/8 | select 2x30 +0.0004 (0.0004) lower 0 equal 7, picked studenttfv 1/8 | oracle +0.0000
+real:kin8nm            n=8 normal  -0.5935 | studenttfv alone -0.0045 (0.0146) | select 2x15 +0.0063 (0.0092) lower 2 equal 3, picked studenttfv 2/8 | select 2x30 -0.0131 (0.0086) lower 2 equal 6, picked studenttfv 2/8 | oracle -0.0196
+real:protein           n=8 normal   2.9154 | studenttfv alone +0.0028 (0.0140) | select 2x15 +0.0040 (0.0117) lower 2 equal 0, picked studenttfv 8/8 | select 2x30 +0.0028 (0.0140) lower 4 equal 0, picked studenttfv 8/8 | oracle -0.0128
+real:tnoise            n=8 normal   1.2996 | studenttfv alone -0.0832 (0.0230) | select 2x15 -0.0658 (0.0567) lower 5 equal 0, picked studenttfv 7/8 | select 2x30 -0.0749 (0.0253) lower 6 equal 1, picked studenttfv 7/8 | oracle -0.0879
+
+pooled select 2x15        +0.0071 (0.0098); lower on 15, equal on 7 of 56
+pooled select 2x30        -0.0042 (0.0066); lower on 13, equal on 29 of 56
+pooled second head alone  +0.0243 (0.0104); lower on 17, equal on 0 of 56
+pooled oracle             -0.0174 (0.0050); lower on 17, equal on 39 of 56

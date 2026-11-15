@@ -33,7 +33,7 @@ pub struct StudentT {
 /// here — with an exactly-zero log ν gradient at the cap, the true chain-rule
 /// derivative of the clamped parameterization — freezes such rows at a
 /// t that is numerically Normal: 1e8 is TLogPdf's own Normal-limit switch.
-const DF_MAX: f64 = 1e8;
+pub(crate) const DF_MAX: f64 = 1e8;
 
 /// statrs' t cdf unwraps an incomplete-beta `Result` and panics on a NaN
 /// argument (seen when a diverged fit produced σ = ∞ or 0; research/ngboost

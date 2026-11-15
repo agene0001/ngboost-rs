@@ -2,6 +2,7 @@ pub mod categorical;
 pub mod cauchy;
 pub mod exponential;
 pub mod gamma;
+pub mod gamma_mean;
 pub mod halfnormal;
 pub mod hurdle;
 pub mod laplace;
@@ -12,6 +13,7 @@ pub mod normal;
 pub mod normal_mixture;
 pub mod poisson;
 pub mod studentt;
+pub mod studentt_fv;
 pub mod weibull;
 
 // Re-export all distributions for convenience
@@ -21,6 +23,7 @@ pub use categorical::{
 pub use cauchy::{Cauchy, CauchyFixedVar};
 pub use exponential::Exponential;
 pub use gamma::Gamma;
+pub use gamma_mean::GammaMean;
 pub use halfnormal::HalfNormal;
 pub use hurdle::{Hurdle, HurdleCrpsPart, HurdleLogNormal, HurdleNormal};
 pub use laplace::Laplace;
@@ -33,6 +36,7 @@ pub use normal::{Normal, NormalFixedMean, NormalFixedVar};
 pub use normal_mixture::{NormalMixture, NormalMixture2, NormalMixture3};
 pub use poisson::Poisson;
 pub use studentt::{StudentT, TFixedDf, TFixedDfFixedVar};
+pub use studentt_fv::StudentTFiniteVar;
 pub use weibull::Weibull;
 
 use crate::scores::{Scorable, Score};
@@ -66,7 +70,9 @@ pub trait Distribution: Sized + Clone + Debug {
     /// location — or `None`. Drives the default post-hoc scale recalibration
     /// at the end of `NGBoost::fit` (`NGBoost::auto_calibrate_scale`). Only
     /// loc/scale families return `Some`: Normal, Laplace, LogNormal, Cauchy,
-    /// StudentT, TFixedDf (column 1) and NormalFixedMean (column 0).
+    /// StudentT, StudentTFiniteVar, TFixedDf (column 1) and NormalFixedMean
+    /// (column 0); NegativeBinomial and GammaMean return their log-shape
+    /// column, which plays the same role.
     fn scale_param_index() -> Option<usize> {
         None
     }
@@ -77,6 +83,49 @@ pub trait Distribution: Sized + Clone + Debug {
     /// scales.
     fn scale_param_columns() -> Vec<usize> {
         Self::scale_param_index().into_iter().collect()
+    }
+
+    /// Upper bound k on a predicted scale relative to the model's baseline
+    /// scale, or `None` (the default: no bound). With `Some(k)`, every
+    /// prediction of an `NGBoost` regression model clamps the
+    /// [`Self::scale_param_index`] column at `c + ln k`, where `c` is the
+    /// model's stored constant for that column — after a staged fit the
+    /// log of the rms residual scale given the fitted location, after a
+    /// joint fit the marginal one. The stored model and the fit are
+    /// unchanged; only predictions are clamped. Since the mean of σ²(x) is
+    /// the squared rms residual scale, at most 1/k² of the rows can have a
+    /// true σ(x) above the bound.
+    ///
+    /// `LogNormal` returns `Some(4.0)` (since 1.3.0): its mean
+    /// exp(μ + σ²/2) is exponential in σ², and a few rows fitted with a
+    /// very large σ — single extreme log-residuals of a target that is not
+    /// log-normal in its tails — made predicted means explode (research
+    /// Cycle 19, `research/optimization-algorithm/proposals/
+    /// O5_lognormal_scale_ceiling.md`).
+    fn scale_ceiling() -> Option<f64> {
+        None
+    }
+
+    /// E[min(Y, cap)] per row — the mean of the predictive distribution
+    /// with everything above `cap` counted as `cap` (a winsorised mean) —
+    /// or `None` if the distribution does not provide it. `LogNormal`
+    /// does, in closed form. It is ≤ `min(mean, cap)` and tends to the mean
+    /// as `cap` grows. A building block for [`Self::predict_capped`].
+    fn winsorized_mean(&self, _cap: f64) -> Option<Array1<f64>> {
+        None
+    }
+
+    /// The point prediction when the largest training target `cap` is
+    /// known, for heads whose plain mean hangs on a tail no training row
+    /// ever reached; `None` (the default) = use [`Self::predict`].
+    /// `NGBoost::predict` and `staged_predict` call this with the model's
+    /// stored `target_max`. `HurdleLogNormal` returns
+    /// (1 − π)·E[min(Y, cap)] (since 1.3.0; research Cycle 21): its mean is
+    /// exponential in σ², and a few rows fitted with a large σ produced
+    /// means twenty times the largest target. `pred_dist(x).mean()` is
+    /// still the unbounded mean.
+    fn predict_capped(&self, _cap: f64) -> Option<Array1<f64>> {
+        None
     }
 
     /// Fewest validation rows for the default end-of-fit recalibration to
@@ -105,7 +154,8 @@ pub trait Distribution: Sized + Clone + Debug {
     /// (`NGBoost::fit_staged`): location first, then the remaining columns,
     /// then the location again weighted by its Fisher entry (feasible GLS),
     /// then the rest. `None` = no staged fit. Normal, Laplace, LogNormal,
-    /// StudentT, TFixedDf and Cauchy return `Some(0)`.
+    /// StudentT, StudentTFiniteVar, TFixedDf, Cauchy and GammaMean (log μ)
+    /// return `Some(0)`.
     fn location_column() -> Option<usize> {
         None
     }
@@ -113,7 +163,8 @@ pub trait Distribution: Sized + Clone + Debug {
     /// Whether `fit_with_validation` uses the staged fit by default (LogScore,
     /// early stopping and validation data present). True for Normal,
     /// LogNormal and StudentT (since 1.2.0; research/ngboost Cycles 13–14;
-    /// Laplace was mixed and stays joint).
+    /// Laplace was mixed and stays joint), GammaMean and StudentTFiniteVar
+    /// (since 1.3.0).
     fn default_staged_fit() -> bool {
         false
     }

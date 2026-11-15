@@ -151,6 +151,9 @@ pub struct NGBoostParams {
     /// Staged location-then-scale fit (`None` = the distribution's default).
     #[serde(default)]
     pub staged_fit: Option<bool>,
+    /// Folds for cross-fitted location residuals in the staged fit (0 = off).
+    #[serde(default)]
+    pub staged_crossfit_folds: usize,
 }
 
 fn default_true() -> bool {
@@ -178,6 +181,7 @@ impl Default for NGBoostParams {
             validation_split: ValidationSplit::Random,
             fisher_weight_power: None,
             staged_fit: None,
+            staged_crossfit_folds: 0,
         }
     }
 }
@@ -291,9 +295,78 @@ where
     /// Staged location-then-scale fit (feasible GLS) in `fit_with_validation`
     /// / `fit` when early stopping data is present: `None` = the
     /// distribution's default ([`Distribution::default_staged_fit`]; true
-    /// for Normal, LogNormal and StudentT under LogScore since 1.2.0),
+    /// for Normal, LogNormal and StudentT under LogScore since 1.2.0, for
+    /// GammaMean and StudentTFiniteVar since 1.3.0),
     /// `Some(false)` = the joint upstream fit. See [`NGBoost::fit_staged`].
     pub staged_fit: Option<bool>,
+    /// Opt-in (since 1.3.0; 0 or 1 = off, the default): number of folds for
+    /// **cross-fitted location residuals** in the staged fit.
+    ///
+    /// The staged fit trains its scale stages on the residuals of a location
+    /// that was fitted to the same rows. Those in-sample residuals are too
+    /// small — their variance was 41–76 % of the out-of-fold variance at
+    /// 2100 training rows and 12–57 % at 490 (dataset means) — which is
+    /// why the uncalibrated staged fit is overconfident and the staged fit
+    /// depends on the validation recalibration. With K ≥ 2 folds, each
+    /// scale stage instead sees, for every training row, the location
+    /// predicted by a model fitted without that row's fold (K extra
+    /// location fits per location stage, each run for the round count the
+    /// full location fit kept, no early stopping). Validation rows and the
+    /// final model are unchanged in kind: same format, same prediction path.
+    ///
+    /// Measured for Normal, K = 5, leaf size 20, six datasets × 10 seeds
+    /// (research Cycle 18, `research/optimization-algorithm/proposals/
+    /// O1_crossfit_scale.md`), held-out NLL against the library default:
+    /// −0.02…−0.09 on four datasets at 2100 training rows (7–10 seeds
+    /// each; ±0.01 on the other two), still −0.03 on average with the
+    /// recalibration switched off; −0.03…−0.09 on five datasets at 490
+    /// training rows; −0.08…−0.30 on five datasets when only 30 validation
+    /// rows exist. Because it does not need the recalibration, enabling it
+    /// also lifts the ≥ 40-validation-row condition on the default staged
+    /// fit ([`Self::uses_staged_fit`]). The exception in every setting is a
+    /// heavy-tailed target (protein): −0.01 at 2100 rows, but +0.07 (4 of
+    /// 10 seeds) at 490 rows and +0.09 with 30 validation rows — keep it
+    /// off for heavy-tailed targets on small data. Cost: about (1 + K)× the
+    /// location stages' tree fits; measured 2.6–4.8× the wall time of the
+    /// default staged fit at K = 5 in those runs (newer timings below).
+    ///
+    /// Other staged heads (K = 5, leaf 20, 10 seeds, against their own
+    /// default): GammaMean −0.005…−0.084 NLL on three datasets with the
+    /// mean unaffected. LogNormal: −0.005…−0.124 NLL on four datasets (8–10
+    /// of 10 seeds), means unaffected or slightly better. That holds with
+    /// the head's scale ceiling ([`Distribution::scale_ceiling`]); without
+    /// it the honest, larger σ of a few rows made exp(μ + σ²/2) explode on
+    /// one dataset (kin8nm: RMSE up to 10²⁵ on 9 of 10 seeds), which is
+    /// what [`Self::pred_param_unbounded`] still returns.
+    /// StudentTFiniteVar: −0.008…−0.048 NLL on four datasets (9–10 of 10
+    /// seeds on three, 7 of 10 on protein), RMSE within ±0.002 or better,
+    /// 90 % coverage moved from 0.93 to 0.90 where it was too wide.
+    ///
+    /// Tested as a default (research Cycle 25, `proposals/
+    /// O16_crossfit_default.md`; the model of
+    /// `hyper_opt::default_histogram_model`, all five heads that stage by
+    /// default, 19 head × dataset pairs, two sets of 10 seeds) and **not
+    /// made one**. Always on fails: with fewer than 40 validation rows
+    /// (under about 400 rows with the default split) single datasets lose
+    /// 0.1–0.3 NLL. From 40 validation rows up, K = 5 gave −0.045 NLL
+    /// (lower on 1543 of 1900 fits, 18 of 19 pairs) and 1 % lower RMSE;
+    /// K = 3 gave −0.043. The gain shrinks with size (−0.03 at 6000 rows,
+    /// −0.02 at 20 000), and the Normal head on a heavy-tailed target
+    /// gains nothing. Wall time on that model, one fit at a time: K = 5
+    /// 2.4–6.6× the default (median 5.6×), K = 3 0.9–5.0× (median 3.2×).
+    ///
+    /// Folds are random (drawn from the model's RNG) or, with
+    /// [`ValidationSplit::Chronological`], contiguous blocks in row order.
+    /// No effect on joint fits.
+    pub staged_crossfit_folds: usize,
+    /// Cross-fitted location column for the training rows, consumed by the
+    /// staged scale stage (`staged_rest`): (column, per-row values).
+    staged_train_override: Option<(usize, Array1<f64>)>,
+    /// Stop a fit after this many rounds while keeping `n_estimators` (and
+    /// with it the learning-rate schedule's progress) unchanged. Set only on
+    /// the fold models of `crossfit_location`, which replay the first
+    /// rounds of the full location fit.
+    round_limit: Option<u32>,
     /// Columns whose gradients are zeroed during training (staged fit only).
     frozen_columns: Vec<usize>,
     /// Whether the last `fit_with_validation` ran the staged fit (`refit_full`
@@ -328,6 +401,12 @@ where
     /// `fit`/`partial_fit`, or `None` if it did not run. Informational; the
     /// map itself is folded into `init_params` and the stored learners.
     pub scale_calibration: Option<(usize, f64, f64)>,
+    /// Largest finite target seen by `fit` / `partial_fit` (training and
+    /// validation rows), or `None` before a fit and for models saved before
+    /// 1.3.0. Used only by heads whose point prediction is bounded by it
+    /// ([`Distribution::predict_capped`]: `HurdleLogNormal`); stored with
+    /// the model (`SerializedNGBoost::target_max`).
+    pub target_max: Option<f64>,
 
     // --- 0-byte (PhantomData) ---
     _dist: PhantomData<D>,
@@ -380,12 +459,16 @@ where
             fisher_weight_cap: None,
             per_param_line_search: false,
             staged_fit: None,
+            staged_crossfit_folds: 0,
+            staged_train_override: None,
+            round_limit: None,
             frozen_columns: Vec::new(),
             last_fit_staged: false,
             refit_intercept: None,
             auto_calibrate_scale: true,
             validation_split: ValidationSplit::Random,
             scale_calibration: None,
+            target_max: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -433,12 +516,16 @@ where
             fisher_weight_cap: None,
             per_param_line_search: false,
             staged_fit: None,
+            staged_crossfit_folds: 0,
+            staged_train_override: None,
+            round_limit: None,
             frozen_columns: Vec::new(),
             last_fit_staged: false,
             refit_intercept: None,
             auto_calibrate_scale: true,
             validation_split: ValidationSplit::Random,
             scale_calibration: None,
+            target_max: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -514,12 +601,16 @@ where
             fisher_weight_cap: None,
             per_param_line_search: false,
             staged_fit: None,
+            staged_crossfit_folds: 0,
+            staged_train_override: None,
+            round_limit: None,
             frozen_columns: Vec::new(),
             last_fit_staged: false,
             refit_intercept: None,
             auto_calibrate_scale: true,
             validation_split: ValidationSplit::Random,
             scale_calibration: None,
+            target_max: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -585,12 +676,16 @@ where
             fisher_weight_cap: None,
             per_param_line_search: false,
             staged_fit: None,
+            staged_crossfit_folds: 0,
+            staged_train_override: None,
+            round_limit: None,
             frozen_columns: Vec::new(),
             last_fit_staged: false,
             refit_intercept: None,
             auto_calibrate_scale: true,
             validation_split: ValidationSplit::Random,
             scale_calibration: None,
+            target_max: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -653,12 +748,16 @@ where
             fisher_weight_cap: None,
             per_param_line_search: false,
             staged_fit: None,
+            staged_crossfit_folds: 0,
+            staged_train_override: None,
+            round_limit: None,
             frozen_columns: Vec::new(),
             last_fit_staged: false,
             refit_intercept: None,
             auto_calibrate_scale: true,
             validation_split: ValidationSplit::Random,
             scale_calibration: None,
+            target_max: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -726,12 +825,16 @@ where
             fisher_weight_cap: None,
             per_param_line_search: false,
             staged_fit: None,
+            staged_crossfit_folds: 0,
+            staged_train_override: None,
+            round_limit: None,
             frozen_columns: Vec::new(),
             last_fit_staged: false,
             refit_intercept: None,
             auto_calibrate_scale: true,
             validation_split: ValidationSplit::Random,
             scale_calibration: None,
+            target_max: None,
             _dist: PhantomData,
             _score: PhantomData,
         }
@@ -834,6 +937,7 @@ where
         m.fisher_weight_cap = self.fisher_weight_cap;
         m.per_param_line_search = self.per_param_line_search;
         m.staged_fit = self.staged_fit;
+        m.staged_crossfit_folds = self.staged_crossfit_folds;
         m.refit_intercept = self.refit_intercept;
         m.auto_calibrate_scale = self.auto_calibrate_scale;
         m.validation_split = self.validation_split;
@@ -916,7 +1020,9 @@ where
     /// rows). The staged scale stage is fitted to the residuals of a
     /// longer-trained location, so it is too narrow until recalibrated:
     /// uncalibrated it lost +0.04…+0.21 NLL on 4 of 5 datasets at n = 3000
-    /// and up to +14 at n = 700 (research Cycle 17, R65–R66).
+    /// and up to +14 at n = 700 (research Cycle 17, R65–R66). With
+    /// cross-fitted residuals (`staged_crossfit_folds ≥ 2`) the scale stage
+    /// is not too narrow, and the recalibration condition is dropped.
     pub fn uses_staged_fit(&self, n_rows: usize, n_val: Option<usize>) -> bool {
         let split = self.validation_fraction > 0.0 && self.validation_fraction < 1.0;
         let val_rows = match n_val {
@@ -929,9 +1035,11 @@ where
         let enabled = self.staged_fit.unwrap_or_else(|| {
             D::default_staged_fit()
                 && std::any::TypeId::of::<S>() == std::any::TypeId::of::<LogScore>()
-                && self.auto_calibrate_scale
-                && !D::scale_param_columns().is_empty()
-                && val_rows >= AUTO_CALIBRATION_MIN_ROWS.max(D::auto_calibration_min_rows())
+                && (self.staged_crossfit_folds >= 2
+                    || (self.auto_calibrate_scale
+                        && !D::scale_param_columns().is_empty()
+                        && val_rows
+                            >= AUTO_CALIBRATION_MIN_ROWS.max(D::auto_calibration_min_rows())))
         });
         enabled
             && D::location_column().is_some()
@@ -955,6 +1063,10 @@ where
     /// 4. as stage 2 on the stage-3 location, then the default
     ///    recalibration. The model is stages 3 + 4: ordinary rounds, same
     ///    format and prediction as a joint fit.
+    ///
+    /// With `staged_crossfit_folds ≥ 2`, stages 2 and 4 see cross-fitted
+    /// (out-of-fold) location predictions for the training rows instead of
+    /// the in-sample ones (see that field).
     ///
     /// Without explicit validation data the rows are split once
     /// (`validation_fraction`, `validation_split`) for all stages. Measured
@@ -999,17 +1111,21 @@ where
         self.auto_calibrate_scale = false;
         let r = self
             .staged_location(x, y, xv, yv, sample_weight, val_sample_weight, &others)
+            .and_then(|_| self.crossfit_location(x, y, sample_weight, loc, &others))
             .and_then(|_| {
                 self.staged_rest(x, y, xv, yv, sample_weight, val_sample_weight, loc, &others)
             });
+        self.staged_train_override = None;
         if let Err(e) = r {
             self.frozen_columns.clear();
             self.auto_calibrate_scale = calibrate;
             return Err(e);
         }
         // stage 3 weights: the location's Fisher entry (1/σ̂² for Normal)
+        // (from the unclamped sum, like every other fit-time quantity: a
+        // distribution's scale ceiling only applies to predictions)
         let fisher_loc = |m: &Self, xx: &Array2<f64>| {
-            Scorable::<S>::diagonal_metric(&m.pred_dist(xx))
+            Scorable::<S>::diagonal_metric(&D::from_params(&m.raw_params_at(xx, None)))
                 .column(loc)
                 .to_owned()
         };
@@ -1036,7 +1152,7 @@ where
             if beta == 0.0 {
                 return None;
             }
-            let mut p = m.pred_param(xx);
+            let mut p = m.raw_params_at(xx, None);
             for &j in &others {
                 p.column_mut(j).fill(init3[j]);
             }
@@ -1077,10 +1193,12 @@ where
         // stages 3–4
         let r = self
             .staged_location(x, y, xv, yv, Some(&w_tr), w_val.as_ref(), &others)
+            .and_then(|_| self.crossfit_location(x, y, Some(&w_tr), loc, &others))
             .and_then(|_| {
                 self.auto_calibrate_scale = calibrate;
                 self.staged_rest(x, y, xv, yv, sample_weight, val_sample_weight, loc, &others)
             });
+        self.staged_train_override = None;
         self.frozen_columns.clear();
         self.auto_calibrate_scale = calibrate;
         r
@@ -1103,6 +1221,76 @@ where
         self.fit_internal(x, y, xv, yv, w, wv, true)
     }
 
+    /// Staged fit with `staged_crossfit_folds ≥ 2`: out-of-fold location
+    /// predictions for the training rows, stored in `staged_train_override`
+    /// for the following scale stage. Called right after a location stage,
+    /// so `base_models` is that stage's (early-stopped) location model; each
+    /// fold model repeats its recipe — other columns frozen at the fold's
+    /// marginal constants, the stage's weights — on the other folds' rows
+    /// for the same number of rounds, without validation data.
+    fn crossfit_location(
+        &mut self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        w: Option<&Array1<f64>>,
+        loc: usize,
+        others: &[usize],
+    ) -> Result<(), &'static str> {
+        let k = self.staged_crossfit_folds;
+        if k < 2 {
+            return Ok(());
+        }
+        let n = y.len();
+        if n < 2 * k {
+            return Err("staged_crossfit_folds: need at least two training rows per fold");
+        }
+        let rounds = self.base_models.len().max(1) as u32;
+        let mut idx: Vec<usize> = (0..n).collect();
+        if self.validation_split == ValidationSplit::Random {
+            for i in (1..n).rev() {
+                let j = self.rng.random_range(0..=i);
+                idx.swap(i, j);
+            }
+        }
+        let ax = ndarray::Axis(0);
+        let mut out = Array1::from_elem(n, f64::NAN);
+        for f in 0..k {
+            let (lo, hi) = (f * n / k, (f + 1) * n / k);
+            let held = &idx[lo..hi];
+            let rest: Vec<usize> = idx[..lo].iter().chain(&idx[hi..]).copied().collect();
+            let mut m = self.unfitted_like::<D>();
+            m.set_random_state(self.rng.random::<u64>());
+            // same `n_estimators`, hence the same learning-rate schedule as
+            // the full location fit; stopped at the rounds that fit kept
+            m.round_limit = Some(rounds);
+            m.early_stopping_rounds = None;
+            m.staged_fit = Some(false);
+            m.staged_crossfit_folds = 0;
+            m.auto_calibrate_scale = false;
+            m.verbose = false;
+            m.frozen_columns = others.to_vec();
+            let wt = w.map(|w| w.select(ax, &rest));
+            m.fit_internal(
+                &x.select(ax, &rest),
+                &y.select(ax, &rest),
+                None,
+                None,
+                wt.as_ref(),
+                None,
+                true,
+            )?;
+            let p = m.raw_params_at(&x.select(ax, held), None);
+            for (r, &i) in held.iter().enumerate() {
+                out[i] = p[[r, loc]];
+            }
+        }
+        if out.iter().any(|v| !v.is_finite()) {
+            return Err("staged_crossfit_folds: non-finite out-of-fold location");
+        }
+        self.staged_train_override = Some((loc, out));
+        Ok(())
+    }
+
     /// Staged fit, scale stage: refit the other columns' constants given the
     /// current location (coordinate-wise 1-D minimisation of the training
     /// score, folded into `init_params`), then boost them with the location
@@ -1119,7 +1307,13 @@ where
         loc: usize,
         others: &[usize],
     ) -> Result<(), &'static str> {
-        let base = self.pred_param(x);
+        let mut base = self.raw_params_at(x, None);
+        // cross-fitted location for the training rows (`crossfit_location`)
+        if let Some((col, v)) = &self.staged_train_override
+            && v.len() == base.nrows()
+        {
+            base.column_mut(*col).assign(v);
+        }
         let mut shift = vec![0.0; base.ncols()];
         for _pass in 0..2 {
             for &j in others {
@@ -1353,6 +1547,20 @@ where
         self.evals_result = EvalsResult::default();
         self.scale_calibration = None;
         self.n_features = Some(x.ncols());
+        // largest target seen (training and validation rows); a continued
+        // fit keeps the larger of the old and the new one
+        if reset_state {
+            self.target_max = None;
+        }
+        let seen = y
+            .iter()
+            .chain(y_val.into_iter().flatten())
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        if seen.is_finite() {
+            self.target_max = Some(self.target_max.map_or(seen, |m| m.max(seen)));
+        }
 
         // A full fit with early stopping but no possible validation data
         // would silently train all n_estimators with best_val_loss_itr =
@@ -1469,7 +1677,7 @@ where
         // For partial_fit, replay all existing base models to reconstruct current params
         // (matches Python's pred_param(X) call at start of partial_fit)
         let mut params = if !reset_state && !self.base_models.is_empty() {
-            self.get_params_at(&x_train, None)
+            self.raw_params_at(&x_train, None)
         } else {
             let mut p = Array2::from_elem((x_train.nrows(), n_params), 0.0);
             let init_params = self.init_params.as_ref().unwrap();
@@ -1477,11 +1685,19 @@ where
                 .for_each(|mut row| row.assign(init_params));
             p
         };
+        // Staged fit with cross-fitted residuals: the (frozen) location column
+        // of the training rows starts — and stays — at its out-of-fold value.
+        if !reset_state
+            && let Some((col, v)) = &self.staged_train_override
+            && v.len() == params.nrows()
+        {
+            params.column_mut(*col).assign(v);
+        }
 
         // Prepare validation params if validation data is provided
         let mut val_params = if let (Some(xv), Some(_yv)) = (x_val, y_val) {
             if !reset_state && !self.base_models.is_empty() {
-                Some(self.get_params_at(xv, None))
+                Some(self.raw_params_at(xv, None))
             } else {
                 let mut v_params = Array2::from_elem((xv.nrows(), n_params), 0.0);
                 let init_params = self.init_params.as_ref().unwrap();
@@ -1546,7 +1762,7 @@ where
         let mut prof_rounds = 0usize;
         let mut prof_t = std::time::Instant::now();
 
-        for itr in 0..self.n_estimators {
+        for itr in 0..self.n_estimators.min(self.round_limit.unwrap_or(u32::MAX)) {
             if profile {
                 prof_t = std::time::Instant::now();
                 prof_rounds += 1;
@@ -2302,7 +2518,37 @@ where
         self.get_params_at(x, None)
     }
 
+    /// Predicted parameters with the distribution's scale ceiling applied
+    /// ([`Distribution::scale_ceiling`]); every public prediction goes
+    /// through here. The fit itself works on [`Self::raw_params_at`].
     fn get_params_at(&self, x: &Array2<f64>, max_iter: Option<usize>) -> Array2<f64> {
+        let mut params = self.raw_params_at(x, max_iter);
+        self.apply_scale_ceiling(&mut params);
+        params
+    }
+
+    /// Clamp the log-scale column at `init + ln(k)`, k =
+    /// [`Distribution::scale_ceiling`]: no predicted scale exceeds k times
+    /// the model's baseline scale (the stored constant of that column —
+    /// after a staged fit the rms residual scale given the location).
+    /// A no-op for distributions without a ceiling.
+    fn apply_scale_ceiling(&self, params: &mut Array2<f64>) {
+        if let Some(k) = D::scale_ceiling()
+            && let Some(col) = D::scale_param_index()
+            && let Some(init) = self.init_params.as_ref()
+            && col < params.ncols()
+            && k.is_finite()
+            && k > 0.0
+        {
+            let ceil = init[col] + k.ln();
+            if ceil.is_finite() {
+                params.column_mut(col).mapv_inplace(|v| v.min(ceil));
+            }
+        }
+    }
+
+    /// `init + Σ trees`, unclamped.
+    fn raw_params_at(&self, x: &Array2<f64>, max_iter: Option<usize>) -> Array2<f64> {
         let init_params = self
             .init_params
             .as_ref()
@@ -2392,6 +2638,15 @@ where
         self.get_params(x)
     }
 
+    /// The model's own parameter sum, `init + Σ trees`, without the
+    /// distribution's scale ceiling ([`Distribution::scale_ceiling`]; only
+    /// `LogNormal` has one). Identical to [`Self::pred_param`] for every
+    /// other distribution. `D::from_params(&model.pred_param_unbounded(x))`
+    /// is the unclamped predictive distribution.
+    pub fn pred_param_unbounded(&self, x: &Array2<f64>) -> Array2<f64> {
+        self.raw_params_at(x, None)
+    }
+
     /// Get the predicted distribution parameters using the first `max_iter`
     /// boosting STAGES (a model count, not an inclusive iteration index).
     ///
@@ -2448,8 +2703,19 @@ where
         D::from_params(&self.pred_param_best(x))
     }
 
+    /// Point predictions: the distribution's `predict` (its mean for the
+    /// regression heads), except for heads that bound it by the largest
+    /// training target ([`Distribution::predict_capped`]; `HurdleLogNormal`
+    /// returns (1 − π)·E\[min(Y, target_max)\]). `pred_dist(x).mean()` is
+    /// always the plain mean.
     pub fn predict(&self, x: &Array2<f64>) -> Array1<f64> {
-        self.pred_dist(x).predict()
+        self.point_prediction(&self.pred_dist(x))
+    }
+
+    fn point_prediction(&self, d: &D) -> Array1<f64> {
+        self.target_max
+            .and_then(|cap| d.predict_capped(cap))
+            .unwrap_or_else(|| d.predict())
     }
 
     /// Get predictions using the first `max_iter` boosting STAGES (a model
@@ -2471,7 +2737,7 @@ where
     pub fn staged_predict(&self, x: &Array2<f64>) -> Vec<Array1<f64>> {
         self.staged_pred_dist(x)
             .into_iter()
-            .map(|d| d.predict())
+            .map(|d| self.point_prediction(&d))
             .collect()
     }
 
@@ -2505,7 +2771,13 @@ where
             };
             let factor = lr * scale;
             Self::predict_and_update_params(learners, x, col_idx, &mut params, factor);
-            results.push(D::from_params(&params));
+            if D::scale_ceiling().is_some() {
+                let mut capped = params.clone();
+                self.apply_scale_ceiling(&mut capped);
+                results.push(D::from_params(&capped));
+            } else {
+                results.push(D::from_params(&params));
+            }
         }
 
         results
@@ -2531,6 +2803,12 @@ where
     /// Get number of features the model was trained on
     pub fn n_features(&self) -> Option<usize> {
         self.n_features
+    }
+
+    /// The base learner every boosting round clones (its tree shape, bin
+    /// count and leaf size).
+    pub fn base_learner(&self) -> &B {
+        &self.base_learner
     }
 
     /// Determine if verbose output should be printed at the given iteration.
@@ -2696,7 +2974,7 @@ where
         }
 
         // Get predictions on validation data
-        let params = self.pred_param(x_val);
+        let params = self.raw_params_at(x_val, None);
         let dist = D::from_params(&params);
 
         // Calculate predictions and errors
@@ -2830,7 +3108,7 @@ where
         }
 
         // One shared (a, b) for all listed columns: p_c ← a + b·p_c.
-        let raw = self.pred_param(x_val);
+        let raw = self.raw_params_at(x_val, None);
         let base_cols: Vec<Array1<f64>> = cols.iter().map(|&c| raw.column(c).to_owned()).collect();
         let mut work = raw;
         let mut objective = |a: f64, b: f64| -> f64 {
@@ -3154,6 +3432,7 @@ where
             line_search_method: self.line_search_method,
             n_features: self.n_features,
             random_state: self.random_state,
+            target_max: self.target_max,
         })
     }
 
@@ -3197,6 +3476,7 @@ where
         model.tikhonov_reg = serialized.tikhonov_reg;
         model.line_search_method = serialized.line_search_method;
         model.n_features = serialized.n_features;
+        model.target_max = serialized.target_max;
 
         // Restore base models
         model.base_models = serialized
@@ -3247,6 +3527,32 @@ pub struct SerializedNGBoost {
     /// Random state for reproducibility (added in v0.3)
     #[serde(default)]
     pub random_state: Option<u64>,
+    /// Largest training target (added in 1.3.0; see `NGBoost::target_max`).
+    /// The last field: files written before 1.3.0 simply end before it, and
+    /// [`SerializedNGBoost::from_bincode`] reads those as `None`.
+    #[serde(default)]
+    pub target_max: Option<f64>,
+}
+
+impl SerializedNGBoost {
+    /// Decode a bincode-serialized model written by this or an earlier
+    /// version. bincode is positional, so a file from before 1.3.0 ends
+    /// where the 1.3.0 field `target_max` would begin; such bytes are read
+    /// with that field absent. (Self-describing formats such as JSON need
+    /// no such step: the field has a serde default. Older versions of this
+    /// crate read 1.3.0 files unchanged, ignoring the trailing field.)
+    pub fn from_bincode(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        match bincode::deserialize(bytes) {
+            Ok(m) => Ok(m),
+            Err(first) => {
+                // append the encoding of `None` for the missing last field
+                let mut padded = Vec::with_capacity(bytes.len() + 1);
+                padded.extend_from_slice(bytes);
+                padded.push(0);
+                bincode::deserialize(&padded).map_err(|_| first)
+            }
+        }
+    }
 }
 
 /// Damped Newton with central finite differences and backtracking for a
@@ -3689,7 +3995,7 @@ impl NGBRegressor {
     /// Load model from file using bincode deserialization
     pub fn load_model(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let encoded = std::fs::read(path)?;
-        let serialized: SerializedNGBoost = bincode::deserialize(&encoded)?;
+        let serialized = SerializedNGBoost::from_bincode(&encoded)?;
         let model = NGBoost::<Normal, LogScore, HistogramLearner>::deserialize(
             serialized,
             default_base_learner(),
@@ -3757,6 +4063,7 @@ impl NGBRegressor {
             auto_calibrate_scale: self.model.auto_calibrate_scale,
             validation_split: self.model.validation_split,
             staged_fit: self.model.staged_fit,
+            staged_crossfit_folds: self.model.staged_crossfit_folds,
             fisher_weight_power: self.model.fisher_weight_power,
         }
     }
@@ -3780,6 +4087,7 @@ impl NGBRegressor {
         self.model.auto_calibrate_scale = params.auto_calibrate_scale;
         self.model.validation_split = params.validation_split;
         self.model.staged_fit = params.staged_fit;
+        self.model.staged_crossfit_folds = params.staged_crossfit_folds;
         self.model.fisher_weight_power = params.fisher_weight_power;
         if let Some(seed) = params.random_state {
             self.model.set_random_state(seed);
@@ -4081,6 +4389,7 @@ impl<const K: usize> NGBMultiClassifier<K> {
             auto_calibrate_scale: self.model.auto_calibrate_scale,
             validation_split: self.model.validation_split,
             staged_fit: self.model.staged_fit,
+            staged_crossfit_folds: self.model.staged_crossfit_folds,
             fisher_weight_power: self.model.fisher_weight_power,
         }
     }
@@ -4103,6 +4412,7 @@ impl<const K: usize> NGBMultiClassifier<K> {
         self.model.auto_calibrate_scale = params.auto_calibrate_scale;
         self.model.validation_split = params.validation_split;
         self.model.staged_fit = params.staged_fit;
+        self.model.staged_crossfit_folds = params.staged_crossfit_folds;
         self.model.fisher_weight_power = params.fisher_weight_power;
         if let Some(seed) = params.random_state {
             self.model.set_random_state(seed);
@@ -4357,7 +4667,7 @@ impl NGBClassifier {
     /// Load model from file using bincode deserialization
     pub fn load_model(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let encoded = std::fs::read(path)?;
-        let serialized: SerializedNGBoost = bincode::deserialize(&encoded)?;
+        let serialized = SerializedNGBoost::from_bincode(&encoded)?;
         let model = NGBoost::<Bernoulli, LogScore, HistogramLearner>::deserialize(
             serialized,
             default_base_learner(),
@@ -4440,6 +4750,7 @@ impl NGBClassifier {
             auto_calibrate_scale: self.model.auto_calibrate_scale,
             validation_split: self.model.validation_split,
             staged_fit: self.model.staged_fit,
+            staged_crossfit_folds: self.model.staged_crossfit_folds,
             fisher_weight_power: self.model.fisher_weight_power,
         }
     }
@@ -4463,6 +4774,7 @@ impl NGBClassifier {
         self.model.auto_calibrate_scale = params.auto_calibrate_scale;
         self.model.validation_split = params.validation_split;
         self.model.staged_fit = params.staged_fit;
+        self.model.staged_crossfit_folds = params.staged_crossfit_folds;
         self.model.fisher_weight_power = params.fisher_weight_power;
         if let Some(seed) = params.random_state {
             self.model.set_random_state(seed);

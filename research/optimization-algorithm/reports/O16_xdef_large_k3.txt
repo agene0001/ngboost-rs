@@ -1,0 +1,33 @@
+arm k3 - off, rule U
+paired fits: 20; non-finite or failed: off 0, k3 0
+
+By pool size (mean over head x dataset pairs; se over pair means)
+  size pairs     dNLL     se     lower  dRMSE%    se cov off  cov on time x staged off
+ 20000     4  -0.0210 0.0012   17/20     -0.52  0.78   0.905   0.902   1.83    20/20  
+
+By head x dataset (per-seed mean over sizes; se over seeds)
+head        dataset          dNLL     se     t     lower  dRMSE%    se     t
+normal      het_a         -0.0177 0.0101  -1.8    4/5      -0.17  0.12  -1.4
+normal      protein       -0.0205 0.0134  -1.5    4/5      +1.06  0.53  +2.0
+normal      tnoise        -0.0227 0.0035  -6.5    5/5      -0.31  0.18  -1.7
+studenttfv  protein       -0.0231 0.0131  -1.8    4/5      -2.68  1.70  -1.6
+
+Cells
+head        dataset        size     dNLL     se     t   low  dRMSE% cov off cov on time x off is
+normal      het_a         20000  -0.0177 0.0101  -1.8  4/5    -0.17  0.903  0.902   4.16 staged
+normal      protein       20000  -0.0205 0.0134  -1.5  4/5    +1.06  0.900  0.903   1.64 staged
+normal      tnoise        20000  -0.0227 0.0035  -6.5  5/5    -0.31  0.917  0.912   2.35 staged
+studenttfv  protein       20000  -0.0231 0.0131  -1.8  4/5    -2.68  0.903  0.894   1.64 staged
+
+Pooled
+  dNLL over fits -0.0210; over pair means -0.0210 (se 0.0012, t -17.1, 4 pairs)
+  lower on 17/20 fits (85 %)
+  dRMSE over pair means -0.52 % (se 0.78)
+  coverage off 0.905, on 0.902
+  wall time, sum on / sum off: 1.83
+
+Decision rule
+  R1 benefit           pass
+  R2 no harm           pass  pairs [] cells []
+  R3 point predictions pass  pairs []
+  R4 robustness        pass

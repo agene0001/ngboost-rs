@@ -1,0 +1,183 @@
+arm k5 - off, rule U
+paired fits: 1330; non-finite or failed: off 0, k5 0
+
+By pool size (mean over head x dataset pairs; se over pair means)
+  size pairs     dNLL     se     lower  dRMSE%    se cov off  cov on time x staged off
+   100    19  -0.0191 0.0382  124/190    -1.89  0.71   0.835   0.844   0.04     0/190 
+   200    19  -0.0804 0.0229  149/190    -5.75  1.37   0.859   0.865  11.50     0/190 
+   400    19  -0.0399 0.0097  143/190    -1.49  0.46   0.886   0.880   4.14   160/190 
+   800    19  -0.0577 0.0101  165/190    -2.05  0.64   0.898   0.896   4.98   160/190 
+  1600    19  -0.0667 0.0132  165/190    -1.79  0.65   0.894   0.895   4.57   160/190 
+  3200    19  -0.0359 0.0076  154/190    -0.50  0.29   0.908   0.905   4.32   190/190 
+  6000    19  -0.0317 0.0076  153/190    -0.33  0.23   0.908   0.905   3.61   190/190 
+
+By head x dataset (per-seed mean over sizes; se over seeds)
+head        dataset          dNLL     se     t     lower  dRMSE%    se     t
+gammamean   gamma_het     -0.0273 0.0073  -3.7   50/70     -1.16  0.24  -4.8
+gammamean   kin8nm        -0.0616 0.0127  -4.9   63/70     -4.23  0.38 -11.2
+gammamean   lognorm_het   -0.0649 0.0094  -6.9   54/70     -2.66  0.30  -8.9
+lognormal   kin8nm        -0.0688 0.0143  -4.8   60/70     -2.12  0.47  -4.5
+lognormal   lognorm_het   -0.0354 0.0100  -3.5   51/70     -0.84  0.39  -2.1
+normal      het_a         -0.0614 0.0168  -3.7   58/70     -3.72  1.18  -3.1
+normal      het_b         +0.0063 0.0419  +0.1   55/70     -1.26  0.49  -2.6
+normal      homo          -0.0104 0.0117  -0.9   46/70     -2.96  0.63  -4.7
+normal      kin8nm        +0.0057 0.0296  +0.2   57/70     +0.10  0.41  +0.2
+normal      protein       +0.0324 0.0311  +1.0   38/70     +0.65  0.21  +3.1
+normal      tnoise        -0.0771 0.0189  -4.1   60/70     -3.46  0.76  -4.6
+studentt    het_a         -0.1162 0.0205  -5.7   62/70     -3.99  0.55  -7.3
+studentt    kin8nm        -0.0376 0.0057  -6.6   60/70     -0.24  0.28  -0.9
+studentt    protein       +0.0178 0.0251  +0.7   47/70     +0.15  0.21  +0.7
+studentt    tnoise        -0.1191 0.0263  -4.5   63/70     -4.45  0.75  -5.9
+studenttfv  het_a         -0.1043 0.0159  -6.5   68/70     -3.78  0.68  -5.6
+studenttfv  kin8nm        -0.0432 0.0119  -3.6   57/70     -0.34  0.49  -0.7
+studenttfv  protein       -0.0434 0.0185  -2.3   44/70     +0.30  0.14  +2.1
+studenttfv  tnoise        -0.0908 0.0284  -3.2   60/70     -3.42  0.70  -4.9
+
+Cells
+head        dataset        size     dNLL     se     t   low  dRMSE% cov off cov on time x off is
+gammamean   gamma_het       100  -0.0255 0.0257  -1.0  6/10   +0.47  0.815  0.846  18.03  joint
+gammamean   gamma_het       200  -0.0160 0.0323  -0.5  6/10   -0.34  0.841  0.839   8.29  joint
+gammamean   gamma_het       400  -0.0126 0.0127  -1.0  8/10   -0.62  0.876  0.885   9.67  joint
+gammamean   gamma_het       800  -0.0365 0.0092  -4.0 10/10   -3.05  0.881  0.887  12.49  joint
+gammamean   gamma_het      1600  -0.1027 0.0137  -7.5 10/10   -4.30  0.840  0.883   9.76  joint
+gammamean   gamma_het      3200  -0.0060 0.0065  -0.9  5/10   -0.68  0.893  0.889   4.65 staged
+gammamean   gamma_het      6000  +0.0084 0.0105  +0.8  5/10   +0.39  0.892  0.893   3.36 staged
+gammamean   kin8nm          100  +0.0616 0.1052  +0.6  5/10   -0.36  0.828  0.826   9.07  joint
+gammamean   kin8nm          200  -0.0363 0.0229  -1.6  9/10   -2.46  0.866  0.872   4.77  joint
+gammamean   kin8nm          400  -0.0642 0.0130  -4.9 10/10   -5.38  0.865  0.881  32.06  joint
+gammamean   kin8nm          800  -0.0854 0.0142  -6.0  9/10   -9.48  0.873  0.880  29.72  joint
+gammamean   kin8nm         1600  -0.1205 0.0072 -16.8 10/10  -10.56  0.868  0.879  21.01  joint
+gammamean   kin8nm         3200  -0.0880 0.0118  -7.5 10/10   -0.54  0.908  0.904   4.89 staged
+gammamean   kin8nm         6000  -0.0983 0.0127  -7.7 10/10   -0.86  0.907  0.905   4.43 staged
+gammamean   lognorm_het     100  +0.0114 0.0349  +0.3  6/10   -0.93  0.863  0.852  10.61  joint
+gammamean   lognorm_het     200  -0.0076 0.0725  -0.1  7/10   -1.75  0.852  0.863   8.50  joint
+gammamean   lognorm_het     400  -0.1431 0.0238  -6.0 10/10   -4.75  0.863  0.881   8.02  joint
+gammamean   lognorm_het     800  -0.1375 0.0160  -8.6 10/10   -4.76  0.876  0.896  17.83  joint
+gammamean   lognorm_het    1600  -0.1861 0.0139 -13.4 10/10   -5.75  0.862  0.895  26.04  joint
+gammamean   lognorm_het    3200  +0.0033 0.0054  +0.6  6/10   -0.64  0.909  0.910   3.99 staged
+gammamean   lognorm_het    6000  +0.0054 0.0083  +0.6  5/10   -0.06  0.905  0.905   4.18 staged
+lognormal   kin8nm          100  -0.0800 0.1018  -0.8  7/10   -1.78  0.821  0.847  15.42  joint
+lognormal   kin8nm          200  +0.0503 0.0623  +0.8  6/10   -2.18  0.876  0.853   7.43  joint
+lognormal   kin8nm          400  -0.0423 0.0189  -2.2  8/10   -0.17  0.874  0.883   2.66 staged
+lognormal   kin8nm          800  -0.0566 0.0141  -4.0  9/10   -0.87  0.898  0.906   5.67 staged
+lognormal   kin8nm         1600  -0.1139 0.0061 -18.6 10/10   -2.99  0.907  0.913   6.08 staged
+lognormal   kin8nm         3200  -0.1171 0.0117 -10.0 10/10   -3.37  0.912  0.911   4.74 staged
+lognormal   kin8nm         6000  -0.1223 0.0114 -10.7 10/10   -3.49  0.911  0.910   4.79 staged
+lognormal   lognorm_het     100  +0.0179 0.0534  +0.3  6/10   -1.07  0.827  0.843   6.91  joint
+lognormal   lognorm_het     200  -0.0893 0.0332  -2.7  8/10   -4.53  0.851  0.866  13.55  joint
+lognormal   lognorm_het     400  -0.0787 0.0127  -6.2 10/10   -1.94  0.890  0.898   5.05 staged
+lognormal   lognorm_het     800  -0.0274 0.0159  -1.7  6/10   +0.90  0.906  0.901   3.58 staged
+lognormal   lognorm_het    1600  -0.0594 0.0113  -5.3 10/10   -0.11  0.890  0.896   4.13 staged
+lognormal   lognorm_het    3200  -0.0110 0.0042  -2.6  7/10   +1.00  0.903  0.907   3.69 staged
+lognormal   lognorm_het    6000  -0.0001 0.0047  -0.0  4/10   -0.14  0.902  0.903   3.81 staged
+normal      het_a           100  -0.0135 0.0589  -0.2  6/10   -6.60  0.833  0.834  20.23  joint
+normal      het_a           200  -0.0844 0.0549  -1.5  7/10  -12.48  0.861  0.865  21.23  joint
+normal      het_a           400  -0.0580 0.0178  -3.3  8/10   -0.37  0.895  0.901   3.92 staged
+normal      het_a           800  -0.0882 0.0221  -4.0  8/10   -2.97  0.913  0.915   4.69 staged
+normal      het_a          1600  -0.1149 0.0202  -5.7 10/10   -2.25  0.894  0.887   4.71 staged
+normal      het_a          3200  -0.0400 0.0074  -5.4 10/10   -0.97  0.898  0.905   4.07 staged
+normal      het_a          6000  -0.0310 0.0087  -3.6  9/10   -0.40  0.906  0.902   3.96 staged
+normal      het_b           100  +0.2968 0.2847  +1.0  7/10   -4.46  0.834  0.810  16.78  joint
+normal      het_b           200  -0.1347 0.0234  -5.8 10/10   -3.94  0.860  0.874   8.28  joint
+normal      het_b           400  -0.0536 0.0370  -1.4  7/10   -0.11  0.893  0.881   3.07 staged
+normal      het_b           800  -0.0488 0.0127  -3.8 10/10   -0.29  0.897  0.896   3.30 staged
+normal      het_b          1600  -0.0096 0.0070  -1.4  7/10   +0.17  0.889  0.886   4.43 staged
+normal      het_b          3200  +0.0006 0.0046  +0.1  6/10   -0.08  0.906  0.904   3.76 staged
+normal      het_b          6000  -0.0066 0.0021  -3.2  8/10   -0.13  0.907  0.908   3.06 staged
+normal      homo            100  +0.1177 0.0941  +1.3  4/10   -4.64  0.835  0.824  18.18  joint
+normal      homo            200  -0.1560 0.0271  -5.8 10/10  -14.89  0.863  0.902  20.51  joint
+normal      homo            400  +0.0013 0.0162  +0.1  5/10   -0.48  0.875  0.870   4.73 staged
+normal      homo            800  -0.0084 0.0191  -0.4  6/10   -0.43  0.893  0.895   4.21 staged
+normal      homo           1600  +0.0073 0.0134  +0.5  6/10   +1.64  0.887  0.889   3.87 staged
+normal      homo           3200  -0.0280 0.0114  -2.5  8/10   -1.91  0.878  0.906   4.49 staged
+normal      homo           6000  -0.0065 0.0064  -1.0  7/10   -0.01  0.884  0.900   4.08 staged
+normal      kin8nm          100  +0.1509 0.1835  +0.8  7/10   -0.19  0.827  0.838  11.17  joint
+normal      kin8nm          200  +0.1157 0.0472  +2.4  3/10   -1.96  0.856  0.816  24.34  joint  HARM
+normal      kin8nm          400  -0.0137 0.0078  -1.8  7/10   -0.03  0.870  0.877   3.21 staged
+normal      kin8nm          800  -0.0498 0.0125  -4.0 10/10   -1.81  0.887  0.887   4.75 staged
+normal      kin8nm         1600  -0.0532 0.0076  -7.0 10/10   +0.06  0.897  0.900   4.49 staged
+normal      kin8nm         3200  -0.0521 0.0056  -9.3 10/10   +2.55  0.900  0.896   4.30 staged
+normal      kin8nm         6000  -0.0576 0.0035 -16.3 10/10   +2.07  0.901  0.901   5.10 staged
+normal      protein         100  +0.1480 0.2208  +0.7  2/10   +0.53  0.822  0.827  11.07  joint
+normal      protein         200  +0.0420 0.0607  +0.7  5/10   +1.02  0.873  0.875   6.36  joint
+normal      protein         400  +0.0608 0.0526  +1.2  4/10   +0.33  0.887  0.893   3.85 staged
+normal      protein         800  +0.0119 0.0236  +0.5  7/10   +0.99  0.895  0.903   3.48 staged
+normal      protein        1600  +0.0098 0.0183  +0.5  5/10   +1.21  0.896  0.903   3.48 staged
+normal      protein        3200  -0.0170 0.0203  -0.8  7/10   +0.35  0.906  0.913   4.15 staged
+normal      protein        6000  -0.0287 0.0106  -2.7  8/10   +0.10  0.907  0.912   4.57 staged
+normal      tnoise          100  +0.0697 0.0993  +0.7  6/10   -1.14  0.817  0.818   8.77  joint
+normal      tnoise          200  -0.1492 0.0469  -3.2  8/10  -10.71  0.813  0.856  20.18  joint
+normal      tnoise          400  -0.0881 0.0249  -3.5  8/10   -5.38  0.892  0.882   6.36 staged
+normal      tnoise          800  -0.1164 0.0433  -2.7  9/10   -0.73  0.887  0.890   4.49 staged
+normal      tnoise         1600  -0.1732 0.0304  -5.7 10/10   -3.57  0.894  0.901   4.14 staged
+normal      tnoise         3200  -0.0458 0.0114  -4.0 10/10   -1.72  0.905  0.910   3.77 staged
+normal      tnoise         6000  -0.0366 0.0087  -4.2  9/10   -0.99  0.907  0.911   4.16 staged
+studentt    het_a           100  -0.3108 0.1393  -2.2 10/10   -8.26  0.843  0.890   0.00  joint
+studentt    het_a           200  -0.2069 0.0351  -5.9 10/10  -11.25  0.838  0.875  20.16  joint
+studentt    het_a           400  -0.0384 0.0231  -1.7  7/10   -0.07  0.908  0.885   4.32 staged
+studentt    het_a           800  -0.0991 0.0257  -3.9  9/10   -5.91  0.927  0.913   6.50 staged
+studentt    het_a          1600  -0.0704 0.0115  -6.1 10/10   -1.71  0.920  0.893   8.18 staged
+studentt    het_a          3200  -0.0579 0.0147  -3.9  8/10   -0.58  0.940  0.911   6.25 staged
+studentt    het_a          6000  -0.0298 0.0096  -3.1  8/10   -0.16  0.930  0.910   5.94 staged
+studentt    kin8nm          100  -0.0957 0.0414  -2.3  9/10   +0.55  0.853  0.856  13.22  joint
+studentt    kin8nm          200  -0.0697 0.0091  -7.7 10/10   -2.28  0.857  0.867  41.21  joint
+studentt    kin8nm          400  -0.0046 0.0085  -0.5  7/10   +0.73  0.894  0.865   4.61 staged
+studentt    kin8nm          800  -0.0264 0.0074  -3.6  9/10   -0.39  0.900  0.892   6.84 staged
+studentt    kin8nm         1600  -0.0316 0.0080  -4.0  8/10   +0.16  0.906  0.902   9.75 staged
+studentt    kin8nm         3200  -0.0227 0.0057  -4.0  9/10   +0.33  0.908  0.902   7.18 staged
+studentt    kin8nm         6000  -0.0123 0.0069  -1.8  8/10   -0.80  0.910  0.905   6.71 staged
+studentt    protein         100  +0.1898 0.1702  +1.1  6/10   +2.41  0.869  0.856  19.35  joint
+studentt    protein         200  -0.0350 0.0362  -1.0  6/10   +0.66  0.900  0.864  23.24  joint
+studentt    protein         400  -0.0235 0.0140  -1.7  7/10   -0.65  0.873  0.870   2.14 staged
+studentt    protein         800  -0.0056 0.0050  -1.1  7/10   +0.26  0.885  0.882   8.68 staged
+studentt    protein        1600  -0.0045 0.0057  -0.8  8/10   -0.56  0.890  0.887   2.44 staged
+studentt    protein        3200  +0.0134 0.0121  +1.1  4/10   -0.40  0.899  0.893   3.54 staged
+studentt    protein        6000  -0.0103 0.0042  -2.5  9/10   -0.66  0.897  0.893   4.95 staged
+studentt    tnoise          100  -0.2903 0.1793  -1.6  8/10   -3.48  0.829  0.860  14.50  joint
+studentt    tnoise          200  -0.2905 0.0511  -5.7 10/10  -17.76  0.840  0.889   7.70  joint
+studentt    tnoise          400  -0.0365 0.0251  -1.5  7/10   -3.05  0.894  0.865   6.55 staged
+studentt    tnoise          800  -0.0761 0.0364  -2.1 10/10   -3.95  0.911  0.894   4.70 staged
+studentt    tnoise         1600  -0.0395 0.0169  -2.3  8/10   -0.53  0.913  0.902   5.55 staged
+studentt    tnoise         3200  -0.0643 0.0133  -4.8 10/10   -1.62  0.928  0.906   3.58 staged
+studentt    tnoise         6000  -0.0368 0.0127  -2.9 10/10   -0.79  0.918  0.903   5.45 staged
+studenttfv  het_a           100  -0.1515 0.0372  -4.1 10/10   -6.65  0.837  0.854  14.14  joint
+studenttfv  het_a           200  -0.1988 0.0541  -3.7 10/10  -10.19  0.857  0.869  19.71  joint
+studenttfv  het_a           400  -0.0637 0.0164  -3.9  9/10   -1.26  0.910  0.888   4.00 staged
+studenttfv  het_a           800  -0.1398 0.0227  -6.2 10/10   -5.79  0.922  0.913   6.79 staged
+studenttfv  het_a          1600  -0.0996 0.0156  -6.4 10/10   -1.89  0.919  0.898   4.60 staged
+studenttfv  het_a          3200  -0.0443 0.0095  -4.6 10/10   -0.75  0.934  0.909   4.42 staged
+studenttfv  het_a          6000  -0.0325 0.0091  -3.6  9/10   +0.04  0.929  0.913   3.99 staged
+studenttfv  kin8nm          100  -0.0326 0.0540  -0.6  6/10   +0.45  0.851  0.835   6.62  joint
+studenttfv  kin8nm          200  -0.0703 0.0322  -2.2  8/10   -2.11  0.871  0.866   4.39  joint
+studenttfv  kin8nm          400  -0.0186 0.0122  -1.5  7/10   -0.36  0.896  0.868   1.91 staged
+studenttfv  kin8nm          800  -0.0399 0.0118  -3.4  9/10   -0.37  0.904  0.894   4.54 staged
+studenttfv  kin8nm         1600  -0.0407 0.0093  -4.4  9/10   -0.35  0.912  0.902   4.11 staged
+studenttfv  kin8nm         3200  -0.0579 0.0096  -6.0  9/10   +0.40  0.912  0.902   6.18 staged
+studenttfv  kin8nm         6000  -0.0427 0.0099  -4.3  9/10   -0.08  0.915  0.906   4.54 staged
+studenttfv  protein         100  -0.1810 0.1325  -1.4  5/10   +2.34  0.836  0.860  16.07  joint
+studenttfv  protein         200  -0.0330 0.0499  -0.7  7/10   +0.86  0.890  0.868   2.10  joint
+studenttfv  protein         400  -0.0218 0.0187  -1.2  6/10   -0.84  0.876  0.865   3.19 staged
+studenttfv  protein         800  -0.0184 0.0149  -1.2  7/10   -0.09  0.890  0.884   2.59 staged
+studenttfv  protein        1600  -0.0122 0.0086  -1.4  5/10   -0.25  0.897  0.886   1.88 staged
+studenttfv  protein        3200  -0.0112 0.0064  -1.8  6/10   +0.04  0.903  0.896   2.39 staged
+studenttfv  protein        6000  -0.0265 0.0101  -2.6  8/10   +0.06  0.907  0.899   1.30 staged
+studenttfv  tnoise          100  -0.2450 0.1467  -1.7  8/10   -3.19  0.821  0.862   4.17  joint
+studenttfv  tnoise          200  -0.1578 0.0679  -2.3  9/10  -12.99  0.860  0.859  16.97  joint
+studenttfv  tnoise          400  -0.0582 0.0262  -2.2  8/10   -3.91  0.898  0.872   4.96 staged
+studenttfv  tnoise          800  -0.0474 0.0118  -4.0 10/10   -0.14  0.912  0.896   2.56 staged
+studenttfv  tnoise         1600  -0.0528 0.0246  -2.1  9/10   -2.33  0.914  0.899   4.32 staged
+studenttfv  tnoise         3200  -0.0369 0.0125  -3.0  9/10   -0.96  0.919  0.911   4.47 staged
+studenttfv  tnoise         6000  -0.0375 0.0197  -1.9  7/10   -0.42  0.919  0.922   2.80 staged
+
+Pooled
+  dNLL over fits -0.0473; over pair means -0.0473 (se 0.0102, t -4.7, 19 pairs)
+  lower on 1053/1330 fits (79 %)
+  dRMSE over pair means -1.97 % (se 0.41)
+  coverage off 0.884, on 0.884
+  wall time, sum on / sum off: 3.04
+
+Decision rule
+  R1 benefit           pass
+  R2 no harm           FAIL  pairs [] cells [('normal', 'kin8nm', 200)]
+  R3 point predictions pass  pairs []
+  R4 robustness        pass
