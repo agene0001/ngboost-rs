@@ -55,6 +55,52 @@ pub struct Categorical<const K: usize> {
 /// when rows saturate on (near-)separable data; inactive otherwise.
 const NATGRAD_P_FLOOR: f64 = 1e-6;
 
+/// `1 − p_k` for column `i`, computed as the sum of the OTHER classes'
+/// probabilities instead of by subtracting from 1.
+///
+/// Softmax collapse (Barron, Gnanapragasam & Tschannen 2026, "A Fix for
+/// Softmax and Cross-Entropy", arXiv 2610.31642): once a class dominates by
+/// more than ~36.7 logits in f64, `1 + e^{−m}` rounds to 1, the stored p_k
+/// is exactly 1.0 and `1 − p_k` (or `p_k − 1`) is 0 — while the other
+/// classes' p_j stay positive, because they are formed without adding 1.
+/// The gradient then stops summing to zero. The small p_j are each accurate
+/// to relative precision, so their sum is too; this never cancels.
+#[inline]
+fn complement_prob<const K: usize>(probs: &Array2<f64>, k: usize, i: usize) -> f64 {
+    let mut s = 0.0;
+    for j in 0..K {
+        if j != k {
+            s += probs[[j, i]];
+        }
+    }
+    s
+}
+
+/// `−ln softmax(z)_t` for one observation, without forming `1 + small` and
+/// without the `ln(p)` of a rounded probability (the paper's Eq. 6).
+///
+/// The target slot is the exact constant 0 after shifting by `z_t`; with
+/// `b = max(0, max_{j≠t}(z_j − z_t))` and `s = Σ_{j≠t} e^{z_j − z_t − b}`,
+/// `−ln p_t = LSE(z) − z_t = b + ln(e^{−b} + s) = b + ln1p(s + expm1(−b))`.
+/// When the target dominates (b = 0) this is `ln1p(s)`, accurate to the last
+/// bit where the old `−ln(p_t)` returned exactly 0.
+fn neg_log_softmax_at<const K: usize>(logits: &Array2<f64>, t: usize, i: usize) -> f64 {
+    let z_t = logits[[t, i]];
+    let mut b = 0.0_f64;
+    for j in 0..K {
+        if j != t {
+            b = b.max(logits[[j, i]] - z_t);
+        }
+    }
+    let mut s = 0.0;
+    for j in 0..K {
+        if j != t {
+            s += (logits[[j, i]] - z_t - b).exp();
+        }
+    }
+    b + (s + (-b).exp_m1()).ln_1p()
+}
+
 impl<const K: usize> Distribution for Categorical<K> {
     /// Newton / LogitBoost leaves by default since 1.2.0.
     ///
@@ -227,12 +273,13 @@ impl<const K: usize> ClassificationDistn for Categorical<K> {
 
 impl<const K: usize> Scorable<LogScore> for Categorical<K> {
     fn score(&self, y: &Array1<f64>) -> Array1<f64> {
-        // -log(p[y_i]) for each observation
-        // Match Python: no probability clipping, -log(p) directly
+        // -log(p[y_i]) for each observation, from the logits (see
+        // `neg_log_softmax_at`): no probability clipping, as in Python, but
+        // no rounded `ln(1.0) = 0` for a dominant correct class either.
         let mut scores = Array1::zeros(y.len());
         for (i, &y_i) in y.iter().enumerate() {
             let class = y_i as usize;
-            scores[i] = -self.probs[[class, i]].ln();
+            scores[i] = neg_log_softmax_at::<K>(&self.logits, class, i);
         }
         scores
     }
@@ -245,9 +292,15 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
         for i in 0..n_obs {
             let y_i = y[i] as usize;
             for k in 1..K {
-                // d/d(logit_k) = p_k - 1{y == k}
-                let indicator = if y_i == k { 1.0 } else { 0.0 };
-                d_params[[i, k - 1]] = self.probs[[k, i]] - indicator;
+                // d/d(logit_k) = p_k - 1{y == k}; for the target class
+                // p_k − 1 = −Σ_{j≠k} p_j, summed directly (softmax collapse:
+                // `p_k − 1` is exactly 0 once p_k rounds to 1, while the
+                // other classes' gradients stay positive).
+                d_params[[i, k - 1]] = if y_i == k {
+                    -complement_prob::<K>(&self.probs, k, i)
+                } else {
+                    self.probs[[k, i]]
+                };
             }
         }
 
@@ -268,7 +321,9 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
                 for k in 0..n_params {
                     let p_k = self.probs[[k + 1, i]];
                     if j == k {
-                        fi[[i, j, k]] = p_j * (1.0 - p_j);
+                        // p_j(1 − p_j), with 1 − p_j summed (see
+                        // `complement_prob`).
+                        fi[[i, j, k]] = p_j * complement_prob::<K>(&self.probs, j + 1, i);
                     } else {
                         fi[[i, j, k]] = -p_j * p_k;
                     }
@@ -289,9 +344,13 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
         let n_params = K - 1;
 
         for i in 0..self.n_obs {
-            // u = D⁻¹p̃, s_ug = p̃ᵀD⁻¹g, s_up = p̃ᵀu
+            // u = D⁻¹p̃, s_ug = p̃ᵀD⁻¹g, s_up = p̃ᵀu (carried as 1 − s_up)
             let mut s_ug = 0.0;
-            let mut s_up = 0.0;
+            // 1 − s_up without subtracting from 1 (softmax collapse, see
+            // `complement_prob`): Σ p̃ = 1 − p_0, so
+            // 1 − Σ p_f²/d = p_0 − Σ (p_f − p) + Σ p_f·reg/d,
+            // where p_f is the floored probability. Same value, no cancellation.
+            let mut one_minus_s_up = self.probs[[0, i]];
             let mut singular = false;
             for j in 0..n_params {
                 // Floored probability (see NATGRAD_P_FLOOR): on separable
@@ -305,11 +364,11 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
                     break;
                 }
                 s_ug += p_j * grad[[i, j]] / d_j;
-                s_up += p_j * p_j / d_j;
+                one_minus_s_up += p_j * reg / d_j - (p_j - self.probs[[j + 1, i]]);
             }
             // For reg = 0, 1 − s_up = p_0 (the reference class); floor it the
             // same way (flooring p̃ can push s_up past 1).
-            let denom = (1.0 - s_up).max(NATGRAD_P_FLOOR);
+            let denom = one_minus_s_up.max(NATGRAD_P_FLOOR);
 
             if singular || denom == 0.0 {
                 // Exactly singular (a class probability underflowed to 0):
@@ -320,7 +379,7 @@ impl<const K: usize> Scorable<LogScore> for Categorical<K> {
                     for k in 0..n_params {
                         let p_k = self.probs[[k + 1, i]];
                         fi[[j, k]] = if j == k {
-                            p_j * (1.0 - p_j)
+                            p_j * complement_prob::<K>(&self.probs, j + 1, i)
                         } else {
                             -p_j * p_k
                         };
@@ -364,9 +423,14 @@ impl<const K: usize> Scorable<CRPScore> for Categorical<K> {
             let true_class = y_i as usize;
             let mut brier = 0.0;
             for k in 0..K {
-                let p_k = self.probs[[k, i]];
-                let indicator = if k == true_class { 1.0 } else { 0.0 };
-                brier += (p_k - indicator).powi(2);
+                // p_k − 1 for the true class is −Σ_{j≠k} p_j (see
+                // `complement_prob`); the square makes the sign moot.
+                let r_k = if k == true_class {
+                    complement_prob::<K>(&self.probs, k, i)
+                } else {
+                    self.probs[[k, i]]
+                };
+                brier += r_k * r_k;
             }
             scores[i] = brier;
         }
@@ -395,10 +459,14 @@ impl<const K: usize> Scorable<CRPScore> for Categorical<K> {
             let y_i = y[i] as usize;
 
             // Compute residuals: r_k = p_k - 1{y == k}
+            // (p_y − 1 = −Σ_{j≠y} p_j, see `complement_prob`)
             let mut residuals = vec![0.0; K];
             for k in 0..K {
-                let indicator = if k == y_i { 1.0 } else { 0.0 };
-                residuals[k] = self.probs[[k, i]] - indicator;
+                residuals[k] = if k == y_i {
+                    -complement_prob::<K>(&self.probs, k, i)
+                } else {
+                    self.probs[[k, i]]
+                };
             }
 
             // For each parameter (logit_j for j = 1..K)
@@ -406,11 +474,13 @@ impl<const K: usize> Scorable<CRPScore> for Categorical<K> {
                 let p_j = self.probs[[j, i]];
 
                 // d(BS)/d(logit_j) = 2 * Σ_k r_k * p_k * (1{k==j} - p_j)
+                // (1{k==j} − p_j: for k == j that is 1 − p_j, summed)
+                let one_minus_p_j = complement_prob::<K>(&self.probs, j, i);
                 let mut grad = 0.0;
                 for k in 0..K {
                     let p_k = self.probs[[k, i]];
-                    let delta_kj = if k == j { 1.0 } else { 0.0 };
-                    grad += residuals[k] * p_k * (delta_kj - p_j);
+                    let d_kj = if k == j { one_minus_p_j } else { -p_j };
+                    grad += residuals[k] * p_k * d_kj;
                 }
                 d_params[[i, j - 1]] = 2.0 * grad;
             }
@@ -436,19 +506,23 @@ impl<const K: usize> Scorable<CRPScore> for Categorical<K> {
                 // Compute residuals for outcome Y = c
                 let mut residuals = vec![0.0; K];
                 for k in 0..K {
-                    let indicator = if k == c { 1.0 } else { 0.0 };
-                    residuals[k] = self.probs[[k, i]] - indicator;
+                    residuals[k] = if k == c {
+                        -complement_prob::<K>(&self.probs, k, i)
+                    } else {
+                        self.probs[[k, i]]
+                    };
                 }
 
                 // Compute gradient for each parameter
                 let mut grad = vec![0.0; n_params];
                 for j in 0..n_params {
                     let p_j = self.probs[[j + 1, i]];
+                    let one_minus_p_j = complement_prob::<K>(&self.probs, j + 1, i);
                     let mut g = 0.0;
                     for k in 0..K {
                         let p_k = self.probs[[k, i]];
-                        let delta_kj = if k == j + 1 { 1.0 } else { 0.0 };
-                        g += residuals[k] * p_k * (delta_kj - p_j);
+                        let d_kj = if k == j + 1 { one_minus_p_j } else { -p_j };
+                        g += residuals[k] * p_k * d_kj;
                     }
                     grad[j] = 2.0 * g;
                 }
@@ -785,6 +859,57 @@ mod tests {
         for j in 0..2 {
             for l in 0..2 {
                 assert_relative_eq!(metric[[0, j, l]], expected[[j, l]], epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// Softmax collapse (arXiv 2610.31642): with the correct class 40 logits
+    /// ahead, f64 rounds its probability to exactly 1.0. The old code then
+    /// scored −ln(1) = 0, gave the target a gradient p − 1 = 0 while the other
+    /// classes kept positive gradients (the gradient no longer summed to
+    /// zero), and put a 0 on the Fisher diagonal. The fixed forms keep every
+    /// tiny term.
+    #[test]
+    fn softmax_collapse_keeps_the_dominant_class_terms() {
+        // logits [0, 40, 0] (class 0 is the fixed reference), target class 1
+        let params = Array2::from_shape_vec((1, 2), vec![40.0, 0.0]).unwrap();
+        let dist = Categorical::<3>::from_params(&params);
+        assert_eq!(dist.probs[[1, 0]], 1.0, "the regime this test is about");
+        let tail = 2.0 * (-40.0_f64).exp(); // Σ_{j≠t} p_j to first order
+        let y = Array1::from_vec(vec![1.0]);
+
+        // Loss: ln1p(2e^{-40}) ≈ 2e^{-40}, not 0.
+        let score = Scorable::<LogScore>::score(&dist, &y);
+        assert_relative_eq!(score[0], tail, max_relative = 1e-12);
+
+        // Gradient over ALL classes sums to zero: class 0's gradient is p_0
+        // (implicit, the reference), class 1's is −(p_0 + p_2), class 2's p_2.
+        let g = Scorable::<LogScore>::d_score(&dist, &y);
+        assert_relative_eq!(g[[0, 0]], -tail, max_relative = 1e-12);
+        let total = dist.probs[[0, 0]] + g[[0, 0]] + g[[0, 1]];
+        assert!(total.abs() <= 1e-30, "gradient sums to {total}");
+
+        // Fisher diagonal p_1(1 − p_1) ≈ 2e^{-40}, not 0.
+        let fi = Scorable::<LogScore>::metric(&dist);
+        assert_relative_eq!(fi[[0, 0, 0]], tail, max_relative = 1e-12);
+
+        // Brier residual of the true class: (p_1 − 1)² = (2e^{-40})², not 0.
+        let bs = Scorable::<CRPScore>::score(&dist, &y);
+        assert!(bs[0] > 0.0);
+    }
+
+    /// The log-space score is the same number as −ln p on ordinary rows, and
+    /// stays finite and exact when the TARGET is the one far behind.
+    #[test]
+    fn log_score_matches_neg_ln_p_off_the_collapse_regime() {
+        let params =
+            Array2::from_shape_vec((3, 2), vec![0.3, -1.2, 2.0, 0.5, -50.0, 3.0]).unwrap();
+        let dist = Categorical::<3>::from_params(&params);
+        for t in 0..3 {
+            let y = Array1::from_vec(vec![t as f64; 3]);
+            let score = Scorable::<LogScore>::score(&dist, &y);
+            for i in 0..3 {
+                assert_relative_eq!(score[i], -dist.probs[[t, i]].ln(), max_relative = 1e-12);
             }
         }
     }
